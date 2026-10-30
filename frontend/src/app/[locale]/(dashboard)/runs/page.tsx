@@ -5,8 +5,10 @@ import { Activity, ChevronLeft, ChevronRight, RefreshCw } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useState } from "react";
 import { api, type RunRow } from "@/lib/api";
-import { formatNumber, formatRelative } from "@/lib/utils";
+import { formatRelative } from "@/lib/utils";
 import { runStatusToneClass } from "@/lib/run-quality";
+import { runProductCount } from "@/lib/run-counts";
+import { ProductCountText } from "@/components/product-count";
 
 const PAGE_SIZE = 25;
 const STATUSES = ["", "running", "ok", "degraded", "failed"];
@@ -108,7 +110,7 @@ function RunHistoryRow({ run, locale, expanded, onToggle }: { run: RunRow; local
   const t = useTranslations("runs");
   const detailQ = useQuery({ queryKey: ["run-breakdown", run.id], queryFn: () => api.runBreakdown(run.id), enabled: expanded });
   const sites = Object.keys(run.products_per_site ?? {});
-  return <><tr className="cursor-pointer border-t border-border hover:bg-secondary/30" onClick={onToggle}><td className="px-3 py-2 font-mono text-xs">#{run.id}</td><td className="px-3 py-2 text-muted-foreground">{formatRelative(run.started_at, locale)}</td><td className="px-3 py-2"><Status status={run.status} label={t(`status_${run.status}`)} /></td><td className="px-3 py-2">{sites.join(", ") || run.sites_completed || "—"}</td><td className="px-3 py-2 text-right tabular-nums">{formatNumber(run.products_scraped ?? 0, locale)}</td><td className="px-3 py-2 text-xs">{run.run_quality?.financially_eligible ? t("financial_yes") : t("financial_no")}</td></tr>{expanded && <tr className="border-t border-border bg-muted/20"><td colSpan={6} className="px-4 py-3 text-xs">{detailQ.isLoading ? t("loading") : <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px]">{JSON.stringify(detailQ.data?.run_quality ?? { products_per_site: detailQ.data?.products_per_site }, null, 2)}</pre>}</td></tr>}</>;
+  return <><tr className="cursor-pointer border-t border-border hover:bg-secondary/30" onClick={onToggle}><td className="px-3 py-2 font-mono text-xs">#{run.id}</td><td className="px-3 py-2 text-muted-foreground">{formatRelative(run.started_at, locale)}</td><td className="px-3 py-2"><Status status={run.status} label={t(`status_${run.status}`)} /></td><td className="px-3 py-2">{sites.join(", ") || run.sites_completed || "—"}</td><td className="px-3 py-2 text-right"><ProductCountText count={runProductCount(run)} /></td><td className="px-3 py-2 text-xs">{run.run_quality?.financially_eligible ? t("financial_yes") : t("financial_no")}</td></tr>{expanded && <tr className="border-t border-border bg-muted/20"><td colSpan={6} className="px-4 py-3 text-xs">{detailQ.isLoading ? t("loading") : <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px]">{JSON.stringify(detailQ.data?.run_quality ?? { products_per_site: detailQ.data?.products_per_site }, null, 2)}</pre>}</td></tr>}</>;
 }
 
 function Status({ status, label }: { status: string; label: string }) { return <span className={`inline-flex rounded px-2 py-0.5 text-xs font-medium ${runStatusToneClass(status)}`}>{label}</span>; }

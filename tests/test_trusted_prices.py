@@ -230,7 +230,7 @@ def test_scan_confirms_only_products_it_observed(db_session):
 
 
 def test_scan_that_persists_a_product_twice_confirms_it_once(db_session):
-    """Пайплайн пишет товар дважды за прогон: по категории и в конце целиком."""
+    """Товар приходит в сбор дважды — например, стоит в двух категориях сайта."""
     tick = _observe(db_session, scope="partial")
     full = _observe(db_session, scope="full")
     persist_results(db_session, full, [ScrapeResult(site="aloe", products=[_scraped(10.0)])])

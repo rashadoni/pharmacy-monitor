@@ -65,7 +65,7 @@ import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Iterator, Literal
 from urllib.parse import urlsplit
 
 import structlog
@@ -946,13 +946,40 @@ def _wants_html(request: Request) -> bool:
     return "text/html" in request.headers.get("accept", "").lower()
 
 
-def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
-    """Выпустить magic-token для email и отправить ссылку на вход. Best-effort.
+class LoginLinkMail(BaseModel):
+    """Что стало с письмом со ссылкой на вход — для админа на странице «Пользователи».
 
-    Возвращает True, если активный пользователь с таким email найден (токен
-    выпущен, попытка отправки сделана), False — если такого активного юзера нет.
-    Сбой SMTP логируется, но НЕ пробрасывается: создание/инвайт пользователя не
-    должно падать из-за временной проблемы с почтой (fail-open).
+    `sent=True` — почтовый сервер письмо принял. Дошло ли оно до ящика, отсюда не
+    видно: это кабинет Resend и папка «Спам» получателя. Иначе `reason`:
+    - `smtp_not_configured` — в окружении API нет `SMTP_HOST`, письмо не уходило;
+    - `smtp_refused` — почтовый сервер ответил отказом (код в `smtp_code`);
+    - `send_failed` — до ответа сервера не дошло: сеть, таймаут, обрыв, неполная
+      настройка (`KeyError` — нет `SMTP_USER` или `SMTP_PASSWORD`).
+
+    Адреса и текста ошибки здесь нет — только класс ошибки и её числа
+    (`notifier.delivery_error_fields`), те же, что в журнале.
+    """
+
+    sent: bool
+    reason: Literal["smtp_not_configured", "smtp_refused", "send_failed"] | None = None
+    error_type: str | None = None
+    smtp_code: int | None = None
+    smtp_status: str | None = None
+    errno: int | None = None
+
+
+def _send_login_link(db: Session, email: str, *, invite: bool = False) -> LoginLinkMail | None:
+    """Выпустить magic-token для email и отправить ссылку на вход.
+
+    Возвращает `None`, если активного пользователя с таким email нет (токен не
+    выпущен), иначе — исход отправки письма. Прежний токен пользователя гаснет в
+    любом случае, даже если письмо не ушло.
+
+    Сбой почты не пробрасывается: создание/инвайт пользователя не должно падать
+    из-за почты (fail-open). Но и не прячется — вызывающий решает, что показать.
+    Публичный `/auth/request` исход не показывает никому: его ответ одинаков при
+    любом исходе (иначе по ответу можно было бы перебирать адреса); админские
+    ручки показывают его админу.
 
     Цель ссылки выбирается по тому, есть ли у пользователя свой пароль:
     - нет пароля (`password_hash` пуст) → `/auth/link/password` — оттуда на форму
@@ -974,10 +1001,10 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
         )
     )
     if not user:
-        return False
+        return None
     token = tenants.issue_magic_token(db, email)
     if not token:
-        return False
+        return None
     needs_password = not user.password_hash
     public_url = os.environ.get("PHARMACY_PUBLIC_URL", "http://localhost:3000")
     if needs_password:
@@ -1001,10 +1028,10 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
             "<p>Daxil olmaq üçün keçid (30 dəqiqə qüvvədədir):</p>"
             "<p>Ссылка для входа (действует 30 минут):</p>"
         )
-    try:
-        from src import notifier
+    from src import notifier
 
-        notifier.send_email(
+    try:
+        accepted = notifier.send_email(
             subject=subject,
             html_body=(
                 f"{intro}"
@@ -1015,10 +1042,24 @@ def _send_login_link(db: Session, email: str, *, invite: bool = False) -> bool:
             to=[email],
         )
     except Exception as e:
-        from src.notifier import delivery_error_fields
-
-        log.warning("login_link_email_failed", user_id=user.id, **delivery_error_fields(e))
-    return True
+        # Отказ — это ответ сервера с кодом. `SMTPServerDisconnected` тоже
+        # приходит как `EmailDeliveryError`, но кода у него нет: сервер не ответил.
+        answered = isinstance(e, notifier.EmailDeliveryError) and e.smtp_code is not None
+        reason = "smtp_refused" if answered else "send_failed"
+        # `delivery_error_fields(e)` прямо в вызове журнала: так его видит
+        # проверка кода в tests/test_log_carries_no_address.py.
+        log.warning(
+            "login_link_email_failed",
+            user_id=user.id,
+            reason=reason,
+            **notifier.delivery_error_fields(e),
+        )
+        return LoginLinkMail(sent=False, reason=reason, **notifier.delivery_error_fields(e))
+    if not accepted:
+        # `send_email` без `SMTP_HOST` не бросает, а возвращает False.
+        log.warning("login_link_email_failed", user_id=user.id, reason="smtp_not_configured")
+        return LoginLinkMail(sent=False, reason="smtp_not_configured")
+    return LoginLinkMail(sent=True)
 
 
 @app.post("/auth/request", response_model=AuthRequestOut)
@@ -1027,8 +1068,10 @@ def auth_request(payload: AuthRequestIn, request: Request, db: Session = Depends
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(f"auth_req:{client_ip}", limit=5)
 
+    # Исход письма отсюда не виден никому: ответ один и тот же, есть ли такой
+    # адрес, ушло ли письмо или почта отказала, — иначе по ответу перебирали бы
+    # адреса. Сбой почты остаётся в журнале (`login_link_email_failed`).
     _send_login_link(db, str(payload.email).strip().lower())
-    # Always return success (don't leak whether email exists)
     return AuthRequestOut(sent=True, detail="If the email is registered, a magic-link was sent.")
 
 
@@ -1553,8 +1596,10 @@ def dash_scrape_requests(
     """Последние scrape-запросы tenant'а. UI polls этот endpoint для статуса.
 
     Для terminal request'ов с run_id подмешиваем агрегаты из Run:
-    products_scraped (total) + products_per_site ({site: count}). UI отличает
-    подтверждённый ok от частичного degraded и failed.
+    products_scraped (total) + products_per_site ({site: count}) — строки
+    листинга — и products_distinct_per_site — разные товары
+    (`_products_distinct_per_site`). UI отличает подтверждённый ok от
+    частичного degraded и failed.
     """
     reqs = db.scalars(
         select(storage.ScrapeRequest)
@@ -1592,6 +1637,7 @@ def dash_scrape_requests(
                 "error_message": r.error_message,
                 "products_scraped": run.products_scraped if run else None,
                 "products_per_site": run.products_per_site if run else None,
+                "products_distinct_per_site": _products_distinct_per_site(run) if run else None,
             }
         )
     return out
@@ -1649,6 +1695,7 @@ def dash_scrape_requests_history(
                 "error_message": row.error_message,
                 "products_scraped": run.products_scraped if run else None,
                 "products_per_site": run.products_per_site if run else None,
+                "products_distinct_per_site": _products_distinct_per_site(run) if run else None,
             }
         )
     return {"items": items, "total": total, "limit": limit, "offset": offset}
@@ -1917,6 +1964,12 @@ class RecipientOut(BaseModel):
     created_at: str | None
 
 
+class RecipientCreatedOut(RecipientOut):
+    # Письмо-приглашение со ссылкой на вход: ушло ли оно. Пользователь создан при
+    # любом исходе; не ушло — админ повторит кнопкой «Отправить ссылку».
+    invite_mail: LoginLinkMail | None
+
+
 class RecipientCreate(BaseModel):
     email: str = Field(min_length=3, max_length=200)
     name: str | None = None
@@ -2032,7 +2085,7 @@ def dash_recipients_list(
     return [_to_recipient_out(u) for u in users]
 
 
-@app.post("/api/v1/dash/recipients", response_model=RecipientOut)
+@app.post("/api/v1/dash/recipients", response_model=RecipientCreatedOut)
 def dash_recipients_create(
     payload: RecipientCreate,
     user: storage.TenantUser = Depends(require_user),
@@ -2064,15 +2117,16 @@ def dash_recipients_create(
     db.refresh(new_user)
     # Авто-инвайт: новый юзер получает magic-link на вход сразу (без него у
     # него нет способа залогиниться — общий пароль логинит как админа, а формы
-    # запроса ссылки в UI нет). Best-effort: сбой почты не валит создание.
-    invite_sent = _send_login_link(db, new_user.email, invite=True)
+    # запроса ссылки в UI нет). Сбой почты не валит создание, но админ видит его
+    # в ответе (`invite_mail`).
+    invite_mail = _send_login_link(db, new_user.email, invite=True)
     log.info(
         "recipient_created",
         id=new_user.id,
         by_user_id=user.id,
-        invite_sent=invite_sent,
+        invite_sent=bool(invite_mail and invite_mail.sent),
     )
-    return _to_recipient_out(new_user)
+    return RecipientCreatedOut(**_to_recipient_out(new_user).model_dump(), invite_mail=invite_mail)
 
 
 @app.patch("/api/v1/dash/recipients/{recipient_id}", response_model=RecipientOut)
@@ -2184,7 +2238,17 @@ def dash_recipients_send_login_link(
 
     В отличие от публичного /auth/request (анти-enumeration → всегда 200), этот
     эндпоинт admin-only, поэтому может честно вернуть 404/400 — утечки наличия
-    email тут нет.
+    email тут нет — и честно сказать, ушло ли письмо:
+
+    - 200, `mail.sent=true` — почтовый сервер письмо принял (до ящика — не видно);
+    - 424, `detail.reason` — письмо не ушло или приём не подтверждён:
+      `smtp_not_configured`, `smtp_refused`, `send_failed`; рядом класс ошибки и
+      коды, без адреса.
+
+    424, а не 5xx: отказ почты — не сбой API. Ответ 5xx Sentry забирает событием
+    на каждое нажатие, а 502 в журнале прокси не отличить от лежащего API.
+
+    Токен при сбое письма всё равно выпущен, и прежняя ссылка погашена.
     """
     _require_admin(user)
     r = db.scalar(
@@ -2197,9 +2261,63 @@ def dash_recipients_send_login_link(
         raise HTTPException(404, "Recipient not found")
     if not r.is_active:
         raise HTTPException(400, "Пользователь деактивирован — сначала активируйте его")
-    _send_login_link(db, r.email, invite=False)
+    mail = _send_login_link(db, r.email, invite=False)
+    if mail is None:
+        # Строку нашли по id, а по адресу активного пользователя нет: адрес в
+        # базе записан не в нижнем регистре или с пробелами (`_send_login_link`
+        # ищет нормализованный), либо его деактивировали между запросами.
+        raise HTTPException(
+            409, "Ссылка не выпущена: активный пользователь с этим адресом не найден"
+        )
+    if not mail.sent:
+        # Кто нажал: журнал аудита пишет только успешные ответы, а токен
+        # пользователя при сбое письма всё равно сменился.
+        log.info("recipient_login_link_not_sent", id=r.id, by_user_id=user.id, reason=mail.reason)
+        raise HTTPException(424, detail=mail.model_dump())
     log.info("recipient_login_link_sent", id=r.id, by_user_id=user.id)
-    return {"ok": True, "email": r.email}
+    return {"ok": True, "email": r.email, "mail": mail.model_dump()}
+
+
+class AdminSetPasswordIn(BaseModel):
+    new_password: str
+
+
+@app.post("/api/v1/dash/recipients/{recipient_id}/password")
+def dash_recipients_set_password(
+    recipient_id: int,
+    payload: AdminSetPasswordIn,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Задать пользователю пароль, который набрал админ (admin-only).
+
+    Прежний пароль перестаёт действовать сразу; у пользователя без пароля это
+    первый. Пароль админ сообщает пользователю сам: письмом он не уходит, в
+    ответе и в журнале его нет. Правило то же, что у любого нового пароля
+    (`_usable_new_password`, отказ 422 — до любой записи).
+
+    Свой пароль так не меняется — в настройках, где спрашивают текущий
+    (`/api/v1/dash/me/password`). Сессии пользователя, открытые раньше, не
+    закрываются: отзыва сессий в приложении нет, cookie живёт до своего срока.
+    """
+    _require_admin(user)
+    new_password = _usable_new_password(payload.new_password)
+    r = db.scalar(
+        select(storage.TenantUser).where(
+            storage.TenantUser.id == recipient_id,
+            storage.TenantUser.tenant_id == user.tenant_id,
+        )
+    )
+    if not r:
+        raise HTTPException(404, "Recipient not found")
+    if r.id == user.id:
+        raise HTTPException(400, "Свой пароль меняйте в настройках — там нужен текущий")
+    if not r.is_active:
+        raise HTTPException(400, "Пользователь деактивирован — сначала активируйте его")
+    r.password_hash = _hash_bcrypt(new_password)
+    db.commit()
+    log.info("recipient_password_set", id=r.id, by_user_id=user.id)
+    return {"ok": True}
 
 
 # ─── Frontend dashboard endpoints (JWT cookie) ───────────────────────────────
@@ -4154,6 +4272,28 @@ def _compact_run_quality(run_quality: dict | None) -> dict | None:
     return compact
 
 
+def _products_distinct_per_site(run: storage.Run | None) -> dict[str, int]:
+    """Сколько разных товаров каждого сайта увидел прогон.
+
+    `products_scraped` и `products_per_site` считают строки листинга: товар,
+    стоящий в нескольких категориях сайта, приходит из каждой — у aptekonline
+    96 347 строк на 27 097 товаров (прогон №1141). На этих числах стоят базы
+    прогона, smoke-тест и health, поэтому они остаются как есть, а число разных
+    товаров лежит рядом, в конверте качества (`distinct_products`). У прогонов,
+    записанных до 2026-10-30, его нет — такого сайта в ответе нет, и экран
+    подписывает строки листинга как строки листинга.
+    """
+    sites = ((run.run_quality if run else None) or {}).get("sites")
+    if not isinstance(sites, dict):
+        return {}
+    out: dict[str, int] = {}
+    for site, quality in sites.items():
+        value = quality.get("distinct_products") if isinstance(quality, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            out[site] = value
+    return out
+
+
 def _run_row_out(r: storage.Run, *, compact_quality: bool = True) -> dict:
     return {
         "id": r.id,
@@ -4162,6 +4302,7 @@ def _run_row_out(r: storage.Run, *, compact_quality: bool = True) -> dict:
         "status": r.status,
         "products_scraped": r.products_scraped,
         "products_per_site": r.products_per_site,
+        "products_distinct_per_site": _products_distinct_per_site(r),
         "run_quality": _compact_run_quality(r.run_quality) if compact_quality else r.run_quality,
         "sites_completed": r.sites_completed,
         "error_message": r.error_message,
@@ -4285,8 +4426,9 @@ def dash_run_breakdown(
 
     Returns: {
       "run_id": int, "started_at": iso, "finished_at": iso, "status": str,
-      "products_scraped": int,
-      "products_per_site": {site: total_count},
+      "products_scraped": int,               # строки листинга
+      "products_per_site": {site: total_count},  # строки листинга
+      "products_distinct_per_site": {site: count},  # разные товары, если известны
       "products_per_site_category": {site: {category: count}},
       "run_quality": {version, mode, financially_eligible, sites}
     }
@@ -4306,6 +4448,7 @@ def dash_run_breakdown(
         "status": run.status,
         "products_scraped": run.products_scraped or 0,
         "products_per_site": run.products_per_site or {},
+        "products_distinct_per_site": _products_distinct_per_site(run),
         "products_per_site_category": run.products_per_site_category or {},
         "run_quality": run.run_quality,
         "sites_completed": run.sites_completed,

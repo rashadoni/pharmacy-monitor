@@ -4945,8 +4945,11 @@ def test_send_login_link_requires_admin(client, setup_db):
     assert client.post(f"/api/v1/dash/recipients/{target.id}/send-login-link").status_code == 403
 
 
-def test_send_login_link_ok(client, auth_cookie, setup_db):
+def test_send_login_link_ok(client, auth_cookie, setup_db, monkeypatch):
     """admin шлёт login-link активному юзеру → 200 + выпущен свежий токен."""
+    from src import notifier
+
+    monkeypatch.setattr(notifier, "send_email", lambda **_: True)  # сервер принял
     s = setup_db
     t = tenants.get_or_create_default(s)
     u = storage.TenantUser(
@@ -5096,6 +5099,7 @@ def test_send_login_link_targets_set_password_for_new_user(
 
     def fake_send_email(*, subject, html_body, to):
         captured["html"] = html_body
+        return True
 
     from src import notifier
 
@@ -5116,6 +5120,7 @@ def test_send_login_link_targets_auto_login_for_existing_password(
 
     def fake_send_email(*, subject, html_body, to):
         captured["html"] = html_body
+        return True
 
     from src import notifier
 
@@ -5341,6 +5346,100 @@ def test_run_endpoints_serialize_quality(client, auth_cookie, setup_db):
     detail = client.get(f"/api/v1/dash/runs/{run.id}/breakdown").json()
     assert detail["run_quality"]["financially_eligible"] is False
     assert detail["run_quality"]["sites"]["aloe"]["items"]["dermanlar"]["products"] == 5
+
+
+def test_run_responses_carry_distinct_products_next_to_listing_rows(
+    client, auth_cookie, setup_db
+):
+    """Строки листинга остаются в `products_per_site`, разные товары идут рядом.
+    У прогона, записанного до счётчика разных товаров, сайта в нём нет — экран
+    тогда подписывает строки листинга, а не выдаёт их за товары."""
+    db = setup_db
+    base = utcnow()
+    new_run = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(hours=1),
+        finished_at=base,
+        status="ok",
+        products_scraped=96347,
+        products_per_site={"aptekonline": 96347},
+        sites_completed="aptekonline",
+        run_quality={
+            "version": 1,
+            "sites": {
+                "aptekonline": {
+                    "status": "ok",
+                    "products": 96347,
+                    "distinct_products": 27097,
+                    "items_expected": 298,
+                    "items_completed": 298,
+                    "items_failed": 0,
+                    "items": {"78": {"status": "ok", "products": 1}},
+                }
+            },
+        },
+    )
+    legacy_run = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(hours=3),
+        finished_at=base - timedelta(hours=2),
+        status="ok",
+        products_scraped=8430,
+        products_per_site={"aloe": 8430},
+        sites_completed="aloe",
+        run_quality={
+            "version": 1,
+            "sites": {
+                "aloe": {
+                    "status": "ok",
+                    "products": 8430,
+                    "items_expected": 5,
+                    "items_completed": 5,
+                    "items_failed": 0,
+                }
+            },
+        },
+    )
+    db.add_all([new_run, legacy_run])
+    db.commit()
+    request_row = storage.ScrapeRequest(
+        tenant_id=1, mode="all", status="ok", run_id=new_run.id
+    )
+    db.add(request_row)
+    db.commit()
+
+    rows = {
+        row["site"]: row["run"]
+        for row in client.get("/api/v1/dash/runs/latest-by-site").json()
+    }
+    assert rows["aptekonline"]["products_per_site"] == {"aptekonline": 96347}
+    assert rows["aptekonline"]["products_distinct_per_site"] == {"aptekonline": 27097}
+    assert rows["aloe"]["products_distinct_per_site"] == {}
+
+    breakdown = client.get(f"/api/v1/dash/runs/{new_run.id}/breakdown").json()
+    assert breakdown["products_distinct_per_site"] == {"aptekonline": 27097}
+
+    requests_now = client.get("/api/v1/dash/scrape/requests").json()
+    assert requests_now[0]["products_distinct_per_site"] == {"aptekonline": 27097}
+    history = client.get("/api/v1/dash/scrape/requests/history").json()["items"]
+    assert history[0]["products_distinct_per_site"] == {"aptekonline": 27097}
+
+
+@pytest.mark.parametrize(
+    "run_quality",
+    [
+        None,
+        {"sites": None},
+        {"sites": {"aloe": "ok"}},
+        {"sites": {"aloe": {"distinct_products": True}}},
+        {"sites": {"aloe": {"distinct_products": -1}}},
+        {"sites": {"aloe": {"distinct_products": "12"}}},
+    ],
+)
+def test_distinct_products_ignore_envelopes_that_do_not_carry_a_count(run_quality):
+    from src.api import _products_distinct_per_site
+
+    assert _products_distinct_per_site(storage.Run(run_quality=run_quality)) == {}
 
 
 def test_run_breakdown_is_tenant_scoped(client, auth_cookie, setup_db):

@@ -4,11 +4,32 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocale, useTranslations } from "next-intl";
 import { Link } from "@/i18n/navigation";
 import { useState } from "react";
-import { ArrowLeft, Clock, Send, Trash2, UserPlus } from "lucide-react";
-import { api, type Recipient, type RecipientCreate, type RecipientUpdate } from "@/lib/api";
+import { ArrowLeft, Clock, KeyRound, Send, Trash2, UserPlus } from "lucide-react";
+import {
+  api,
+  ApiError,
+  friendlyError,
+  type LoginLinkMail,
+  type Recipient,
+  type RecipientCreate,
+  type RecipientCreated,
+  type RecipientUpdate,
+} from "@/lib/api";
+import { loginLinkMailFromError, loginLinkMailText } from "@/lib/login-link-mail";
+import {
+  passwordProblem,
+  passwordProblemInResponse,
+  type PasswordProblem,
+} from "@/lib/password-rule";
 import { formatTime } from "@/lib/utils";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
+// Тексты причин — общие со сменой своего пароля (пространство `settings`).
+const PASSWORD_PROBLEM_TEXT = {
+  password_not_text: "password_unusable",
+  password_too_short: "password_too_short",
+  password_too_long: "password_too_long",
+} as const satisfies Record<PasswordProblem, string>;
 type Sev = (typeof SEVERITIES)[number];
 
 export default function UsersPage() {
@@ -77,7 +98,7 @@ export default function UsersPage() {
             error={
               createMut.isError ? ((createMut.error as Error)?.message ?? t("add_error")) : null
             }
-            doneEmail={createMut.isSuccess ? createMut.data?.email : null}
+            created={createMut.isSuccess ? createMut.data : null}
           />
           <div className="space-y-3">
             {listQ.isLoading && (
@@ -139,14 +160,14 @@ function AddUserForm({
   onAdd,
   pending,
   error,
-  doneEmail,
+  created,
 }: {
   dailyEnabled: boolean;
   weeklyEnabled: boolean;
   onAdd: (p: RecipientCreate) => void;
   pending: boolean;
   error: string | null;
-  doneEmail?: string | null;
+  created?: RecipientCreated | null;
 }) {
   const t = useTranslations("users");
   const [email, setEmail] = useState("");
@@ -216,10 +237,45 @@ function AddUserForm({
         >
           {pending ? t("adding") : t("add_btn")}
         </button>
-        {doneEmail && <span className="text-xs text-success">{t("added", { email: doneEmail })}</span>}
+        {created && <span className="text-xs text-success">{t("added", { email: created.email })}</span>}
         {error && <span className="text-xs text-destructive">{error}</span>}
       </div>
+      {created?.invite_mail && <InviteMailNotice mail={created.invite_mail} />}
       <p className="text-xs text-muted-foreground mt-2">{t("add_hint")}</p>
+    </div>
+  );
+}
+
+/** Ушло ли письмо со ссылкой: «принято почтовым сервером» или почему нет. */
+function MailNotice({ mail, retry }: { mail: LoginLinkMail; retry?: string }) {
+  const t = useTranslations("users");
+  if (mail.sent) {
+    return (
+      <p role="status" className="basis-full text-xs text-success">
+        {loginLinkMailText(t, mail)}
+        <span className="block text-muted-foreground">{t("mail_accepted_hint")}</span>
+      </p>
+    );
+  }
+  return (
+    <p role="alert" className="basis-full text-xs text-destructive">
+      {loginLinkMailText(t, mail)}
+      {retry && <span className="block text-muted-foreground">{retry}</span>}
+    </p>
+  );
+}
+
+function InviteMailNotice({ mail }: { mail: LoginLinkMail }) {
+  const t = useTranslations("users");
+  return (
+    <div className="mt-2">
+      <MailNotice
+        mail={mail}
+        retry={t("invite_mail_retry", {
+          button: t("send_login_link"),
+          password: t("set_password"),
+        })}
+      />
     </div>
   );
 }
@@ -246,6 +302,8 @@ function UserCard({
   const sendLinkMut = useMutation({
     mutationFn: () => api.recipientSendLoginLink(u.id),
   });
+  const [passwordOpen, setPasswordOpen] = useState(false);
+  const [passwordDone, setPasswordDone] = useState(false);
   return (
     <div
       className={`rounded-lg border p-4 ${
@@ -332,13 +390,25 @@ function UserCard({
             {t("delete_permanently")}
           </button>
         )}
-        <div className="ml-auto flex items-center gap-2">
-          {sendLinkMut.isSuccess && (
-            <span className="text-[11px] text-success">{t("login_link_sent")}</span>
-          )}
-          {sendLinkMut.isError && (
-            <span className="text-[11px] text-destructive">{t("login_link_error")}</span>
-          )}
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+          <button
+            onClick={() => {
+              setPasswordOpen((open) => !open);
+              setPasswordDone(false);
+            }}
+            disabled={isSelf || !u.is_active}
+            title={
+              isSelf
+                ? t("set_password_self")
+                : u.is_active
+                  ? t("set_password_hint")
+                  : t("send_login_link_inactive")
+            }
+            className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed md:min-h-9"
+          >
+            <KeyRound className="h-3.5 w-3.5" />
+            {t("set_password")}
+          </button>
           <button
             onClick={() => sendLinkMut.mutate()}
             disabled={!u.is_active || sendLinkMut.isPending}
@@ -349,8 +419,149 @@ function UserCard({
             {sendLinkMut.isPending ? t("login_link_sending") : t("send_login_link")}
           </button>
         </div>
+        {/* Без `mail` отвечает API старше этой страницы: о письме оно не знает. */}
+        {sendLinkMut.isSuccess && sendLinkMut.data?.mail && (
+          <MailNotice mail={sendLinkMut.data.mail} />
+        )}
+        {sendLinkMut.isError && <SendLinkError error={sendLinkMut.error} />}
+        {passwordOpen && (
+          <SetPasswordForm
+            u={u}
+            onCancel={() => setPasswordOpen(false)}
+            onDone={() => {
+              setPasswordOpen(false);
+              setPasswordDone(true);
+            }}
+          />
+        )}
+        {passwordDone && (
+          <p role="status" className="basis-full text-xs text-success">
+            {t("set_password_done")}
+          </p>
+        )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Админ набирает пароль и сообщает его пользователю сам: письмом пароль не
+ * уходит. Поле открытое — админ должен видеть, что именно он передаст.
+ */
+function SetPasswordForm({
+  u,
+  onCancel,
+  onDone,
+}: {
+  u: Recipient;
+  onCancel: () => void;
+  onDone: () => void;
+}) {
+  const t = useTranslations("users");
+  const tSettings = useTranslations("settings");
+  const locale = useLocale();
+  const [password, setPassword] = useState("");
+  const mut = useMutation({
+    mutationFn: () => api.recipientSetPassword(u.id, password),
+    onSuccess: () => {
+      setPassword("");
+      onDone();
+    },
+  });
+  // То же правило, что на сервере: кнопка не шлёт пароль, который он не примет.
+  const problem = password ? passwordProblem(password) : null;
+  let serverProblem: PasswordProblem | null = null;
+  if (mut.error instanceof ApiError && mut.error.status === 422) {
+    try {
+      serverProblem = passwordProblemInResponse(JSON.parse(mut.error.detail));
+    } catch {
+      /* не JSON */
+    }
+  }
+  const shownProblem = problem ?? serverProblem;
+
+  return (
+    <div className="basis-full rounded-md border border-border bg-muted/40 p-3">
+      <label className="block">
+        <span className="text-xs font-medium block mb-1">
+          {t("set_password_label", { email: u.email })}
+        </span>
+        <input
+          type="text"
+          value={password}
+          onChange={(e) => {
+            setPassword(e.target.value);
+            // Отказ сервера был о прежнем наборе — не держать его под новым.
+            if (mut.isError) mut.reset();
+          }}
+          autoComplete="off"
+          spellCheck={false}
+          className="min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono md:min-h-9"
+        />
+      </label>
+      {shownProblem && (
+        <p className="mt-1 text-xs text-destructive">
+          {tSettings(PASSWORD_PROBLEM_TEXT[shownProblem])}
+        </p>
+      )}
+      {mut.isError && !serverProblem && (
+        <p role="alert" className="mt-1 text-xs text-destructive">
+          {t("set_password_error", { message: errorText(mut.error, locale) })}
+        </p>
+      )}
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        {t("set_password_note", { active: t("active") })}
+      </p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <button
+          onClick={() => mut.mutate()}
+          disabled={!password.trim() || !!problem || mut.isPending}
+          className="min-h-11 rounded-md bg-primary text-primary-foreground px-3 py-1.5 text-xs font-medium hover:bg-primary/90 disabled:opacity-50 md:min-h-9"
+        >
+          {mut.isPending ? t("set_password_saving") : t("set_password_save")}
+        </button>
+        <button
+          onClick={onCancel}
+          className="min-h-11 rounded-md border border-input bg-background px-3 py-1.5 text-xs font-medium hover:bg-muted md:min-h-9"
+        >
+          {t("set_password_cancel")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Текст отказа API. Отказы этих ручек (400, 409) сервер пишет по-русски строкой
+ * в `detail`; `friendlyError` показал бы в русском интерфейсе JSON целиком.
+ */
+function errorText(error: unknown, locale: string): string {
+  // 401, 403, 404 сервер пишет по-английски — их переводит `friendlyError`.
+  if (
+    error instanceof ApiError &&
+    (error.status === 400 || error.status === 409) &&
+    locale === "ru"
+  ) {
+    try {
+      const detail = JSON.parse(error.detail)?.detail;
+      if (typeof detail === "string") return detail;
+    } catch {
+      /* не JSON */
+    }
+  }
+  return friendlyError(error, locale);
+}
+
+/** Повторная отправка не удалась: письмо не ушло (424) или запрос не прошёл. */
+function SendLinkError({ error }: { error: unknown }) {
+  const t = useTranslations("users");
+  const locale = useLocale();
+  const mail = loginLinkMailFromError(error);
+  if (mail) return <MailNotice mail={mail} />;
+  return (
+    <p role="alert" className="basis-full text-xs text-destructive">
+      {t("login_link_error", { message: errorText(error, locale) })}
+    </p>
   );
 }
 

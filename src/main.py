@@ -3927,6 +3927,7 @@ def classify_run_quality(
             site_details[site] = {
                 "status": "failed",
                 "products": 0,
+                "distinct_products": 0,
                 "items_expected": 0,
                 "items_completed": 0,
                 "items_failed": 0,
@@ -3952,6 +3953,12 @@ def classify_run_quality(
             )
             failed = expected - completed
         products = len(result.products)
+        # `products` — строки листинга: товар, стоящий в нескольких категориях
+        # сайта, приходит из каждой (у aptekonline 96 тыс. строк на 27 тыс.
+        # товаров). На этом числе стоят базы прогона, поэтому оно не меняется;
+        # людям показывается число разных товаров — по ключу, под которым
+        # `persist_results` пишет товар.
+        distinct_products = len({product.external_id for product in result.products})
         baseline = baselines.get(site)
         reasons: list[str] = []
         ordered_items = list(result.item_results.items())
@@ -4020,6 +4027,7 @@ def classify_run_quality(
         site_details[site] = {
             "status": status,
             "products": products,
+            "distinct_products": distinct_products,
             "items_expected": expected,
             "items_completed": completed,
             "items_failed": failed,
@@ -4507,6 +4515,41 @@ def _smoke_test_per_site_coverage(
     session.commit()
 
 
+class _ObservedEntries:
+    """Записи сбора, для которых прогон уже сохранил наблюдение.
+
+    Команда `run` отдаёт каждую запись в `persist_results` дважды: колбэк по
+    категориям — сразу после категории, финальный проход — в конце целиком и в
+    порядке категорий. Финальный проход нужен: он пишет то, что мимо колбэка
+    прошло (раздел, оборвавшийся на середине, — у aloe так регулярно обрывается
+    `dermanlar`), и оставляет товару категорию последнего раздела. Но строка
+    `offer_observations` на запись сбора должна быть одна. До 2026-10-07 их было
+    две: 3,1 млн лишних строк из 6,5 млн.
+
+    Запись — это объект `ScrapedProduct`, а не товар: один товар приходит из
+    нескольких категорий отдельными записями (у aptekonline в среднем 3,5 на
+    товар), и у каждой своё наблюдение. Поэтому сверка по объекту, а не по
+    `(site, external_id)`. Отсюда требование к сборщикам: на каждую запись —
+    свой объект, и после выдачи он не меняется. Один объект, выданный дважды,
+    получит одно наблюдение.
+
+    Объекты удерживаются: адрес освободившегося объекта Python отдаёт
+    следующему, а результат сайта при фатальном сбое заменяется целиком
+    (`site_fatal_result`) — без ссылки чужая запись могла бы получить адрес
+    уже учтённой и остаться без наблюдения.
+    """
+
+    def __init__(self) -> None:
+        self._by_id: dict[int, ScrapedProduct] = {}
+
+    def add(self, products: list[ScrapedProduct]) -> None:
+        for product in products:
+            self._by_id[id(product)] = product
+
+    def __contains__(self, product: object) -> bool:
+        return self._by_id.get(id(product)) is product
+
+
 _PERSIST_CHUNK = 200
 """Размер чанка для pre-fetch / flush / commit. Для SSH-туннеля к prod Postgres
 важно держать INSERT'ы небольшими — на 1000-row INSERT с RETURNING туннель
@@ -4537,6 +4580,7 @@ def persist_results(
     *,
     aloe_whole_catalog: bool = False,
     trusted_identity_observations: bool = False,
+    observed: _ObservedEntries | None = None,
 ) -> int:
     """Записать сбор пачками; что и как пишется — в `_persist_chunks`.
 
@@ -4557,6 +4601,7 @@ def persist_results(
             results,
             aloe_whole_catalog=aloe_whole_catalog,
             trusted_identity_observations=trusted_identity_observations,
+            observed=observed,
         )
     except Exception:
         try:
@@ -4579,6 +4624,7 @@ def _persist_chunks(
     *,
     aloe_whole_catalog: bool = False,
     trusted_identity_observations: bool = False,
+    observed: _ObservedEntries | None = None,
 ) -> int:
     """Сохранить ScrapedProduct/Promo в БД, обновить last_seen_at, добавить snapshots.
 
@@ -4603,6 +4649,14 @@ def _persist_chunks(
     решает, кому достаётся строка, записанная под общим слагом
     (`_adopt_aloe_product_numbers`); решение необратимо, поэтому признак
     считает вызывающий — `run`, до записи.
+
+    `observed` — записи, для которых этот прогон уже сохранил наблюдение. Таким
+    записям строка `offer_observations` повторно не добавляется; всё остальное
+    (карточка товара, сравнение цены) делается как обычно. Записи каждого
+    закоммиченного чанка добавляются в `observed`. Без `observed` наблюдение
+    пишется на каждую запись каждого вызова. Проход с
+    `trusted_identity_observations` пишет строку всегда: отметку доверия к
+    личности нельзя потерять из-за того, что запись уже учтена без неё.
 
     Returns: общее число spарсенных продуктов (НЕ записанных snapshot'ов —
     после diff-only snapshots может быть существенно меньше, чем products).
@@ -4758,18 +4812,20 @@ def _persist_chunks(
 
             # Identity and website-offer history are independent from diff-only
             # price snapshots, so every explicit scrape observation is stored.
+            # Stored once: the final pass of `run` replays entries the category
+            # callback has already observed, and must not add a second row.
             observed_at = utcnow()
             observations: list[storage.OfferObservation] = []
             for sp, _, _, _, _ in prepared:
                 product = existing_by_key[(sp.site, sp.external_id)]
-                observations.append(
-                    apply_product_observation(
-                        product,
-                        sp,
-                        run_id=run.id,
-                        observed_at=observed_at,
-                    )
+                observation = apply_product_observation(
+                    product,
+                    sp,
+                    run_id=run.id,
+                    observed_at=observed_at,
                 )
+                if trusted_identity_observations or observed is None or sp not in observed:
+                    observations.append(observation)
             if trusted_identity_observations:
                 for observation in observations:
                     observation.identity_verified = True
@@ -4851,6 +4907,8 @@ def _persist_chunks(
 
             # === Commit per chunk — bounds transaction, friendly to SSH tunnel ===
             session.commit()
+            if observed is not None:
+                observed.add(chunk_products)
 
         # === Promos обычно мало (десятки), один batch ОК ===
         if result.promos:
@@ -6361,6 +6419,7 @@ def run_cmd(
         )
 
         trust_context = None
+        observed_entries = _ObservedEntries()
         try:
             quality_sites: list[str] = list(sites)
             quality_baselines: dict[str, int | None] = {}
@@ -6427,10 +6486,23 @@ def run_cmd(
                             # строка, записанная под общим слагом, решается по
                             # всем товарам сайта сразу (`_adopt_aloe_product_numbers`).
                             return
+                        # Учёт наблюдений узнаёт запись по объекту: сборщик обязан
+                        # отдавать на каждую запись свой объект (`BaseScraper.scrape`).
+                        # Объект, уже учтённый в другой категории, — нарушение
+                        # этого правила: его запись наблюдения не получит.
+                        reused = sum(1 for product in cat_products if product in observed_entries)
+                        if reused:
+                            log.warning(
+                                "observed_entry_object_reused",
+                                site=site_name,
+                                category=slug,
+                                entries=reused,
+                            )
                         persist_results(
                             session,
                             run,
                             [ScrapeResult(site=site_name, products=list(cat_products))],
+                            observed=observed_entries,
                         )
 
                     on_category = _persist_category
@@ -6625,6 +6697,7 @@ def run_cmd(
                 persistence_results,
                 trusted_identity_observations=identity_partition is not None,
                 aloe_whole_catalog=is_full_catalog and quality_status == "ok" and catalog_verified,
+                observed=observed_entries,
             )
             if identity_partition is not None:
                 if count != identity_partition["trusted_count"]:

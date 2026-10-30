@@ -748,6 +748,26 @@ export interface Recipient {
   created_at: string | null;
 }
 
+/**
+ * Что стало с письмом со ссылкой на вход — `LoginLinkMail` в src/api.py.
+ * `sent` — почтовый сервер письмо принял; дошло ли до ящика, отсюда не видно.
+ */
+export type LoginLinkMailReason = "smtp_not_configured" | "smtp_refused" | "send_failed";
+
+export interface LoginLinkMail {
+  sent: boolean;
+  reason: LoginLinkMailReason | null;
+  error_type?: string | null;
+  smtp_code?: number | null;
+  smtp_status?: string | null;
+  errno?: number | null;
+}
+
+/** Ответ на создание пользователя: сам пользователь и исход письма-приглашения. */
+export interface RecipientCreated extends Recipient {
+  invite_mail: LoginLinkMail | null;
+}
+
 export interface RecipientCreate {
   email: string;
   name?: string | null;
@@ -771,8 +791,12 @@ export interface RunRow {
   started_at: string | null;
   finished_at: string | null;
   status: string;
+  /** Строки листинга всех сайтов: товар из нескольких категорий — несколько раз. */
   products_scraped: number;
+  /** Строки листинга по сайтам. */
   products_per_site: Record<string, number> | null;
+  /** Разные товары по сайтам; у прогонов до 2026-10-30 — пусто (`lib/run-counts`). */
+  products_distinct_per_site?: Record<string, number> | null;
   run_quality: RunQuality | null;
   sites_completed: string | null;
   error_message: string | null;
@@ -785,6 +809,7 @@ export interface RunBreakdown {
   status: string;
   products_scraped: number;
   products_per_site: Record<string, number>;
+  products_distinct_per_site?: Record<string, number> | null;
   products_per_site_category: Record<string, Record<string, number>>;
   run_quality: RunQuality | null;
   sites_completed: string | null;
@@ -817,7 +842,10 @@ export interface AuditLogPage {
 
 export interface RunQualitySite {
   status: "ok" | "degraded" | "failed";
+  /** Строки листинга (на них стоят базы прогона). */
   products: number;
+  /** Разные товары; нет у прогонов до 2026-10-30. */
+  distinct_products?: number;
   items_expected: number;
   items_completed: number;
   items_failed: number;
@@ -1239,7 +1267,7 @@ export const api = {
   },
   recipients: () => request<Recipient[]>("/api/v1/dash/recipients"),
   recipientCreate: (payload: RecipientCreate) =>
-    request<Recipient>("/api/v1/dash/recipients", {
+    request<RecipientCreated>("/api/v1/dash/recipients", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -1252,8 +1280,15 @@ export const api = {
     request<void>(`/api/v1/dash/recipients/${id}${hard ? "?hard=true" : ""}`, {
       method: "DELETE",
     }),
+  /** Админ задаёт пароль другому пользователю; 422 — правило пароля (`passwordProblemInResponse`). */
+  recipientSetPassword: (id: number, new_password: string) =>
+    request<{ ok: true }>(`/api/v1/dash/recipients/${id}/password`, {
+      method: "POST",
+      body: JSON.stringify({ new_password }),
+    }),
+  /** 200 — письмо принято почтовым сервером; 424 — не ушло или не подтверждено (`loginLinkMailFromError`). */
   recipientSendLoginLink: (id: number) =>
-    request<{ ok: boolean; email: string }>(
+    request<{ ok: boolean; email: string; mail: LoginLinkMail }>(
       `/api/v1/dash/recipients/${id}/send-login-link`,
       { method: "POST" },
     ),
@@ -1520,6 +1555,8 @@ export interface ScrapeRequestRow {
   products_scraped: number | null;
   /** Per-site breakdown {site: count} from a terminal run. */
   products_per_site: Record<string, number> | null;
+  /** Distinct products per site; empty for runs recorded before 2026-10-30. */
+  products_distinct_per_site?: Record<string, number> | null;
 }
 
 export interface ScrapeRequestHistoryPage {

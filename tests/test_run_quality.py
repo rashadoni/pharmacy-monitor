@@ -106,6 +106,42 @@ def test_fetch_retries_are_recorded_without_degrading_the_run():
     assert "fetch_retries" not in quality["sites"]["aptekonline"]
 
 
+def test_distinct_products_count_each_product_once_while_listing_rows_stay():
+    """aptekonline отдаёт товар из каждой категории, где он стоит: строк листинга
+    больше, чем товаров (прогон №1141 — 96 347 строк на 27 097 товаров). Людям
+    показывается число разных товаров, а базы прогона по-прежнему считают строки:
+    по разным товарам этот сбор вышел бы ниже половины базы и стал бы degraded."""
+    result = ScrapeResult(
+        site="aptekonline",
+        products=[
+            _product("aptekonline", "both", "parent"),
+            _product("aptekonline", "both", "child"),
+            _product("aptekonline", "only-parent", "parent"),
+            _product("aptekonline", "x", "a"),
+            _product("aptekonline", "x", "b"),
+            _product("aptekonline", "x", "c"),
+        ],
+        items_expected=1,
+        items_completed=1,
+    )
+
+    status, quality = classify_run_quality(
+        [result],
+        ["aptekonline", "aloe"],
+        mode="category",
+        baselines={"aptekonline": 7},
+        enforce_baseline=True,
+    )
+
+    site = quality["sites"]["aptekonline"]
+    assert (site["products"], site["distinct_products"]) == (6, 3)
+    assert site["baseline_fraction"] == round(6 / 7, 4)
+    assert "below_baseline" not in site["reasons"]
+    missing = quality["sites"]["aloe"]
+    assert (missing["products"], missing["distinct_products"]) == (0, 0)
+    assert status == "degraded", "aloe не собран — это про него, а не про счётчик"
+
+
 @pytest.mark.asyncio
 async def test_scrape_site_carries_aloe_fetch_retries_into_the_result(monkeypatch):
     """Счётчик живёт на скрейпере; без переноса в результат он молча равен нулю."""
