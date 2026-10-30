@@ -1403,8 +1403,8 @@ def _pharmonline_public_api_reconciliation_plan_manifest_sha256(
             public_api_external_id=action.public_api_external_id,
             legacy_canonical_url=action.legacy_canonical_url,
             public_api_canonical_url=action.public_api_canonical_url,
-            # Absent for every action that closes no isolation case, so plans
-            # without pending cases hash exactly as before.
+            # Absent for every action that closes no isolation case: their
+            # lines stay as they were (the new metric keys still change the hash).
             conflict=(
                 f"\tconflict\t{action.conflict_evidence_sha256}"
                 if action.conflict_evidence_sha256

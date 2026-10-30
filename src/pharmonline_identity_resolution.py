@@ -21,7 +21,9 @@ it was recorded for. Three decisions, each bound to the exact case state:
 
 A decision holds only while the case's ``last_run_id`` and variant digest are
 the ones it names. A later isolation of the same Product advances the case and
-reopens it; the old decision stays as history.
+reopens it; the old decision stays as history. Variants are append-only and v1
+closes only a case with exactly one source pair, so a reopened case stays open
+until a later decision version handles several pairs.
 """
 
 from __future__ import annotations
@@ -277,6 +279,18 @@ def valid_shadow_product_ids(session, products_by_id, *, tenant_id) -> set[int]:
         case = session.get(_Case, row.conflict_id)
         if (
             counts[row.product_id] != 1
+            or row.proof_version != PROOF_VERSION
+            or row.source_transport != "decodo"
+            or not all(
+                _SHA_RE.fullmatch(value or "")
+                for value in (
+                    row.variant_set_sha256,
+                    row.evidence_sha256,
+                    row.source_manifest_sha256,
+                    row.catalog_fingerprint_sha256,
+                )
+            )
+            or re.fullmatch(r"[0-9]{1,20}", str(row.preflight_run_ref)) is None
             or product is None
             or current is None
             or case is None

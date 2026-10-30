@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 from src import main as m
 from src import pharmonline_identity_resolution as resolution
 from src import product_policy, storage
-from src.pharmonline_identity_isolation import prepare_catalog
+from src.pharmonline_identity_isolation import exclude_pending_products, prepare_catalog
 from src.scrapers.pharmonline_public_api import PUBLIC_API_AVAILABILITY_SOURCE
 from tests.test_pharmonline_scheduled_admission import (
     MANUAL,
@@ -296,7 +296,6 @@ def test_case_drift_between_plan_and_apply_writes_nothing(db_session, isolated):
     "override",
     [
         {"source_transport": "direct"},
-        {"allow_identity_retirement": False},
         {"expected_plan_manifest_sha256": None},
         {"admission_proof_version": m._PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_PROOF_VERSION},
     ],
@@ -309,6 +308,49 @@ def test_apply_requires_the_manual_reviewed_decodo_route(db_session, isolated, o
     db_session.rollback()
     assert _rows(db_session, storage.Product) == before
     assert _count(db_session, storage.PharmonlineIdentityConflictResolution) == 0
+
+
+def test_plan_without_opt_in_is_refused_by_its_own_safety_gate(db_session, isolated):
+    _, source = isolated
+    without = m._pharmonline_public_api_reconciliation_plan_manifest_sha256(
+        *_plan(db_session, source, allow_identity_retirement=False)
+    )
+    before = _rows(db_session, storage.Product)
+    with pytest.raises(
+        m.PharmonlinePublicAPIReconciliationError, match="identity_conflict_pending=4"
+    ):
+        _apply(
+            db_session,
+            source,
+            allow_identity_retirement=False,
+            expected_plan_manifest_sha256=without,
+        )
+    db_session.rollback()
+    assert _rows(db_session, storage.Product) == before
+
+
+def test_partial_producers_stay_blocked_until_cases_close(db_session, isolated):
+    cards, source = isolated
+    replacements = [
+        p for p in source[0].products if p.name in {KALSIMIKS, FRUTO, RAXME, AZITROMISIN}
+    ]
+    assert exclude_pending_products(db_session, replacements) == []
+    _apply(db_session, source)
+    assert exclude_pending_products(db_session, replacements) == replacements
+
+
+def test_shadow_archive_with_altered_proof_fails_verification(db_session, isolated):
+    _, source = isolated
+    _apply(db_session, source)
+    row = db_session.scalar(
+        select(storage.PharmonlineIdentityConflictResolution).where(
+            storage.PharmonlineIdentityConflictResolution.decision == resolution.SHADOW
+        )
+    )
+    row.source_transport = "direct"
+    db_session.commit()
+    with pytest.raises(m.PharmonlinePublicAPIIdentityError, match="retirement_conflicts=1"):
+        m._verify_pharmonline_public_api_identities(db_session, source, tenant_id=1)
 
 
 def test_shadow_with_any_observation_is_not_archived(db_session, isolated):
