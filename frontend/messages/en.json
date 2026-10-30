@@ -370,6 +370,7 @@
     "event_promo_started_title": "New promo on {site}: {promo}",
     "event_price_raise_title": "Can raise price: {product} (+{pct}%)",
     "event_price_raise_detail": "Client: {client} ₼. Competitor median: {median} ₼.",
+    "event_price_raise_cheapest_detail": "Client: {client} ₼. Cheapest competitor — {site}: {competitor} ₼.",
     "event_site_drop_smoke_title": "{site} collected fewer products than usual",
     "event_site_drop_smoke_detail": "This run collected {current} products for {site}. Previous ok-run average: {avg}.",
     "onboarding_title": "Working with notifications",
