@@ -16,14 +16,16 @@ it was recorded for. Three decisions, each bound to the exact case state:
   ever observed, with no audit lineage, which only shares the address of the
   trusted Product the source still names exactly. It is archived like a
   retired row and keeps its history.
-* ``current_confirmed`` — that trusted Product's own case closes together with
-  the shadow: its stored pair is the current pair and nothing competes for it.
+* ``current_confirmed`` — the case of a trusted Product whose stored pair is
+  exactly the current pair and that nothing competes with any more: together
+  with its shadow, or alone when the case only stays open because of pairs
+  from an earlier episode (an address that changed and came back).
 
 A decision holds only while the case's ``last_run_id`` and variant digest are
 the ones it names. A later isolation of the same Product advances the case and
-reopens it; the old decision stays as history. Variants are append-only and v1
-closes only a case with exactly one source pair, so a reopened case stays open
-until a later decision version handles several pairs.
+reopens it; the old decision stays as history. Variants are append-only, so a
+decision looks at the pairs of the case's latest episode only (those the run
+that last isolated it saw) and requires exactly one.
 """
 
 from __future__ import annotations
@@ -42,8 +44,11 @@ RETIRED = "retired"
 SHADOW = "shadow_archived"
 CONFIRMED = "current_confirmed"
 DECISIONS = frozenset({RETIRED, SHADOW, CONFIRMED})
-# ``retirement_kind`` of the reconciliation plan action that archives a shadow.
+# ``retirement_kind`` of plan actions that only record a decision: archive a
+# shadow (and confirm its current card), or confirm a current card alone.
 SHADOW_KIND = "isolated_url_shadow"
+CONFIRM_KIND = "isolated_current_confirmed"
+DECISION_ONLY_KINDS = frozenset({SHADOW_KIND, CONFIRM_KIND})
 TABLE = storage.PharmonlineIdentityConflictResolution.__table__.name
 
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
@@ -73,6 +78,8 @@ class CaseState:
 
     cases: dict[int, _Case]
     variants: dict[int, frozenset[tuple[str, str]]]
+    # Pairs seen by the run that last isolated the case (its latest episode).
+    episode: dict[int, frozenset[tuple[str, str]]] = field(default_factory=dict)
     current: dict[int, _Resolution] = field(default_factory=dict)
 
     @property
@@ -118,11 +125,20 @@ def load_case_state(session, products_by_id) -> CaseState:
         for case in session.scalars(select(_Case).execution_options(populate_existing=True))
     }
     grouped: dict[int, set[tuple[str, str]]] = {case_id: set() for case_id in cases}
+    latest: dict[int, set[tuple[str, str]]] = {case_id: set() for case_id in cases}
     for variant in session.scalars(select(_Variant).execution_options(populate_existing=True)):
-        if variant.conflict_id not in cases:
+        case = cases.get(variant.conflict_id)
+        if case is None:
             raise PharmonlinePublicAPIIdentityError("identity variant has no conflict case")
-        grouped[variant.conflict_id].add((str(variant.external_id), variant.canonical_url))
-    state = CaseState(cases, {case_id: frozenset(pairs) for case_id, pairs in grouped.items()})
+        pair = (str(variant.external_id), variant.canonical_url)
+        grouped[case.id].add(pair)
+        if variant.last_run_id == case.last_run_id:
+            latest[case.id].add(pair)
+    state = CaseState(
+        cases,
+        {case_id: frozenset(pairs) for case_id, pairs in grouped.items()},
+        {case_id: frozenset(pairs) for case_id, pairs in latest.items()},
+    )
     rows = (
         session.scalars(
             select(_Resolution).order_by(_Resolution.id).execution_options(populate_existing=True)
@@ -186,15 +202,15 @@ def _decision_invalid_reason(session, row, state, products_by_id, retired) -> st
         return "transport"
     if re.fullmatch(r"[0-9]{1,20}", str(row.preflight_run_ref)) is None:
         return "preflight_run"
-    public_id, public_url = str(row.public_api_external_id), row.public_api_canonical_url
-    if (
-        _PHARMONLINE_METEOR_ID_RE.fullmatch(public_id) is None
-        or _canonical(public_url) != public_url
-    ):
+    public_id, stored_url = str(row.public_api_external_id), row.public_api_canonical_url
+    # Re-canonicalize like the other ledgers: a later canonicalizer change must
+    # not turn every stored decision into a refusal.
+    public_url = _canonical(stored_url)
+    if _PHARMONLINE_METEOR_ID_RE.fullmatch(public_id) is None or public_url is None:
         return "public_pair"
     if _PHARMONLINE_METEOR_ID_RE.fullmatch(str(row.legacy_external_id)) is None:
         return "legacy_id"
-    if state.variants.get(row.conflict_id) != frozenset({(public_id, public_url)}):
+    if state.episode.get(row.conflict_id) != frozenset({(public_id, stored_url)}):
         return "variants"
     product = products_by_id.get(row.product_id)
     current = products_by_id.get(row.current_product_id)
@@ -207,9 +223,9 @@ def _decision_invalid_reason(session, row, state, products_by_id, retired) -> st
         or current.site != "pharmonline"
     ):
         return "product_tenant"
-    # The current Product's later life is not part of the decision: a case
-    # stays closed until isolation reopens it, and a legitimate later change
-    # of that Product must not turn this record into a catalog-wide refusal.
+    # The decision does not re-check the current Product's later life: a case
+    # stays closed until isolation reopens it. (``retired`` still depends on
+    # its retirement record staying valid, which retirement v1 enforces anyway.)
     if row.decision == RETIRED:
         retirement = (
             session.get(storage.PharmonlinePublicAPIIdentityRetirement, row.retirement_id)
@@ -231,13 +247,9 @@ def _decision_invalid_reason(session, row, state, products_by_id, retired) -> st
     elif row.decision == SHADOW:
         if (
             row.retirement_id is not None
-            or product.id == current.id
             or product.id not in retired
             or str(row.legacy_external_id) == public_id
-            or row.archived_external_id
-            != shadow_archived_id(product.id, str(row.legacy_external_id))
-            or str(product.external_id) != row.archived_external_id
-            or _canonical(product.url) != public_url
+            or not _shadow_archive_ok(row, product, current)
         ):
             return "shadow"
     elif (
@@ -245,13 +257,27 @@ def _decision_invalid_reason(session, row, state, products_by_id, retired) -> st
         or row.archived_external_id is not None
         or product.id != current.id
         or str(row.legacy_external_id) != public_id
-        or not any(
-            other.decision == SHADOW and other.current_product_id == current.id
-            for other in state.current.values()
-        )
     ):
         return "confirmation"
     return None
+
+
+def _shadow_archive_ok(row, product, current) -> bool:
+    """One predicate for an archived shadow, shared by both validators."""
+    from src import pharmonline_identity_recovery as recovery
+
+    return bool(
+        product.id != current.id
+        and row.archived_external_id == shadow_archived_id(product.id, str(row.legacy_external_id))
+        and str(product.external_id) == row.archived_external_id
+        and _canonical(product.url) is not None
+        and _canonical(product.url) == _canonical(row.public_api_canonical_url)
+        and product.availability_source == recovery.AVAILABILITY_SOURCE
+        and product.offer_availability_status == "unknown"
+        and product.offer_quantity is None
+        and product.availability_run_id is None
+        and product.availability_observed_at is not None
+    )
 
 
 def valid_shadow_product_ids(session, products_by_id, *, tenant_id) -> set[int]:
@@ -260,8 +286,6 @@ def valid_shadow_product_ids(session, products_by_id, *, tenant_id) -> set[int]:
     Called by ``pharmonline_identity_recovery.valid_state``: an archive marker
     without such a decision stays a hard verification failure there.
     """
-    from src import pharmonline_identity_recovery as recovery
-
     if not available(session):
         return set()
     rows = session.scalars(
@@ -299,16 +323,7 @@ def valid_shadow_product_ids(session, products_by_id, *, tenant_id) -> set[int]:
             or product.tenant_id != tenant_id
             or current.tenant_id != tenant_id
             or product.site != "pharmonline"
-            or product.id == current.id
-            or row.archived_external_id
-            != shadow_archived_id(product.id, str(row.legacy_external_id))
-            or str(product.external_id) != row.archived_external_id
-            or _canonical(product.url) != row.public_api_canonical_url
-            or product.availability_source != recovery.AVAILABILITY_SOURCE
-            or product.offer_availability_status != "unknown"
-            or product.offer_quantity is not None
-            or product.availability_run_id is not None
-            or product.availability_observed_at is None
+            or not _shadow_archive_ok(row, product, current)
         ):
             continue
         valid.add(product.id)
@@ -360,7 +375,7 @@ def retirement_evidence(
     except PharmonlinePublicAPIIdentityError:
         return None
     case = state.pending_by_product.get(legacy.id)
-    if case is None or state.variants[case.id] != frozenset({(new_id, new_url)}):
+    if case is None or state.episode[case.id] != frozenset({(new_id, new_url)}):
         return None
     for other in state.pending:
         if other.id != case.id and any(
@@ -543,16 +558,19 @@ def _shadow_action(
     from src import main as core
 
     shadows = [p for p in at_url if p.id != current.id]
-    if len(shadows) != 1:
+    if len(shadows) > 1:
         return None
-    shadow = shadows[0]
-    if shadow.id not in touched or not touched <= {shadow.id, current.id}:
+    shadow = shadows[0] if shadows else None
+    # Every touched Product is decided here: the shadow (when there is one)
+    # and the current card itself.
+    expected = {current.id} | ({shadow.id} if shadow is not None else set())
+    if touched - expected or (shadow is not None and shadow.id not in touched):
         return None
     pair = frozenset({(external_id, url)})
     pending = index.state.pending_by_product
     for product in (shadow, current):
-        case = pending.get(product.id)
-        if case is not None and index.state.variants[case.id] != pair:
+        case = pending.get(product.id) if product is not None else None
+        if case is not None and index.state.episode[case.id] != pair:
             return None
     # The current card must already be trusted for exactly this pair and keep
     # its strict display name: the decision asserts nothing new about it.
@@ -562,6 +580,21 @@ def _shadow_action(
     name = core._pharmonline_product_name_signature(current.name)
     if not name or name != core._pharmonline_product_name_signature(public_product.name):
         return None
+    if shadow is None:
+        # Nothing competes any more; the case stays open only because of pairs
+        # from an earlier episode. Close it without touching any row.
+        if current.id not in touched:
+            return None
+        return core._PharmonlinePublicAPIIdentityQuarantineAction(
+            legacy_product_id=current.id,
+            legacy_external_id=external_id,
+            legacy_canonical_url=url,
+            public_api_external_id=external_id,
+            public_api_canonical_url=url,
+            public_product=public_product,
+            retirement_kind=CONFIRM_KIND,
+            conflict_evidence_sha256=evidence_sha256(index.state, [(current, None)]),
+        )
     legacy_id = str(shadow.external_id)
     if (
         core._PHARMONLINE_METEOR_ID_RE.fullmatch(legacy_id) is None
@@ -675,7 +708,7 @@ def apply_resolutions(
             or case is None
             or case.id in closed
             or legacy.tenant_id != tenant_id
-            or state.variants[case.id] != pair
+            or state.episode[case.id] != pair
         ):
             raise changed()
         if action.retirement_kind in (recovery.URL_CHANGED, recovery.ID_REPLACED):
@@ -705,6 +738,24 @@ def apply_resolutions(
                 legacy_external_id=action.legacy_external_id,
                 evidence=evidence,
                 retirement_id=retirement.id,
+            )
+            closed.add(case.id)
+            continue
+        if action.retirement_kind == CONFIRM_KIND:
+            if (
+                str(legacy.external_id) != action.public_api_external_id
+                or _canonical(legacy.url) != action.public_api_canonical_url
+                or evidence_sha256(state, [(legacy, None)]) != action.conflict_evidence_sha256
+            ):
+                raise changed()
+            record(
+                action,
+                case,
+                CONFIRMED,
+                product=legacy,
+                current=legacy,
+                legacy_external_id=action.public_api_external_id,
+                evidence=action.conflict_evidence_sha256,
             )
             closed.add(case.id)
             continue
@@ -747,7 +798,7 @@ def apply_resolutions(
         closed.add(case.id)
         current_case = pending.get(current.id)
         if current_case is not None:
-            if current_case.id in closed or state.variants[current_case.id] != pair:
+            if current_case.id in closed or state.episode[current_case.id] != pair:
                 raise changed()
             record(
                 action,

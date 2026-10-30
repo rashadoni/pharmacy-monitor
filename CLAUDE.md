@@ -1114,6 +1114,9 @@ Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~
 > `shadow_archived`, `current_confirmed` пишутся в
 > `pharmonline_identity_conflict_resolutions`, история не переносится. Без
 > флага план с открытыми делами небезопасен (`identity_conflict_pending`).
+> ⚠️ После первого записанного решения откат кода за этот PR — только вместе с
+> восстановлением базы: прежний код считает закрытые дела противоречием и роняет
+> каждый ночной сбор pharmonline.
 > Условия, проверка и откат — [docs/RUNBOOK.md](docs/RUNBOOK.md) «Закрытие дел
 > изоляции». Запуск на проде пишет в боевую базу — только по слову владельца.
 

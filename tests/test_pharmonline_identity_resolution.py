@@ -482,3 +482,32 @@ def test_later_reconciled_move_of_the_current_card_keeps_decisions_valid(db_sess
     assert not cards["current"].identity_conflicted
     assert product_policy.identity_is_retired(cards["shadow"])
     m._verify_pharmonline_public_api_identities(db_session, moved, tenant_id=1)
+
+
+def test_case_reopened_by_an_address_flap_closes_again_by_confirmation(db_session, isolated):
+    cards, source = isolated
+    _apply(db_session, source)
+    moved = _source()
+    moved[0].products[-1] = _api(3, "azitromisin-yeni", name=AZITROMISIN)
+    _isolate(db_session, moved)  # the site moves the card: its closed case reopens
+    _, partition, _, _ = _isolate(db_session, source)  # ...and moves it back
+    assert partition["isolated_count"] == 1
+    db_session.expire_all()
+    assert cards["current"].identity_conflicted
+
+    _, _, quarantines, metrics = _plan(db_session, source)
+
+    assert metrics["identity_conflict_cases"] == 1
+    assert metrics["identity_conflict_confirmations_ready"] == 1
+    assert m._pharmonline_public_api_reconciliation_is_safe(metrics)
+    assert [(a.legacy_product_id, a.retirement_kind) for a in quarantines] == [
+        (cards["current"].id, resolution.CONFIRM_KIND)
+    ]
+    before = (cards["current"].external_id, cards["current"].url)
+    _apply(db_session, source)
+    _, partition, _, _ = _isolate(db_session, source)
+    assert partition is None
+    db_session.expire_all()
+    assert (cards["current"].external_id, cards["current"].url) == before
+    assert not cards["current"].identity_conflicted
+    assert product_policy.identity_is_retired(cards["shadow"])

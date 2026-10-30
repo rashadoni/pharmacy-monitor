@@ -1136,6 +1136,7 @@ def _pharmonline_public_api_reconciliation_plan(
         "identity_conflict_cases": conflict_index.pending_count(tenant_id),
         "identity_conflict_retirements_ready": 0,
         "identity_conflict_shadows_ready": 0,
+        "identity_conflict_confirmations_ready": 0,
         "identity_conflict_pending": 0,
         "identity_conflict_unresolved": 0,
         "identity_conflict_record_conflict": int(conflict_index.broken),
@@ -1163,6 +1164,9 @@ def _pharmonline_public_api_reconciliation_plan(
             elif resolution_action.retirement_kind == identity_resolution.SHADOW_KIND:
                 quarantines.append(resolution_action)
                 metrics["identity_conflict_shadows_ready"] += 1
+            elif resolution_action.retirement_kind == identity_resolution.CONFIRM_KIND:
+                quarantines.append(resolution_action)
+                metrics["identity_conflict_confirmations_ready"] += 1
             else:
                 quarantines.append(resolution_action)
                 metrics["identity_retirements_ready"] += 1
@@ -1357,6 +1361,7 @@ def _pharmonline_public_api_reconciliation_plan(
         + metrics["identity_splits_ready"]
         + metrics["identity_retirements_ready"]
         + metrics["identity_conflict_shadows_ready"]
+        + metrics["identity_conflict_confirmations_ready"]
     )
     metrics["unclassified_api_identities"] = max(
         0,
@@ -1598,7 +1603,7 @@ def _apply_pharmonline_public_api_reconciliation(
             [
                 action
                 for action in retirements
-                if action.retirement_kind != identity_resolution.SHADOW_KIND
+                if action.retirement_kind not in identity_resolution.DECISION_ONLY_KINDS
             ],
             results,
             tenant_id=tenant_id,
@@ -3000,7 +3005,11 @@ def _diagnose_pharmonline_public_api_reconciliation(
     )
     schema_migrated = _pharmonline_public_api_recovery_tables_available(session)
     if allow_identity_retirement:
-        schema_migrated = schema_migrated and identity_recovery.available(session)
+        schema_migrated = (
+            schema_migrated
+            and identity_recovery.available(session)
+            and identity_resolution.available(session)
+        )
     baselines: list[storage.PharmonlinePublicAPICatalogBaseline] = []
     if schema_migrated:
         baselines = (

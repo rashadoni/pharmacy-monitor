@@ -109,7 +109,8 @@ Workflow сохраняет бэкап и следы при сбое, но **н�
 тот же recover с `retire_conflicting_identities=true` записывают и retirement, и
 решение `retired` в `pharmonline_identity_conflict_resolutions`. Для дела без
 retirement-формы — исторической «тени» по адресу доверенной карточки — есть
-решение `shadow_archived`. Для дел URL_CHANGED redirect-доказательство не
+решение `shadow_archived`, а для дела, которое держится только на парах
+прошлого эпизода, — `current_confirmed`. Для дел URL_CHANGED redirect-доказательство не
 требуется: дело записано полным каталогом, прежний адрес обязан уйти из каталога,
 а разделение не утверждает преемственности. Подробно —
 [RUNBOOK.md](RUNBOOK.md) «Закрытие дел изоляции».
