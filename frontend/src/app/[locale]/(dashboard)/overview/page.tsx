@@ -26,6 +26,8 @@ import { QuickActions } from "@/components/quick-actions";
 import { formatNumber, formatRelative, formatPrice } from "@/lib/utils";
 import { categoryDisplayLabel } from "@/lib/category-label";
 import { runStatusToneClass } from "@/lib/run-quality";
+import { runProductCount, siteProductCount } from "@/lib/run-counts";
+import { ProductCountText } from "@/components/product-count";
 import { MetricStrip } from "@/components/metric-strip";
 
 export default function OverviewPage() {
@@ -241,7 +243,7 @@ function LatestRunsBySitePanel({
                   attempt.id !== run?.id &&
                   (attempt.status === "degraded" || attempt.status === "failed"),
                 );
-                const siteProducts = run?.products_per_site?.[item.site] ?? run?.products_scraped ?? null;
+                const siteProducts = siteProductCount(run, item.site);
                 return (
                   <tr key={item.site} className="border-t border-border">
                     <td className="px-3 py-2 font-medium">{item.site}</td>
@@ -268,8 +270,8 @@ function LatestRunsBySitePanel({
                         )}
                       </div>
                     </td>
-                    <td className="px-3 py-2 text-right tabular-nums">
-                      {siteProducts == null ? "—" : siteProducts}
+                    <td className="px-3 py-2 text-right">
+                      <ProductCountText count={siteProducts} />
                     </td>
                   </tr>
                 );
@@ -393,8 +395,8 @@ function RunRowExpandable({
         <td className="px-3 py-2">
           <StatusBadge status={run.status} />
         </td>
-        <td className="px-3 py-2 text-right tabular-nums">
-          {run.products_scraped}
+        <td className="px-3 py-2 text-right">
+          <ProductCountText count={runProductCount(run)} />
         </td>
         <td className="px-3 py-2 text-muted-foreground hidden md:table-cell">
           {run.sites_completed}
@@ -487,10 +489,9 @@ function RunBreakdownPanel({
             className="rounded-md border border-border bg-card px-3 py-1.5 text-xs"
           >
             <span className="font-medium">{site}:</span>{" "}
-            <span className="tabular-nums font-semibold">
-              {data.products_per_site[site] ?? 0}
-            </span>{" "}
-            <span className="text-muted-foreground">{t("total_label")}</span>
+            <span className="font-semibold">
+              <ProductCountText count={siteProductCount(data, site)} inline />
+            </span>
           </div>
         ))}
       </div>

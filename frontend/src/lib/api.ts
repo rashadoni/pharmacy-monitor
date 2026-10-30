@@ -791,8 +791,12 @@ export interface RunRow {
   started_at: string | null;
   finished_at: string | null;
   status: string;
+  /** Строки листинга всех сайтов: товар из нескольких категорий — несколько раз. */
   products_scraped: number;
+  /** Строки листинга по сайтам. */
   products_per_site: Record<string, number> | null;
+  /** Разные товары по сайтам; у прогонов до 2026-10-30 — пусто (`lib/run-counts`). */
+  products_distinct_per_site?: Record<string, number> | null;
   run_quality: RunQuality | null;
   sites_completed: string | null;
   error_message: string | null;
@@ -805,6 +809,7 @@ export interface RunBreakdown {
   status: string;
   products_scraped: number;
   products_per_site: Record<string, number>;
+  products_distinct_per_site?: Record<string, number> | null;
   products_per_site_category: Record<string, Record<string, number>>;
   run_quality: RunQuality | null;
   sites_completed: string | null;
@@ -837,7 +842,10 @@ export interface AuditLogPage {
 
 export interface RunQualitySite {
   status: "ok" | "degraded" | "failed";
+  /** Строки листинга (на них стоят базы прогона). */
   products: number;
+  /** Разные товары; нет у прогонов до 2026-10-30. */
+  distinct_products?: number;
   items_expected: number;
   items_completed: number;
   items_failed: number;
@@ -1547,6 +1555,8 @@ export interface ScrapeRequestRow {
   products_scraped: number | null;
   /** Per-site breakdown {site: count} from a terminal run. */
   products_per_site: Record<string, number> | null;
+  /** Distinct products per site; empty for runs recorded before 2026-10-30. */
+  products_distinct_per_site?: Record<string, number> | null;
 }
 
 export interface ScrapeRequestHistoryPage {
