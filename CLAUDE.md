@@ -1255,6 +1255,7 @@ SELECT COUNT(*) FROM products;
 - Tests live in `tests/`, named `test_<module>.py`
 - Avoid `print()` in src/ — use `structlog`
 - New endpoints under `/api/v1/dash/*` for frontend, `/api/v1/<x>` for ERP
+- Текст отказа валидатора — постоянная строка, значение в нём не цитируется (`raise ValueError("too long")`, не `f"… {v}"`): ответ 422 отдаёт `type`, `loc`, `msg`, `ctx` без присланного, а вырезать значение из `msg` обработчику нечем. Код причины для интерфейса — в `ctx` через `PydanticCustomError`. Сверяет `tests/test_validation_refusal_echoes_nothing.py`.
 
 ## Important context I should not forget
 
