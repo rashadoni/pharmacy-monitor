@@ -366,6 +366,35 @@ def test_two_sites_in_one_run_share_the_tracking(db_session, monkeypatch):
     assert run.products_per_site == {"aloe": 2, "aptekonline": 3}
 
 
+def test_scraper_that_reuses_an_entry_object_is_reported(db_session, monkeypatch):
+    """Учёт держится на правиле «на каждую запись — свой объект». Сборщик, который
+    отдаёт один объект из двух категорий, это правило нарушает: вторая запись
+    наблюдения не получит. Нарушение не молчит — оно в журнале."""
+    shared = _scraped("both", 10.0, "cat-a")
+    catalog = {"cat-a": [shared], "cat-b": [shared]}
+    events: list[dict] = []
+    real_warning = main_mod.log.warning
+
+    def recording_warning(event, **fields):
+        events.append({"event": event, **fields})
+        return real_warning(event, **fields)
+
+    monkeypatch.setattr(main_mod.log, "warning", recording_warning)
+
+    run = _run_scan(db_session, monkeypatch, catalog)
+
+    assert _observations(db_session, run) == {"both": 1}
+    reused = [event for event in events if event["event"] == "observed_entry_object_reused"]
+    assert reused == [
+        {
+            "event": "observed_entry_object_reused",
+            "site": "aptekonline",
+            "category": "cat-b",
+            "entries": 1,
+        }
+    ]
+
+
 def test_scan_without_incremental_writes_is_unchanged(db_session, monkeypatch):
     """Путь без колбэка (public_api, legacy bridge): всё пишет финальный проход,
     по одному наблюдению на запись."""

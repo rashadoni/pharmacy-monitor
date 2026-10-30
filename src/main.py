@@ -6410,6 +6410,18 @@ def run_cmd(
                             # строка, записанная под общим слагом, решается по
                             # всем товарам сайта сразу (`_adopt_aloe_product_numbers`).
                             return
+                        # Учёт наблюдений узнаёт запись по объекту: сборщик обязан
+                        # отдавать на каждую запись свой объект (`BaseScraper.scrape`).
+                        # Объект, уже учтённый в другой категории, — нарушение
+                        # этого правила: его запись наблюдения не получит.
+                        reused = sum(1 for product in cat_products if product in observed_entries)
+                        if reused:
+                            log.warning(
+                                "observed_entry_object_reused",
+                                site=site_name,
+                                category=slug,
+                                entries=reused,
+                            )
                         persist_results(
                             session,
                             run,
