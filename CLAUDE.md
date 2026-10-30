@@ -1102,6 +1102,21 @@ Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~
 > личностей потом считает доверенной историей (по коду, прогоном не проверено).
 > RUNBOOK «Сбор pharmonline…», уточнение 2026-10-14.
 
+> **Дела изоляции личностей pharmonline закрывает только ручная сверка
+> (2026-10-30, инструмент в PR, не смержен и не выложен).** С прогона №1061
+> (16.10) каждый ночной сбор pharmonline — `degraded`: четыре пары каталога
+> изолированы, пять дел в `pharmonline_identity_conflicts`. Сам сбор их не
+> закроет никогда. Цены остальных ~9 500 карточек при этом доверены (эпоха,
+> рекомендации и утреннее письмо их берут; сверено 30.10 чтением прода), из
+> сравнения выпадают только пять строк. Закрытие — `plan-…-reconciliation.yml` и
+> `recover-…-public-api.yml` с `retire_conflicting_identities=true` после
+> выкладки миграции `0027_identity_resolutions`; решения `retired`,
+> `shadow_archived`, `current_confirmed` пишутся в
+> `pharmonline_identity_conflict_resolutions`, история не переносится. Без
+> флага план с открытыми делами небезопасен (`identity_conflict_pending`).
+> Условия, проверка и откат — [docs/RUNBOOK.md](docs/RUNBOOK.md) «Закрытие дел
+> изоляции». Запуск на проде пишет в боевую базу — только по слову владельца.
+
 > Сервер — Contabo (см. «Server» в начале файла). «Hetzner prod», «Hetzner-IP
 > бан» и сбор с Мака в записях ниже — про машину, удалённую в сентябре 2026, и
 > про схему, снятую 2026-07-03 (`infra/local/README.md`).
