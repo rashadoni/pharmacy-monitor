@@ -12,6 +12,7 @@ from dataclasses import replace
 
 from sqlalchemy import select, text
 
+from src import pharmonline_identity_resolution as identity_resolution
 from src import storage
 from src._time import utcnow
 
@@ -117,26 +118,16 @@ def _classify(session, results, tenant_id):
         if url:
             by_url.setdefault(url, []).append(product)
 
-    cases = list(session.scalars(select(storage.PharmonlineIdentityConflict)))
-    cases_by_id = {case.id: case for case in cases}
-    pending_by_product = {case.product_id: case for case in cases}
+    # Only pending cases isolate. A case closed by a reviewed decision
+    # (pharmonline_identity_resolution) stays as history; the ledger, the
+    # decisions and the conflicted markers are validated together and any
+    # contradiction refuses the whole catalog.
+    state = identity_resolution.load_case_state(session, by_product)
     variants_by_id, variants_by_url = {}, {}
-    for case in cases:
-        product = by_product.get(case.product_id)
-        if (
-            product is None
-            or product.tenant_id != case.tenant_id
-            or not product.identity_conflicted
-        ):
-            raise core.PharmonlinePublicAPIIdentityError("identity conflict ledger is inconsistent")
-    if any(p.identity_conflicted and p.id not in pending_by_product for p in products):
-        raise core.PharmonlinePublicAPIIdentityError("identity conflict evidence is missing")
-    for variant in session.scalars(select(storage.PharmonlineIdentityConflictVariant)):
-        case = cases_by_id.get(variant.conflict_id)
-        if case is None:
-            raise core.PharmonlinePublicAPIIdentityError("identity variant has no conflict case")
-        variants_by_id.setdefault(variant.external_id, set()).add(case.product_id)
-        variants_by_url.setdefault(variant.canonical_url, set()).add(case.product_id)
+    for case in state.pending:
+        for external_id, url in state.variants[case.id]:
+            variants_by_id.setdefault(external_id, set()).add(case.product_id)
+            variants_by_url.setdefault(url, set()).add(case.product_id)
 
     associations, isolated = {}, set()
     for external_id, (url, _) in records.items():
@@ -176,7 +167,7 @@ def _classify(session, results, tenant_id):
         if expanded <= isolated:
             break
         isolated.update(expanded)
-    existing_pending = {c.product_id for c in cases if c.tenant_id == tenant_id}
+    existing_pending = {c.product_id for c in state.pending if c.tenant_id == tenant_id}
     if (
         len(isolated) > MAX_ISOLATED
         or len(isolated) > len(records) * MAX_ISOLATED_FRACTION
@@ -187,7 +178,9 @@ def _classify(session, results, tenant_id):
         replace(result, products=[p for p in result.products if p.external_id not in isolated])
         for result in results
     ]
-    return trusted_results, frozenset(isolated), associations, by_product, pending_by_product
+    # Every case, resolved ones included: isolating a Product again reuses its
+    # case, which advances ``last_run_id`` and so reopens it.
+    return trusted_results, frozenset(isolated), associations, by_product, state.cases_by_product
 
 
 def prepare_catalog(session, results, *, tenant_id, run_id, source_transport):
@@ -314,11 +307,23 @@ def exclude_pending_products(session, products):
     ):
         blocked_ids.add(external_id)
         blocked_urls.add(_canonical_pharmonline_product_url(url))
+    # A Product stays marked exactly while one of its cases is pending, so the
+    # marker selects the variants still in dispute; closed cases do not block.
     for external_id, url in session.execute(
         select(
             storage.PharmonlineIdentityConflictVariant.external_id,
             storage.PharmonlineIdentityConflictVariant.canonical_url,
         )
+        .join(
+            storage.PharmonlineIdentityConflict,
+            storage.PharmonlineIdentityConflict.id
+            == storage.PharmonlineIdentityConflictVariant.conflict_id,
+        )
+        .join(
+            storage.Product,
+            storage.Product.id == storage.PharmonlineIdentityConflict.product_id,
+        )
+        .where(storage.Product.identity_conflicted.is_(True))
     ):
         blocked_ids.add(external_id)
         blocked_urls.add(url)

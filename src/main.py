@@ -34,6 +34,7 @@ load_dotenv(override=True)
 
 from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
 from src import pharmonline_identity_recovery as identity_recovery  # noqa: E402
+from src import pharmonline_identity_resolution as identity_resolution  # noqa: E402
 from src.run_lock import SCRAPE_ADVISORY_LOCK_KEY  # noqa: E402
 from src.scrapers.ai_crawler import AI_CRAWLER_BY_SITE  # noqa: E402
 from src.scrapers.aloe import AloeScraper  # noqa: E402
@@ -325,6 +326,9 @@ class _PharmonlinePublicAPIIdentityQuarantineAction:
     public_product: ScrapedProduct
     retirement_kind: str | None = None
     prior_admission_sha256: str | None = None
+    # Set only when the action closes a pending isolation case: the digest of
+    # the exact case state it was planned against (pharmonline_identity_resolution).
+    conflict_evidence_sha256: str | None = None
 
 
 def _pharmonline_product_name_signature(value: str | None) -> str:
@@ -1079,6 +1083,10 @@ def _pharmonline_public_api_reconciliation_plan(
         session,
         tenant_id=tenant_id,
     )
+    # Pending isolation cases are closed only by an explicit reviewed decision
+    # (retirement v1 or a shadow archive). Without the opt-in no other action
+    # may touch them: an older plan is not a way to lift isolation.
+    conflict_index = identity_resolution.plan_index(session, all_site_products)
 
     actions: list[_PharmonlinePublicAPIReconciliationAction] = []
     admissions: list[_PharmonlinePublicAPIIdentityAdmissionAction] = []
@@ -1125,8 +1133,45 @@ def _pharmonline_public_api_reconciliation_plan(
         "admission_record_conflict": admission_conflicts,
         "quarantine_record_conflict": quarantine_conflicts,
         "trusted_identity_conflict": trusted_identity_conflicts,
+        "identity_conflict_cases": conflict_index.pending_count(tenant_id),
+        "identity_conflict_retirements_ready": 0,
+        "identity_conflict_shadows_ready": 0,
+        "identity_conflict_confirmations_ready": 0,
+        "identity_conflict_pending": 0,
+        "identity_conflict_unresolved": 0,
+        "identity_conflict_record_conflict": int(conflict_index.broken),
     }
     for external_id, (canonical_url, public_product) in api_records.items():
+        if conflict_index.touching(external_id, canonical_url):
+            if not allow_identity_retirement:
+                metrics["identity_conflict_pending"] += 1
+                continue
+            resolution_action = identity_resolution.plan_action(
+                session,
+                conflict_index,
+                external_id=external_id,
+                url=canonical_url,
+                public_product=public_product,
+                api_records=api_records,
+                all_site_products=all_site_products,
+                retired_ids=retired_product_ids,
+                trusted_by_id=trusted_by_id,
+                trusted_history_product_ids=trusted_history_product_ids,
+                tenant_id=tenant_id,
+            )
+            if resolution_action is None:
+                metrics["identity_conflict_unresolved"] += 1
+            elif resolution_action.retirement_kind == identity_resolution.SHADOW_KIND:
+                quarantines.append(resolution_action)
+                metrics["identity_conflict_shadows_ready"] += 1
+            elif resolution_action.retirement_kind == identity_resolution.CONFIRM_KIND:
+                quarantines.append(resolution_action)
+                metrics["identity_conflict_confirmations_ready"] += 1
+            else:
+                quarantines.append(resolution_action)
+                metrics["identity_retirements_ready"] += 1
+                metrics["identity_conflict_retirements_ready"] += 1
+            continue
         trusted = trusted_by_id.get(external_id)
         if trusted is not None and _canonical_pharmonline_product_url(trusted.url) == canonical_url:
             metrics["already_trusted_identities"] += 1
@@ -1315,6 +1360,8 @@ def _pharmonline_public_api_reconciliation_plan(
         + metrics["native_id_url_rebind_redirect_ready"]
         + metrics["identity_splits_ready"]
         + metrics["identity_retirements_ready"]
+        + metrics["identity_conflict_shadows_ready"]
+        + metrics["identity_conflict_confirmations_ready"]
     )
     metrics["unclassified_api_identities"] = max(
         0,
@@ -1353,7 +1400,7 @@ def _pharmonline_public_api_reconciliation_plan_manifest_sha256(
     lines.extend(
         "quarantine\t{legacy_product_id}\t{legacy_external_id}\t"
         "{public_api_external_id}\t{legacy_canonical_url}\t{public_api_canonical_url}\t"
-        "{retirement_kind}\t{prior_admission_sha256}".format(
+        "{retirement_kind}\t{prior_admission_sha256}{conflict}".format(
             retirement_kind=action.retirement_kind or "legacy_quarantine",
             prior_admission_sha256=action.prior_admission_sha256 or "none",
             legacy_product_id=action.legacy_product_id,
@@ -1361,6 +1408,13 @@ def _pharmonline_public_api_reconciliation_plan_manifest_sha256(
             public_api_external_id=action.public_api_external_id,
             legacy_canonical_url=action.legacy_canonical_url,
             public_api_canonical_url=action.public_api_canonical_url,
+            # Absent for every action that closes no isolation case: their
+            # lines stay as they were (the new metric keys still change the hash).
+            conflict=(
+                f"\tconflict\t{action.conflict_evidence_sha256}"
+                if action.conflict_evidence_sha256
+                else ""
+            ),
         )
         for action in sorted(
             quarantines,
@@ -1404,6 +1458,9 @@ _PHARMONLINE_PUBLIC_API_UNSAFE_PLAN_METRICS = (
     "retirement_record_conflict",
     "trusted_identity_conflict",
     "identity_split_prior_audit",
+    "identity_conflict_pending",
+    "identity_conflict_unresolved",
+    "identity_conflict_record_conflict",
     "unclassified_api_identities",
 )
 
@@ -1543,8 +1600,23 @@ def _apply_pharmonline_public_api_reconciliation(
     if retirements:
         identity_recovery.apply_retirements(
             session,
-            retirements,
+            [
+                action
+                for action in retirements
+                if action.retirement_kind not in identity_resolution.DECISION_ONLY_KINDS
+            ],
             results,
+            tenant_id=tenant_id,
+            source_manifest_sha256=source_manifest_sha256,
+            catalog_fingerprint_sha256=catalog_fingerprint_sha256,
+            source_transport=source_transport,
+            preflight_run_ref=preflight_run_ref,
+        )
+        # Retirement and shadow archives that close isolation cases record
+        # their decisions in the same transaction, after the separation exists.
+        identity_resolution.apply_resolutions(
+            session,
+            retirements,
             tenant_id=tenant_id,
             source_manifest_sha256=source_manifest_sha256,
             catalog_fingerprint_sha256=catalog_fingerprint_sha256,
@@ -2933,7 +3005,11 @@ def _diagnose_pharmonline_public_api_reconciliation(
     )
     schema_migrated = _pharmonline_public_api_recovery_tables_available(session)
     if allow_identity_retirement:
-        schema_migrated = schema_migrated and identity_recovery.available(session)
+        schema_migrated = (
+            schema_migrated
+            and identity_recovery.available(session)
+            and identity_resolution.available(session)
+        )
     baselines: list[storage.PharmonlinePublicAPICatalogBaseline] = []
     if schema_migrated:
         baselines = (

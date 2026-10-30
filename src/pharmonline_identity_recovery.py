@@ -91,13 +91,27 @@ def candidate(session, legacy, public, api_records, all_products, *, tenant_id, 
 
     if not available(session) or legacy.tenant_id != tenant_id or legacy.site != "pharmonline":
         return None
-    if legacy.identity_conflicted:
-        # Pending isolation has its own immutable variants. This older manual
-        # retirement protocol cannot close those cases or unblock a successor.
-        return None
     old_id, new_id = str(legacy.external_id), str(public.external_id)
     old_url = m._canonical_pharmonline_product_url(legacy.url)
     new_url = m._canonical_pharmonline_product_url(public.url)
+    conflict_evidence = None
+    if legacy.identity_conflicted:
+        # Pending isolation has its own immutable variants. Retirement may
+        # close such a case only when the case is exactly this move; the
+        # decision is then recorded by pharmonline_identity_resolution.
+        from src import pharmonline_identity_resolution as resolution
+
+        conflict_evidence = resolution.retirement_evidence(
+            session,
+            legacy,
+            new_id=new_id,
+            new_url=new_url,
+            all_products=all_products,
+            api_records=api_records,
+            kind=kind,
+        )
+        if conflict_evidence is None:
+            return None
     name = m._pharmonline_product_name_signature(legacy.name)
     if (
         not name
@@ -161,6 +175,7 @@ def candidate(session, legacy, public, api_records, all_products, *, tenant_id, 
         public_product=public,
         retirement_kind=kind,
         prior_admission_sha256=admission_digest(admission),
+        conflict_evidence_sha256=conflict_evidence,
     )
 
 
@@ -267,6 +282,11 @@ def valid_state(session, products, *, tenant_id):
             continue
         retired.add(old.id)
         replacements[new_id] = new
+    # A never-observed shadow archived by a reviewed isolation decision carries
+    # the same marker; only that decision may authenticate it.
+    from src import pharmonline_identity_resolution as resolution
+
+    retired |= marked & resolution.valid_shadow_product_ids(session, by_id, tenant_id=tenant_id)
     conflicts += len(marked - retired)
     return retired, replacements, conflicts
 

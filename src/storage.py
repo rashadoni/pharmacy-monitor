@@ -637,6 +637,56 @@ class PharmonlineIdentityConflictVariant(Base):
     catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
 
 
+class PharmonlineIdentityConflictResolution(Base):
+    """Reviewed, append-only decision that closes one pending isolation case.
+
+    A decision never transfers history. ``retired`` names the retirement ledger
+    that separated the old Product from a new current one; ``shadow_archived``
+    archives a never-observed historic row that only shared the address of a
+    trusted current Product; ``current_confirmed`` closes that current
+    Product's own case. The decision holds only for the case state it names
+    (``case_last_run_id`` and the variant digest): a later isolation of the
+    same Product advances the case and reopens it.
+    """
+
+    __tablename__ = "pharmonline_identity_conflict_resolutions"
+    __table_args__ = (
+        UniqueConstraint(
+            "conflict_id",
+            "case_last_run_id",
+            name="uq_pharmonline_conflict_resolution_state",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, index=True)
+    conflict_id: Mapped[int] = mapped_column(
+        ForeignKey("pharmonline_identity_conflicts.id", ondelete="RESTRICT")
+    )
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"))
+    case_last_run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="RESTRICT"))
+    decision: Mapped[str] = mapped_column(String(40))
+    current_product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="RESTRICT")
+    )
+    retirement_id: Mapped[int | None] = mapped_column(
+        ForeignKey("pharmonline_public_api_identity_retirements.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    legacy_external_id: Mapped[str] = mapped_column(String(200))
+    archived_external_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    public_api_external_id: Mapped[str] = mapped_column(String(200))
+    public_api_canonical_url: Mapped[str] = mapped_column(String(500))
+    variant_set_sha256: Mapped[str] = mapped_column(String(64))
+    evidence_sha256: Mapped[str] = mapped_column(String(64))
+    proof_version: Mapped[str] = mapped_column(String(40))
+    source_manifest_sha256: Mapped[str] = mapped_column(String(64))
+    catalog_fingerprint_sha256: Mapped[str] = mapped_column(String(64))
+    source_transport: Mapped[str] = mapped_column(String(40))
+    preflight_run_ref: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class Match(Base):
     """Канонический товар, объединяющий до 3 SKU с разных сайтов."""
 
