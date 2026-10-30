@@ -1208,6 +1208,12 @@ gh workflow run deploy.yml --ref main -f apply_migrations=false
 ssh root@13.140.186.143 \
   'cd /opt/pharmacy-monitor && .venv/bin/python -m ensurepip --upgrade && \
    .venv/bin/python -m pip install -q -e .'
+# pip reads pyproject.toml, not uv.lock: it takes the newest playwright the floor
+# allows (to stay on the version CI tested, add 'playwright==<version in uv.lock>').
+# A new playwright needs its own Chromium, installed as pm — as root it lands in
+# /root/.cache, the scrapers never see it, and aloe/aptekonline fail to launch:
+ssh root@13.140.186.143 \
+  'cd /opt/pharmacy-monitor && sudo -u pm -H .venv/bin/python -m playwright install chromium'
 
 # Server ops (root user — pm's passwordless sudo covers only the two restarts deploy.yml makes)
 ssh root@13.140.186.143
