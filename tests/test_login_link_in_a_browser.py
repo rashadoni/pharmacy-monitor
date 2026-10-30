@@ -240,7 +240,8 @@ def _link_for(db_session, letters, site: Site, **user_fields) -> tuple[str, str]
     """Выдать ссылку так, как её выдаёт любой путь, и вернуть её адрес и токен."""
     _add_user(db_session, **user_fields)
     letters.clear()
-    assert api_module._send_login_link(db_session, ADDRESS) is True
+    mail = api_module._send_login_link(db_session, ADDRESS)
+    assert mail is not None and mail.sent
     ((_subject, body),) = letters
     link = body.split("href='", 1)[1].split("'", 1)[0]
     assert link.startswith(site.address + "/auth/link")

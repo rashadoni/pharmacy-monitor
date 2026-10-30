@@ -507,7 +507,9 @@ def test_error_report_letter_failure_log_carries_no_address(session, monkeypatch
 
 def test_login_link_failure_log_carries_no_address(session, user):
     with capture_logs() as logs:
-        assert api._send_login_link(session, ADDRESS) is True
+        mail = api._send_login_link(session, ADDRESS)
+    assert mail is not None and mail.reason == "send_failed"
+    assert mail.error_type == "RuntimeError"
     _assert_clean(logs, events={"login_link_email_failed"}, user_id=user.id)
 
 
