@@ -61,15 +61,15 @@ describe("LatestSiteRunStatus", () => {
 
     expect(shown("ru", ru, <LatestSiteRunStatus item={item} />).lines).toEqual([
       "Неполный",
-      "4 карточки изолированы до сверки, остальные 9 439 — в расчётах",
+      "4 карточки изолированы, остальные 9 439 допущены к расчётам",
     ]);
     expect(shown("az", az, <LatestSiteRunStatus item={item} />).lines).toEqual([
       "Natamam",
-      "4 məhsul kartı yoxlanılana qədər təcrid edilib, qalan 9.439 hesablamalardadır",
+      "4 məhsul kartı təcrid edilib, qalan 9.439 hesablamalara buraxılıb",
     ]);
     expect(shown("en", en, <LatestSiteRunStatus item={item} />).lines).toEqual([
       "Incomplete",
-      "4 cards isolated pending review; the other 9,439 are in calculations",
+      "4 cards isolated; the other 9,439 are admitted to calculations",
     ]);
     expect(shown("ru", ru, <LatestSiteRunStatus item={item} />).titles).toEqual([
       ru.overview.isolated_identities_hint,
@@ -77,11 +77,13 @@ describe("LatestSiteRunStatus", () => {
   });
 
   it("still warns about a newer attempt that really failed", () => {
+    // Пометка говорит о самом прогоне («допущены»), а не о том, что цены сейчас
+    // в расчётах: после упавшей попытки эпоха доверия закрыта.
     const item = site({ run: run(1160, "degraded", 4), latest_attempt: run(1161, "failed") });
 
     expect(shown("ru", ru, <LatestSiteRunStatus item={item} />).lines).toEqual([
       "Неполный",
-      "4 карточки изолированы до сверки, остальные 9 439 — в расчётах",
+      "4 карточки изолированы, остальные 9 439 допущены к расчётам",
       "новая попытка #1161 завершилась с проблемой",
     ]);
   });
@@ -115,10 +117,10 @@ describe("IsolatedIdentitiesNote", () => {
     ).lines[0];
 
   it("keeps Russian plural forms", () => {
-    expect(note(1)).toBe("1 карточка изолирована до сверки, остальные 9 000 — в расчётах");
-    expect(note(21)).toBe("21 карточка изолирована до сверки, остальные 9 000 — в расчётах");
-    expect(note(5)).toBe("5 карточек изолировано до сверки, остальные 9 000 — в расчётах");
-    expect(note(22)).toBe("22 карточки изолированы до сверки, остальные 9 000 — в расчётах");
+    expect(note(1)).toBe("1 карточка изолирована, остальные 9 000 допущены к расчётам");
+    expect(note(21)).toBe("21 карточка изолирована, остальные 9 000 допущены к расчётам");
+    expect(note(5)).toBe("5 карточек изолировано, остальные 9 000 допущены к расчётам");
+    expect(note(22)).toBe("22 карточки изолированы, остальные 9 000 допущены к расчётам");
   });
 
   it("renders nothing for a run without isolated cards", () => {

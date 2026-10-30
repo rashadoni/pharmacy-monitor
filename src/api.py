@@ -86,7 +86,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, desc, func, or_, select
-from sqlalchemy.orm import Session, aliased, selectinload
+from sqlalchemy.orm import Session, aliased, defer, selectinload
 
 from src import analytics, catalog_search
 from src import inventory as inv_mod
@@ -4407,7 +4407,12 @@ def _site_run_histories(
     pending = set(sites)
     before_id: int | None = None
     while pending:
-        stmt = select(storage.Run).where(storage.Run.tenant_id == tenant_id)
+        # Разбивка по категориям ни обходу, ни ответу не нужна, а весит больше всего.
+        stmt = (
+            select(storage.Run)
+            .options(defer(storage.Run.products_per_site_category))
+            .where(storage.Run.tenant_id == tenant_id)
+        )
         if before_id is not None:
             stmt = stmt.where(storage.Run.id < before_id)
         rows = db.scalars(

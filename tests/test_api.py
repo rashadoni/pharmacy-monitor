@@ -1279,6 +1279,48 @@ def test_latest_by_site_takes_a_trusted_partition_run_as_the_latest_good_run(
     assert listed[verified.id]["isolated_identities"] is None
 
 
+def test_partition_run_counts_only_for_its_own_site_and_tenant(
+    client, auth_cookie, setup_db
+):
+    db = setup_db
+    base = utcnow()
+    aloe_ok = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(days=2),
+        finished_at=base - timedelta(days=2) + timedelta(minutes=30),
+        status="ok",
+        products_scraped=8042,
+        products_per_site={"aloe": 8042},
+        sites_completed="aloe",
+    )
+    pharm_ok = _pharmonline_full_run(base - timedelta(days=3))
+    # Изолированы карточки pharmonline; aloe в том же прогоне годным от этого не стал.
+    mixed = _pharmonline_full_run(
+        base - timedelta(hours=8),
+        partition=4,
+        products_per_site={"pharmonline": 9443, "aloe": 8042},
+    )
+    mixed.run_quality = {
+        **mixed.run_quality,
+        "sites": {
+            "pharmonline": {"status": "ok", "products": 9443},
+            "aloe": {"status": "ok", "products": 8042},
+        },
+    }
+    other_tenant = _pharmonline_full_run(base - timedelta(hours=1), partition=4, tenant_id=2)
+    db.add_all([aloe_ok, pharm_ok, mixed, other_tenant])
+    db.commit()
+
+    rows = {
+        row["site"]: row
+        for row in client.get("/api/v1/dash/runs/latest-by-site").json()
+    }
+    assert rows["pharmonline"]["run"]["id"] == mixed.id
+    assert rows["pharmonline"]["latest_attempt"]["id"] == mixed.id
+    assert rows["aloe"]["run"]["id"] == aloe_ok.id
+    assert rows["aloe"]["latest_attempt"]["id"] == mixed.id
+
+
 @pytest.mark.parametrize(
     "spoil",
     [
