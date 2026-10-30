@@ -118,56 +118,60 @@ def test_manual_alternatives_and_api_candidates_do_not_offer_archived_rows(db_se
     assert archived.canonical_id is None
 
 
-def test_retired_competitor_history_cannot_lower_brand_price_floor(db_session, monkeypatch):
+def _cluster_with_one_offer_per_site(db_session, client, competitor, prices):
+    match = storage.Match(tenant_id=1, canonical_name="Aspirin Bayer 100 mg")
+    db_session.add(match)
+    db_session.flush()
+    client.canonical_id = competitor.canonical_id = match.id
+    run = storage.Run(
+        status="ok",
+        catalog_scope="full",
+        catalog_verified=True,
+        finished_at=utcnow(),
+        run_quality={"financially_eligible": True},
+    )
+    db_session.add_all([client, competitor, run])
+    db_session.flush()
+    for product, price in zip((client, competitor), prices):
+        db_session.add(storage.PriceSnapshot(run_id=run.id, product_id=product.id, price=price))
+    db_session.flush()
+
+
+@pytest.mark.parametrize("retired", [True, False])
+def test_retired_competitor_history_does_not_produce_an_undercut(db_session, monkeypatch, retired):
     monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "shadow")
-    current = _product("current")
-    archived = _product("archived", retired=True)
     client = _product("client", site="aptekonline")
-    run = storage.Run(
-        status="ok",
-        catalog_scope="full",
-        catalog_verified=True,
-        finished_at=utcnow(),
-        run_quality={"financially_eligible": True},
+    competitor = _product("competitor", retired=retired)
+    _cluster_with_one_offer_per_site(db_session, client, competitor, (7.0, 5.0))
+
+    actions = roi._undercut_threats(
+        db_session,
+        3.0,
+        90.0,
+        10,
+        min_margin_pct=10.0,
+        tenant_id=1,
+        client_site="aptekonline",
+        competitor_sites=("pharmonline",),
     )
-    db_session.add_all([current, archived, client, run])
-    db_session.flush()
-    for product, price in [(current, 10.0)] * 3 + [(archived, 5.0), (client, 7.0)]:
-        db_session.add(storage.PriceSnapshot(run_id=run.id, product_id=product.id, price=price))
-    db_session.flush()
-
-    actions = roi._map_violations(
-        db_session, 10, tenant_id=1, client_site="aptekonline", competitor_sites=("pharmonline",)
-    )
-    assert len(actions) == 1
-    assert actions[0].target_value_azn == 9.9
-    assert db_session.query(storage.PriceSnapshot).filter_by(product_id=archived.id).count() == 1
+    assert len(actions) == (0 if retired else 1)
+    assert db_session.query(storage.PriceSnapshot).filter_by(product_id=competitor.id).count() == 1
 
 
-def test_retired_client_history_does_not_produce_a_price_raise(db_session, monkeypatch):
+@pytest.mark.parametrize("retired", [True, False])
+def test_retired_client_history_does_not_produce_a_price_raise(db_session, monkeypatch, retired):
     monkeypatch.setenv("OFFER_AVAILABILITY_POLICY", "shadow")
+    client = _product("client", retired=retired)
     competitor = _product("competitor", site="aptekonline")
-    archived = _product("archived", retired=True)
-    run = storage.Run(
-        status="ok",
-        catalog_scope="full",
-        catalog_verified=True,
-        finished_at=utcnow(),
-        run_quality={"financially_eligible": True},
-    )
-    db_session.add_all([competitor, archived, run])
-    db_session.flush()
-    for product, price in [(competitor, 10.0)] * 3 + [(archived, 7.0)]:
-        db_session.add(storage.PriceSnapshot(run_id=run.id, product_id=product.id, price=price))
-    db_session.flush()
+    _cluster_with_one_offer_per_site(db_session, client, competitor, (7.0, 10.0))
 
-    assert (
-        roi._map_violations(
-            db_session,
-            10,
-            tenant_id=1,
-            client_site="pharmonline",
-            competitor_sites=("aptekonline",),
-        )
-        == []
+    actions = roi._price_raise_opportunities(
+        db_session,
+        5.0,
+        80.0,
+        10,
+        tenant_id=1,
+        client_site="pharmonline",
+        competitor_sites=("aptekonline",),
     )
+    assert len(actions) == (0 if retired else 1)
