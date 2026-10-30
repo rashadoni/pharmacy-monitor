@@ -46,7 +46,10 @@ jobs:
 
   test:
     name: Test (pytest)
-    runs-on: ubuntu-latest
+    # Не ubuntu-latest: с 2026-10-30 это 26.04, и `playwright install chromium`
+    # на нём отказывает («does not support chromium on ubuntu26.04-x64») — шаг
+    # падает до тестов. Вернуть latest, когда Playwright из uv.lock её поддержит.
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16-alpine
