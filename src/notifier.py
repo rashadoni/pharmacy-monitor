@@ -13,6 +13,7 @@ import os
 import re
 import smtplib
 import ssl
+import urllib.error
 import urllib.parse
 import urllib.request
 from email.message import EmailMessage
@@ -86,6 +87,42 @@ def delivery_error_fields(exc: BaseException) -> dict[str, object]:
     return fields
 
 
+# === TELEGRAM: РАЗМЕТКА ===
+# Сообщения идут в разметке Markdown — той, что Bot API называет legacy. В ней
+# `_`, `*`, `` ` `` и `[` открывают сущность, и сообщение с незакрытой сущностью
+# Telegram не принимает целиком: 400 «can't parse entities». Закрытую он
+# принимает, но знаки из текста пропадают: «HYAL [PRE] KURSOR» приходит как
+# «HYAL PRE KURSOR». Поэтому строка, которую писали не мы (название товара,
+# текст проблемы health, слово, набранное человеком), попадает в сообщение
+# только через `telegram_escape`.
+
+_TELEGRAM_MARKERS = re.compile(r"[_*`\[]")
+_TELEGRAM_WRAPS = ("*", "_", "`")
+
+
+def telegram_escape(text: str | None, wrap: str = "") -> str:
+    """Строка извне — в сообщение с разметкой Markdown, знак в знак.
+
+    Без `wrap` строка встаёт вне сущностей: перед `_`, `*`, `` ` `` и `[`
+    ставится «\\». С `wrap` («*» — жирный, «_» — курсив, «`» — моноширинный)
+    строка возвращается уже обёрнутой. Внутри сущности экранирования нет — всё
+    до закрывающего знака Telegram берёт как есть, — поэтому сам знак обёртки в
+    строке закрывает сущность, ставится экранированным и открывает её снова
+    (пример из документации Bot API: `*2*\\**2=4*`).
+
+    Обрезать строку — до вызова: срез после него может оставить «\\» без пары.
+    И не ставить знак разметки вплотную после вставки без `wrap`: строку,
+    которая кончается на «\\», от него не отделить — такого экранирования в
+    этой разметке нет.
+    """
+    text = text or ""
+    if not wrap:
+        return _TELEGRAM_MARKERS.sub(r"\\\g<0>", text)
+    if wrap not in _TELEGRAM_WRAPS:
+        raise ValueError(f"unknown Telegram Markdown entity: {wrap!r}")
+    return f"\\{wrap}".join(f"{wrap}{part}{wrap}" if part else "" for part in text.split(wrap))
+
+
 # === TELEGRAM ===
 # Используем raw HTTP (через stdlib) — никаких внешних библиотек.
 # Bot создаётся через @BotFather, токен кладётся в .env как TELEGRAM_BOT_TOKEN.
@@ -103,7 +140,8 @@ def send_telegram_message(chat_id: str | int, text: str, parse_mode: str = "Mark
     payload = {
         "chat_id": str(chat_id),
         "text": text,
-        "parse_mode": parse_mode,
+        # Пустой `parse_mode` — текст без разметки: поле в запрос не кладётся.
+        **({"parse_mode": parse_mode} if parse_mode else {}),
         "disable_web_page_preview": True,
     }
     data = urllib.parse.urlencode(payload).encode("utf-8")
@@ -116,6 +154,18 @@ def send_telegram_message(chat_id: str | int, text: str, parse_mode: str = "Mark
                 return False
             return True
     except Exception as e:
+        if parse_mode and isinstance(e, urllib.error.HTTPError) and e.code == 400:
+            # Лучше сообщение со звёздочками, чем никакого: тот же текст уходит
+            # ещё раз без разметки. Отказ Telegram приходит статусом HTTP, а 400
+            # у него — и неразобранная разметка, и «нет такого чата». Чем они
+            # различаются, сказано только в тексте ответа; на его формулировку
+            # доставку не завязываем — повторяем на любой 400. Событие пишется,
+            # когда повтор прошёл: текст без разметки принят — значит, отказали
+            # из-за неё. Если не прошёл, причину запишет сам повтор.
+            delivered = send_telegram_message(chat_id, text, parse_mode="")
+            if delivered:
+                log.warning("telegram_markup_refused", parse_mode=parse_mode)
+            return delivered
         log.warning("telegram_send_failed", error=str(e))
         return False
 
