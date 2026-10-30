@@ -65,6 +65,29 @@ describe("product counts of a run", () => {
     expect(runProductCount({ products_scraped: null })).toBeNull();
   });
 
+  it("does not call a run without any count yet an old run", () => {
+    // Идущий прогон и прогон, упавший до записи: products_scraped по умолчанию 0.
+    const running = { products_scraped: 0, products_per_site: null };
+
+    expect(runProductCount(running)).toEqual({ value: 0, distinct: true, listingRows: null });
+    expect(siteProductCount(running, "aptekonline")).toEqual({
+      value: 0,
+      distinct: true,
+      listingRows: null,
+    });
+  });
+
+  it("takes listing rows of the run from the sites, not from products_scraped", () => {
+    // У pharmonline записи, отложенные проверкой личности, в products_scraped не входят.
+    const run = {
+      products_scraped: 9400,
+      products_per_site: { pharmonline: 9520 },
+      products_distinct_per_site: {},
+    };
+
+    expect(runProductCount(run)).toEqual({ value: 9520, distinct: false, listingRows: null });
+  });
+
   it("adds distinct products of several sites only when every collected site has them", () => {
     const both = {
       products_scraped: 104777,

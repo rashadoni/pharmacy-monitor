@@ -872,8 +872,8 @@
   },
   "run_counts": {
     "listing_rows": "{count, plural, one {siyahıda # sətir} other {siyahıda # sətir}}",
-    "listing_rows_unit": "siyahı sətri",
+    "listing_rows_unit": "{count, plural, one {siyahı sətri} other {siyahı sətri}}",
     "hint": "Saytın bir neçə kateqoriyasında olan məhsul siyahıda hər kateqoriyadan ayrıca gəlir. Əsas rəqəm fərqli məhsulların sayıdır.",
-    "hint_legacy": "Bu icra fərqli məhsullar sayılmazdan əvvəl yazılıb: bunlar siyahı sətirləridir və bir neçə kateqoriyada olan məhsul bir neçə dəfə sayılıb."
+    "hint_legacy": "Bu icra üçün fərqli məhsulların sayı yazılmayıb: bunlar siyahı sətirləridir və bir neçə kateqoriyada olan məhsul bir neçə dəfə sayılıb."
   }
 }

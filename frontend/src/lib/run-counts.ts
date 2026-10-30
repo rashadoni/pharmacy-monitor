@@ -19,7 +19,7 @@ export interface RunCounters {
 export interface ProductCount {
   /** Главное число: разные товары, а у старого прогона — строки листинга. */
   value: number;
-  /** `true` — `value` это разные товары; `false` — строки листинга. */
+  /** `true` — `value` это разные товары (или ноль); `false` — строки листинга. */
   distinct: boolean;
   /** Строки листинга, когда их больше, чем разных товаров; иначе `null`. */
   listingRows: number | null;
@@ -39,6 +39,13 @@ function withListing(distinct: number, rows: number | null): ProductCount {
   };
 }
 
+function withoutDistinct(rows: number | null): ProductCount | null {
+  if (rows == null) return null;
+  // Ноль — он и в товарах ноль: так выглядит идущий прогон и прогон, упавший до
+  // записи. Подпись «строк в листинге» ему не нужна.
+  return { value: rows, distinct: rows === 0, listingRows: null };
+}
+
 /** Число товаров одного сайта в прогоне. */
 export function siteProductCount(
   run: RunCounters | null | undefined,
@@ -48,8 +55,7 @@ export function siteProductCount(
   const rows = count(run.products_per_site?.[site]);
   const distinct = count(run.products_distinct_per_site?.[site]);
   if (distinct != null) return withListing(distinct, rows);
-  const legacy = rows ?? count(run.products_scraped);
-  return legacy == null ? null : { value: legacy, distinct: false, listingRows: null };
+  return withoutDistinct(rows ?? count(run.products_scraped));
 }
 
 /**
@@ -60,13 +66,18 @@ export function runProductCount(
   run: RunCounters | null | undefined,
 ): ProductCount | null {
   if (!run) return null;
-  const rows = count(run.products_scraped);
   const perSite = run.products_per_site ?? {};
   const sites = Object.keys(perSite).filter((site) => (count(perSite[site]) ?? 0) > 0);
+  // Строки — сумма по сайтам, как в строках сайтов: `products_scraped` у
+  // pharmonline не считает записи, отложенные проверкой личности.
+  const rows =
+    sites.length > 0
+      ? sites.reduce((sum, site) => sum + (count(perSite[site]) ?? 0), 0)
+      : count(run.products_scraped);
   const distinctBySite = sites.map((site) => count(run.products_distinct_per_site?.[site]));
   if (sites.length > 0 && distinctBySite.every((value) => value != null)) {
     const total = distinctBySite.reduce<number>((sum, value) => sum + (value ?? 0), 0);
     return withListing(total, rows);
   }
-  return rows == null ? null : { value: rows, distinct: false, listingRows: null };
+  return withoutDistinct(rows);
 }

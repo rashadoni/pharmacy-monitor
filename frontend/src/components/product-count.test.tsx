@@ -54,6 +54,16 @@ describe("ProductCountText", () => {
       title: ru.run_counts.hint_legacy,
     });
     expect(shown("az", az, legacy).text).toBe("96.347" + "siyahı sətri");
+    expect(shown("en", en, legacy).text).toBe("96,347" + "listing rows");
+    const oneRow: ProductCount = { value: 8431, distinct: false, listingRows: null };
+    expect(shown("ru", ru, oneRow).text).toBe("8 431" + "строка в листинге");
+  });
+
+  it("shows a bare zero for a run that has not counted anything yet", () => {
+    expect(shown("ru", ru, { value: 0, distinct: true, listingRows: null })).toEqual({
+      text: "0",
+      title: null,
+    });
   });
 
   it("keeps Russian plural forms of the second number", () => {

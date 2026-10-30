@@ -27,7 +27,7 @@ export function ProductCountText({
     ? count.listingRows != null
       ? t("listing_rows", { count: count.listingRows })
       : null
-    : t("listing_rows_unit");
+    : t("listing_rows_unit", { count: count.value });
   const title = count.distinct ? (note ? t("hint") : undefined) : t("hint_legacy");
 
   return (

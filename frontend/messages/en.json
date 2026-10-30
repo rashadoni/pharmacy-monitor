@@ -872,8 +872,8 @@
   },
   "run_counts": {
     "listing_rows": "{count, plural, one {# listing row} other {# listing rows}}",
-    "listing_rows_unit": "listing rows",
+    "listing_rows_unit": "{count, plural, one {listing row} other {listing rows}}",
     "hint": "A product listed in several categories of the site appears in the listing once per category. The main number counts distinct products.",
-    "hint_legacy": "This run was recorded before distinct products were counted: these are listing rows, and a product listed in several categories is counted several times."
+    "hint_legacy": "Distinct products were not recorded for this run: these are listing rows, and a product listed in several categories is counted several times."
   }
 }

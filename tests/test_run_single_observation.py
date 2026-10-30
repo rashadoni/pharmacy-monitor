@@ -349,8 +349,10 @@ def test_products_added_by_the_fallback_crawler_are_observed_once(db_session, mo
 
 
 def test_two_sites_in_one_run_share_the_tracking(db_session, monkeypatch):
-    """Сайты одного прогона собираются одновременно и пишут через один колбэк с
-    общим учётом: записи одного сайта не должны сойти за учтённые записи другого."""
+    """Сайты одного прогона пишут через общий учёт. aloe колбэком не пишется:
+    его записи приходят только финальным проходом, когда учёт уже заполнен
+    записями aptekonline, — и всё равно получают по наблюдению, а повтор
+    aptekonline второй строки не добавляет."""
     aptekonline = {
         "cat-x": [_scraped("x1", 7.0, "cat-x")],
         "cat-y": [_scraped("x1", 7.0, "cat-y"), _scraped("x2", 8.0, "cat-y")],
