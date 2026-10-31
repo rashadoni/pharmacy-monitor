@@ -4,6 +4,8 @@ from contextlib import contextmanager
 
 from datetime import timedelta
 
+import pytest
+
 from src._time import utcnow
 
 from src import roi, storage
@@ -119,6 +121,148 @@ def test_price_raise_when_client_cheaper(db_session):
     assert a.spread_pct is not None and a.spread_pct > 0
     # estimated_monthly_impact_azn deprecated — всегда 0
     assert a.estimated_monthly_impact_azn == 0
+
+
+def _only_price_raise(actions):
+    raise_actions = [a for a in actions if a.type == "price_raise"]
+    assert len(raise_actions) == 1, [(a.type, a.target_value_azn) for a in actions]
+    return raise_actions[0]
+
+
+def test_price_raise_target_stays_below_the_cheaper_of_two_competitors(db_session):
+    """Два конкурента с разной ценой: цель ниже дешёвого, разрыв — от дешёвого.
+
+    Медиана двух цен `sorted(...)[len // 2]` — дорогой из двух: прежний код
+    советовал поднять до 7.84 при конкуренте за 6.00 и писал «останешься
+    самым дешёвым».
+    """
+    _make_cluster(
+        db_session,
+        "TwoComp",
+        {"pharmonline": 5.00, "aptekonline": 6.00, "aloe": 8.00},
+    )
+    a = _only_price_raise(roi.compute_actions(db_session))
+    assert a.current_value_azn == 5.00
+    assert a.target_value_azn == 5.88  # 6.00 × 0.98
+    assert 5.00 < a.target_value_azn < 6.00
+    assert a.unit_gap_azn == 0.88
+    assert a.spread_pct == 20.0  # (6.00 − 5.00) / 5.00, а не от 8.00
+    assert a.extra == {"cheapest_competitor": 6.00, "cheapest_competitor_site": "aptekonline"}
+
+
+def test_price_raise_texts_name_a_target_below_the_cheapest_competitor(db_session):
+    """Текст совета на ru/az/en несёт ту же цель и разрыв, что поля совета."""
+    _make_cluster(
+        db_session,
+        "TwoCompText",
+        {"pharmonline": 5.00, "aptekonline": 8.00, "aloe": 6.00},
+    )
+    a = _only_price_raise(roi.compute_actions(db_session))
+    assert a.extra["cheapest_competitor_site"] == "aloe"
+    assert a.detail == (
+        "Ты дешевле конкурентов на 20.0%. Подними с 5.00 до 5.88 ₼ — "
+        "останешься самым дешёвым, но получишь +0.88 ₼/ед."
+    )
+
+    raw = roi._action_to_dict(a)
+    az = roi.translate_action(raw, "az")
+    assert az["title"] == "Qiyməti qaldırın: TwoCompText"
+    assert az["detail"] == (
+        "Rəqiblərdən 20.0% ucuzsunuz. 5.00-dən 5.88 ₼-ə qaldırın — "
+        "ən ucuz qalacaqsınız, +0.88 ₼/vahid qazanacaqsınız."
+    )
+    en = roi.translate_action(raw, "en")
+    assert en["title"] == "Raise price: TwoCompText"
+    assert en["detail"] == (
+        "You're 20.0% cheaper than competitors. Raise from 5.00 to 5.88 ₼ — "
+        "stay cheapest and gain +0.88 ₼/unit."
+    )
+
+
+def test_no_price_raise_when_one_competitor_is_already_cheaper(db_session):
+    """Клиент между двумя конкурентами — не «дешевле всех», поднимать некуда.
+
+    Прежний код мерил от дорогого (7.00) и советовал 6.86 при конкуренте за 4.80.
+    """
+    _make_cluster(
+        db_session,
+        "Between",
+        {"pharmonline": 5.00, "aptekonline": 4.80, "aloe": 7.00},
+    )
+    actions = roi.compute_actions(db_session)
+    assert [a for a in actions if a.type == "price_raise"] == []
+
+
+def test_no_price_raise_when_cheapest_competitor_is_within_threshold(db_session):
+    """Порог считается от дешёвого конкурента: 5.10 против 5.00 — 2%, меньше 5%."""
+    _make_cluster(
+        db_session,
+        "NearCheapest",
+        {"pharmonline": 5.00, "aptekonline": 5.10, "aloe": 7.00},
+    )
+    actions = roi.compute_actions(db_session)
+    assert [a for a in actions if a.type == "price_raise"] == []
+
+
+@pytest.mark.parametrize(
+    "cheapest",
+    [
+        5.08,  # цель 5.08 × 0.98 = 4.98 — ниже цены клиента
+        5.10,  # цель 5.10 × 0.98 = 4.998 → 5.00 — ровно цена клиента, «+0.00 ₼»
+    ],
+)
+def test_no_price_raise_when_buffered_target_is_not_above_client(db_session, cheapest):
+    """Порог ниже буфера 2%: поднимать некуда — совета нет."""
+    _make_cluster(
+        db_session,
+        "TinyGap",
+        {"pharmonline": 5.00, "aptekonline": cheapest, "aloe": 7.00},
+    )
+    actions = roi.compute_actions(db_session, raise_threshold_pct=1.0)
+    assert [a for a in actions if a.type == "price_raise"] == []
+
+
+def test_price_raise_names_one_site_when_competitors_tie(db_session):
+    """Два конкурента по одной цене: в совете один сайт, по алфавиту — один и тот же."""
+    _make_cluster(
+        db_session,
+        "Tie",
+        {"pharmonline": 5.00, "aptekonline": 6.00, "aloe": 6.00},
+    )
+    a = _only_price_raise(roi.compute_actions(db_session))
+    assert a.target_value_azn == 5.88
+    assert a.extra == {"cheapest_competitor": 6.00, "cheapest_competitor_site": "aloe"}
+
+
+def test_price_raise_target_with_one_competitor_is_unchanged(db_session):
+    """Один конкурент: медиана и минимум совпадают — цель прежняя, 7.00 × 0.98."""
+    _make_cluster(db_session, "OneComp", {"pharmonline": 5.00, "aptekonline": 7.00})
+    a = _only_price_raise(roi.compute_actions(db_session))
+    assert a.target_value_azn == 6.86
+    assert a.unit_gap_azn == 1.86
+    assert a.spread_pct == 40.0
+
+
+def test_cheap_price_raise_target_rounds_below_the_competitor(db_session):
+    """0.24 × 0.98 = 0.2352 округляется до 0.24 — цена самого конкурента; цель 0.23."""
+    _make_cluster(
+        db_session,
+        "Cheap",
+        {"pharmonline": 0.20, "aptekonline": 0.24, "aloe": 0.30},
+    )
+    a = _only_price_raise(roi.compute_actions(db_session))
+    assert a.target_value_azn == 0.23
+    assert a.unit_gap_azn == 0.03
+
+
+def test_price_raise_target_is_below_competitor_at_every_kopeck():
+    for kopecks in range(2, 100_001):
+        cheapest = kopecks / 100
+        target = roi._price_raise_target(cheapest)
+        assert target < cheapest, cheapest
+        assert round(target, 2) == target, cheapest
+        if cheapest >= 0.25:
+            assert target == round(cheapest * 0.98, 2), cheapest
 
 
 def test_undercut_when_competitor_cheaper(db_session):
