@@ -345,7 +345,22 @@ def _detect_promo_started(session: Session, run_id: int, params: dict) -> list[C
 def _detect_price_raise_opportunity(
     session: Session, run_id: int, params: dict
 ) -> list[CandidateEvent]:
-    """Клиент дешевле всех конкурентов на ≥ min_pct."""
+    """Клиент дешевле всех конкурентов на ≥ min_pct.
+
+    Разрыв меряется от самого дешёвого конкурента, а не от медианы: при двух
+    конкурентах медиана `sorted(...)[len // 2]` — это дорогой из двух, и алерт
+    шёл клиенту, который равен дешёвому конкуренту или стоит между двумя
+    (замер 2026-10-30 на копии каталога: «Neo-Rektol» 14.40 при aptekonline
+    14.40 и aloe 15.90 — «+10.4%»). Совет ROI «подними цену»
+    (`roi._price_raise_opportunities`) переводится на то же правило в PR #119.
+
+    В payload — `cheapest_competitor` и `cheapest_competitor_site`. События,
+    записанные до этой правки, несут `median_competitor`; фронтенд
+    (`frontend/src/lib/alert-copy.ts`) читает оба.
+
+    Конкурент с ценой 0 считается самым дешёвым и глушит алерт: с такой
+    ценой «дешевле всех» не проверить. Так же ведёт себя совет ROI в #119.
+    """
     min_pct = float(params.get("min_pct", 7.0))
     out: list[CandidateEvent] = []
     current_run = session.get(Run, run_id)
@@ -365,13 +380,13 @@ def _detect_price_raise_opportunity(
         client_price = prices.get(CLIENT_SITE)
         if client_price is None or client_price <= 0:
             continue  # цена 0 → иначе деление на 0 в gap_pct
-        comp_prices = [p for s, p in prices.items() if s in COMPETITOR_SITES and p is not None]
+        comp_prices = [(s, p) for s, p in prices.items() if s in COMPETITOR_SITES and p is not None]
         if not comp_prices:
             continue
-        median = sorted(comp_prices)[len(comp_prices) // 2]
-        if median <= client_price:
-            continue
-        gap_pct = (median - client_price) / client_price * 100
+        cheapest_site, cheapest = min(comp_prices, key=lambda sp: (sp[1], sp[0]))
+        if cheapest <= client_price:
+            continue  # клиент не дешевле всех
+        gap_pct = (cheapest - client_price) / client_price * 100
         if gap_pct < min_pct:
             continue
         out.append(
@@ -380,11 +395,15 @@ def _detect_price_raise_opportunity(
                 dedup_key=f"raise|m={m.id}",
                 severity="info",
                 title=f"Можно поднять: {m.canonical_name} (+{gap_pct:.1f}%)",
-                detail=(f"Клиент: {client_price:.2f} ₼. Медиана конкурентов: {median:.2f} ₼."),
+                detail=(
+                    f"Клиент: {client_price:.2f} ₼. "
+                    f"Самый дешёвый конкурент — {cheapest_site}: {cheapest:.2f} ₼."
+                ),
                 payload={
                     "match_id": m.id,
                     "client_price": client_price,
-                    "median_competitor": median,
+                    "cheapest_competitor": cheapest,
+                    "cheapest_competitor_site": cheapest_site,
                     "gap_pct": round(gap_pct, 2),
                 },
             )

@@ -117,16 +117,28 @@ export function localizedAlertCopy(
   if (event.rule_type === "price_raise_opportunity") {
     const gapPct = numberPayload(payload, "gap_pct");
     const clientPrice = numberPayload(payload, "client_price");
-    const median = numberPayload(payload, "median_competitor");
+    // Разрыв считается от самого дешёвого конкурента. События, записанные
+    // до этой правки, несут медиану — их текст остаётся прежним.
+    const cheapest = numberPayload(payload, "cheapest_competitor");
+    const detail =
+      cheapest !== null
+        ? t("event_price_raise_cheapest_detail", {
+            client: formatAlertAmount(clientPrice),
+            site: stringPayload(payload, "cheapest_competitor_site") ?? "?",
+            competitor: formatAlertAmount(cheapest),
+          })
+        : t("event_price_raise_detail", {
+            client: formatAlertAmount(clientPrice),
+            median: formatAlertAmount(
+              numberPayload(payload, "median_competitor"),
+            ),
+          });
     return {
       title: t("event_price_raise_title", {
         product: titleSubjectWithoutTrailingPercent(event),
         pct: gapPct === null ? "?" : gapPct.toFixed(1),
       }),
-      detail: t("event_price_raise_detail", {
-        client: formatAlertAmount(clientPrice),
-        median: formatAlertAmount(median),
-      }),
+      detail,
     };
   }
 

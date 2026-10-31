@@ -834,8 +834,22 @@ def test_only_specific_rule_when_rule_ids_filter(db_session):
 # === DETECTOR — price_raise_opportunity ===
 
 
-def test_price_raise_opportunity_fires_when_client_below_median(db_session):
-    """Клиент дешевле медианы конкурентов на >= min_pct → fires."""
+def _raise_case(s, name, client, aptekonline=None, aloe=None):
+    """Кластер с ценами клиента и конкурентов в одном проверенном прогоне."""
+    m = _make_match(s, name)
+    run = _add_run(s)
+    prices = {"pharmonline": client, "aptekonline": aptekonline, "aloe": aloe}
+    for site, price in prices.items():
+        if price is None:
+            continue
+        product = _add_product(s, site, name, f"{site}-{m.id}", canonical_id=m.id)
+        _add_snap(s, run, product, price)
+    s.commit()
+    return m, run
+
+
+def test_price_raise_opportunity_fires_when_client_below_all_competitors(db_session):
+    """Клиент дешевле каждого конкурента на >= min_pct → fires."""
     m = _make_match(db_session, "Vitamins")
     p_client = _add_product(db_session, "pharmonline", "V", "ph", canonical_id=m.id)
     p_a = _add_product(db_session, "aptekonline", "V", "ap", canonical_id=m.id)
@@ -850,8 +864,129 @@ def test_price_raise_opportunity_fires_when_client_below_median(db_session):
     assert len(cands) == 1
     assert cands[0].severity == "info"
     assert "Vitamins" in cands[0].title
-    # gap_pct = (10 - 8) / 8 * 100 = 25% (median = 10)
-    assert cands[0].payload["gap_pct"] >= 24.0
+    # gap_pct = (10 - 8) / 8 * 100 = 25% — от самого дешёвого конкурента
+    assert cands[0].payload["gap_pct"] == 25.0
+
+
+def test_price_raise_opportunity_measures_gap_from_cheapest_competitor(db_session):
+    """Два конкурента с разной ценой: разрыв, payload и текст — от дешёвого.
+
+    Медиана двух цен — это дорогой из двух (11.00 → +37.5%); алерт обязан
+    назвать того, кто ближе всего к клиенту.
+    """
+    m, run = _raise_case(db_session, "Two competitors", 8.0, aptekonline=11.0, aloe=10.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+
+    assert len(cands) == 1
+    event = cands[0]
+    assert event.dedup_key == f"raise|m={m.id}"
+    assert event.title == "Можно поднять: Two competitors (+25.0%)"
+    assert event.detail == "Клиент: 8.00 ₼. Самый дешёвый конкурент — aloe: 10.00 ₼."
+    assert event.payload == {
+        "match_id": m.id,
+        "client_price": 8.0,
+        "cheapest_competitor": 10.0,
+        "cheapest_competitor_site": "aloe",
+        "gap_pct": 25.0,
+    }
+
+
+def test_price_raise_opportunity_no_fire_when_client_between_competitors(db_session):
+    """Клиент между двумя конкурентами — один уже дешевле, «поднять» нельзя.
+
+    Детектор, считавший от медианы, давал здесь «+20.0%» от дорогого конкурента.
+    """
+    _m, run = _raise_case(db_session, "Between", 10.0, aptekonline=9.0, aloe=12.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+
+    assert cands == []
+
+
+def test_price_raise_opportunity_no_fire_when_client_equals_cheapest(db_session):
+    """«Neo-Rektol» с копии каталога 2026-10-30: клиент 14.40, aptekonline 14.40.
+
+    Прежний код слал «Можно поднять (+10.4%)» от цены aloe 15.90.
+    """
+    _m, run = _raise_case(db_session, "Neo-Rektol", 14.40, aptekonline=14.40, aloe=15.90)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 7.0})
+
+    assert cands == []
+
+
+def test_price_raise_opportunity_no_fire_when_gap_to_cheapest_below_min_pct(db_session):
+    """До дорогого конкурента 20%, до дешёвого 3% при пороге 5% — алерта нет."""
+    _m, run = _raise_case(db_session, "Close", 10.0, aptekonline=10.30, aloe=12.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+
+    assert cands == []
+
+
+def test_price_raise_opportunity_zero_threshold_still_needs_client_strictly_cheaper(
+    db_session,
+):
+    """Порог 0 (CLI и Streamlit его разрешают): равная цена — не «можно поднять»."""
+    _m, run = _raise_case(db_session, "Zero threshold", 10.0, aptekonline=10.0, aloe=12.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 0.0})
+
+    assert cands == []
+
+
+def test_price_raise_opportunity_fires_at_exact_threshold(db_session):
+    """Разрыв ровно равен порогу — алерт есть (≥ min_pct)."""
+    _m, run = _raise_case(db_session, "Exact", 8.0, aptekonline=10.0, aloe=12.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 25.0})
+
+    assert [c.payload["gap_pct"] for c in cands] == [25.0]
+
+
+def test_price_raise_opportunity_skips_zero_client_price(db_session):
+    """Цена клиента 0 — процент не посчитать, алерта нет."""
+    _m, run = _raise_case(db_session, "Free", 0.0, aptekonline=10.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+
+    assert cands == []
+
+
+def test_price_raise_opportunity_zero_competitor_price_suppresses(db_session):
+    """Конкурент с ценой 0: «дешевле всех» не проверить — алерта нет.
+
+    Так же ведёт себя совет ROI «подними цену» в #119.
+    """
+    _m, run = _raise_case(db_session, "Zero competitor", 8.0, aptekonline=0.0, aloe=10.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+
+    assert cands == []
+
+
+def test_price_raise_opportunity_tied_competitors_name_one_site(db_session):
+    """Два конкурента с одной ценой: сайт выбирается всегда один и тот же."""
+    _m, run = _raise_case(db_session, "Tie", 8.0, aptekonline=10.0, aloe=10.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+
+    assert len(cands) == 1
+    assert cands[0].payload["cheapest_competitor"] == 10.0
+    assert cands[0].payload["cheapest_competitor_site"] == "aloe"
+    assert cands[0].payload["gap_pct"] == 25.0
+
+
+def test_price_raise_opportunity_single_competitor_gap_unchanged(db_session):
+    """Один конкурент: разрыв тот же, что считал прежний код."""
+    _m, run = _raise_case(db_session, "Single", 9.0, aptekonline=10.0)
+
+    cands = alerts._detect_price_raise_opportunity(db_session, run.id, {"min_pct": 5.0})
+
+    assert len(cands) == 1
+    assert cands[0].payload["gap_pct"] == 11.11
+    assert cands[0].payload["cheapest_competitor_site"] == "aptekonline"
 
 
 def test_price_raise_opportunity_no_fire_when_below_min_pct(db_session):
