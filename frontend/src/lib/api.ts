@@ -797,9 +797,21 @@ export interface RunRow {
   products_per_site: Record<string, number> | null;
   /** Разные товары по сайтам; у прогонов до 2026-10-30 — пусто (`lib/run-counts`). */
   products_distinct_per_site?: Record<string, number> | null;
+  /**
+   * Не пусто у полного сбора, который кончился `degraded` только потому, что
+   * часть карточек изолирована до сверки, а цены остальных идут в расчёты.
+   * Годен ли сбор, решает бэкенд тем же правилом, что и денежные расчёты.
+   */
+  isolated_identities?: IsolatedIdentities | null;
   run_quality: RunQuality | null;
   sites_completed: string | null;
   error_message: string | null;
+}
+
+export interface IsolatedIdentities {
+  site: string;
+  trusted_count: number;
+  isolated_count: number;
 }
 
 export interface RunBreakdown {

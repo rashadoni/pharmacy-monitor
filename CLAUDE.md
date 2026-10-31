@@ -525,6 +525,7 @@ After rotation, re-register via `claude mcp remove <name> -s user && claude mcp 
 
 - **URL update bug в `persist_results` (commit `4765620`)**: `existing.url` НИКОГДА не обновлялся → 6238 pharmonline-продуктов застряли на `https://pharmonline.az/product/True` (артефакт старого `postQuery` бага в DDP). Plus: `ScrapedProduct` dataclass даже не имел поля `barcode` (task #12 был неполон). Фикс: `existing.url = sp.url or existing.url` + `existing.barcode` conditional fill + добавлен `barcode` в `ScrapedProduct`. **Verified on prod: 6238 → 2** (99.97% fix rate, оставшиеся 2 — orphan products not re-scraped). +4 регрессионных теста в [tests/test_persist_results.py](tests/test_persist_results.py). Run 108 показал: 272k products в 51 минуту, persist завершил все URL'ы корректно.
 - **Phase 4.5 — MAP violation detection (commit `7e5a541`)**: новый ROI action type `map_violation` — трекает min цены конкурентов per brand за 30д. Если клиент дешевле этого floor более чем на 5% — флагуем opportunity. Severity buckets: critical (≥20%), warning (≥10%), info (≥5%). Min 3 snapshot-семпла per бренд для валидного floor. Отличается от `_price_raise_opportunities` тем, что агрегат по БРЕНДУ (не один матч), 30-дневное окно (стабильнее). +5 регрессионных тестов в [tests/test_roi.py](tests/test_roi.py). Bonus: фикс pre-existing NameError в [src/analytics.py:75](src/analytics.py) (`by_brand[brand][site]` → `[site_name]`).
+  - ⚠️ **Снят 2026-10-30.** Тип больше не считается: «пол» по бренду брался с любого товара бренда — пачку Pampers на 12 штук сравнивало с большой пачкой и с влажными салфетками, а там, где бренд — первое слово названия («Pambıq», «Uşaqlar»), — с чем угодно, и советовало поднять до чужой цены с красной важностью. Замер на копии каталога 2026-10-30: 65 таких советов у pharmonline, у 63 «пол» — цена другого товара; все 10 на обзоре — такие. Сравнение с тем же товаром (кластер) дублирует «Подними цену»: из 216 советов 213 выдаёт он сам, а три остальных он отбрасывает как вероятно неверную пару. Кэш, записанный до правки, такие записи не отдаёт (`roi._RETIRED_ACTION_TYPES`). Сравнение по бренду без того же товара не возвращать.
 - **Phase 5.5 — Frontend X-Request-ID propagation (commit `1090db5`)**: каждый fetch генерит UUID v4 (crypto.randomUUID, Math.random fallback), отправляет как `X-Request-ID` header, backend echoes back, ApiError несёт `requestId` для support correlation. Новая helper `getRequestId(err)` для consumers. Round-trip verified: `curl -H "X-Request-ID: test" /health` возвращает тот же header.
 - **Orphan runs cleanup**: run 97 (вчера Mac, 102k products, orphan "running") → marked `ok`; run 99 (утренний empty test) → marked `failed`. Дашборд status'ы теперь чистые.
 
@@ -1114,9 +1115,10 @@ Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~
 > RUNBOOK «Сбор pharmonline…», уточнение 2026-10-14.
 
 > **Дела изоляции личностей pharmonline закрывает только ручная сверка
-> (2026-10-30, инструмент в PR, не смержен и не выложен).** С прогона №1061
-> (16.10) каждый ночной сбор pharmonline — `degraded`: четыре пары каталога
-> изолированы, пять дел в `pharmonline_identity_conflicts`. Сам сбор их не
+> (2026-10-30; выложено и исполнено в тот же день — уточнение ниже).** С
+> прогона №1061 (16.10) до записи каждый ночной сбор pharmonline был
+> `degraded`: четыре пары каталога изолированы, пять дел в
+> `pharmonline_identity_conflicts`. Сам сбор их не
 > закроет никогда. Цены остальных ~9 500 карточек при этом доверены (эпоха,
 > рекомендации и утреннее письмо их берут; сверено 30.10 чтением прода), из
 > сравнения выпадают только пять строк. Закрытие — `plan-…-reconciliation.yml` и
@@ -1130,6 +1132,27 @@ Production state: run 108 OK (272018 products, 11 alerts, GPG-encrypted backup ~
 > каждый ночной сбор pharmonline.
 > Условия, проверка и откат — [docs/RUNBOOK.md](docs/RUNBOOK.md) «Закрытие дел
 > изоляции». Запуск на проде пишет в боевую базу — только по слову владельца.
+>
+> ⚠️ **Уточнение 2026-10-30: выложено и исполнено, по слову владельца.** Сверено
+> чтением прода, время UTC; абзац выше описывает состояние до записи. Миграция
+> 0027 применена в 21:43 выкладкой `deploy.yml` на `87c2f4ce` (бэкап перед ней
+> снят). Это мерж PR #113, поэтому вместе с ней ушла и его правка `src/roi.py`, а
+> CI на коммите тогда ещё шёл. Затем была выложена `f6226905` — без миграций;
+> что стоит сейчас, смотреть на сервере. План и запись шли на `d19a021e`: код
+> сверки тот же. План — `reconciliation_safe=1`, дел 5, действий 3 + 1 (одно
+> действие-архив закрывает два дела), `unresolved=0`; запись прошла. В журнале
+> решений пять строк — 3 `retired`, 1 `shadow_archived`, 1 `current_confirmed`,
+> все на текущем эпизоде своего дела; помеченных карточек 0. Проверочный сбор
+> №1184 — `ok`, 9 524 товара, `full_catalog_verified=true`; health — `ok`, без
+> `catalog_identity_isolated`. **Код за PR #116 теперь откатывать нельзя —
+> только вперёд**: прежний код роняет каждый ночной сбор pharmonline. `deploy.yml`
+> коммит без 0027 и сам не выложит, но в обход ревизии код в живой каталог кладут
+> `activate-pharmonline-public-api-autonomy.yml`, `category-hotfix-deploy.yml` и
+> `health-pharmonline-hotfix-deploy.yml` (их удаляет открытый PR #39) — не
+> запускать. Ночью на 31.10 оба будильника pharmonline сбор пропустят
+> (`run_skipped_within_cadence`): окно ритма открылось в 22:00, его закрыл
+> проверочный сбор (начат в 22:51) — это штатно, `--force` не нужен. Первый
+> плановый сбор — в ночь на 01.11. Обзор в браузере не смотрели.
 
 > Сервер — Contabo (см. «Server» в начале файла). «Hetzner prod», «Hetzner-IP
 > бан» и сбор с Мака в записях ниже — про машину, удалённую в сентябре 2026, и
@@ -1226,6 +1249,12 @@ gh workflow run deploy.yml --ref main -f apply_migrations=false
 ssh root@13.140.186.143 \
   'cd /opt/pharmacy-monitor && .venv/bin/python -m ensurepip --upgrade && \
    .venv/bin/python -m pip install -q -e .'
+# pip reads pyproject.toml, not uv.lock: it takes the newest playwright the floor
+# allows (to stay on the version CI tested, add 'playwright==<version in uv.lock>').
+# A new playwright needs its own Chromium, installed as pm — as root it lands in
+# /root/.cache, the scrapers never see it, and aloe/aptekonline fail to launch:
+ssh root@13.140.186.143 \
+  'cd /opt/pharmacy-monitor && sudo -u pm -H .venv/bin/python -m playwright install chromium'
 
 # Server ops (root user — pm's passwordless sudo covers only the two restarts deploy.yml makes)
 ssh root@13.140.186.143

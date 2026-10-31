@@ -76,12 +76,12 @@ Comprehensive overview за после Phase 6.1 (URL-based i18n) и устан�
        │  - undercuts (incl.  │                                  │ - alert_events           │
        │    margin-aware)     │                                  │ - tracked_products       │
        │  - price_raise       │                                  │ - pricing_config         │
-       │  - MAP violations    │                                  └──────────────────────────┘
-       │    (Phase 4.5)       │                                             ▲
-       │  - assortment_gaps   │                                             │
-       │  - promo_responses   │                                  ┌──────────┴───────────────┐
-       │  → AlertEvents       │                                  │ Redis 7                  │
-       │  → ROI cache         │                                  │ - intraday:rotation:idx  │
+       │  - assortment_gaps   │                                  └──────────────────────────┘
+       │  - promo_responses   │                                             ▲
+       │  → AlertEvents       │                                             │
+       │  → ROI cache         │                                  ┌──────────┴───────────────┐
+       │                      │                                  │ Redis 7                  │
+       │                      │                                  │ - intraday:rotation:idx  │
        └──────────┬───────────┘                                  │ - intraday:lock:site:*   │
                   │                                              │ - rate-limit (future)    │
                   ▼                                              └──────────────────────────┘
@@ -163,12 +163,15 @@ Respect `MatchRejection` table (manual user "this is wrong" feedback).
 
 ### ROI / Actions (`src/roi.py`)
 
-5 action types для каждого tenant (Phase 4):
+4 action types для каждого tenant (Phase 4):
 1. `price_raise` — клиент дешевле всех конкурентов, можно поднять
 2. `undercut` — конкурент опустил ниже, нужна реакция (с margin-aware Phase 4.4)
 3. `assortment_gap` — товар у конкурента, нет у клиента
 4. `promo_response` — конкурент запустил акцию
-5. `map_violation` (Phase 4.5) — клиент дешевле brand-floor (30d window, multi-source)
+
+`map_violation` (Phase 4.5, «клиент дешевле brand-floor») снят 2026-10-30: «пол» по бренду
+брался с любого другого товара бренда, а сравнение с тем же товаром дублирует
+`price_raise`. Замер и причина — docstring `src/roi.py`.
 
 Persistent кэш в `roi_actions_cache` table (UNIQUE per tenant+client_site), invalidate on scrape success.
 
@@ -536,7 +539,7 @@ E2E: в `frontend/e2e/` лежит восемь файлов сценариев 
 - Phase 1: proxy chain (IPRoyal + Bright Data + ScraperAPI), DDP scraper, AI fallback
 - Phase 1c: pharmonline DDP reverse-engineered + reconnect logic
 - Phase 2: barcode + matcher v2 (limited utility — internal SKUs only)
-- Phase 4: PricingConfig + cost CSV + MAP violations + settings UI
+- Phase 4: PricingConfig + cost CSV + MAP violations (сняты 2026-10-30) + settings UI
 - Phase 5.1c: intraday category rotation (hourly business hours)
 - Phase 5.5: frontend X-Request-ID propagation
 - Phase 5.6: per-site staleness panel

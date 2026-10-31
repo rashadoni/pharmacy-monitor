@@ -167,7 +167,7 @@ load-test/api.k6.js + README   k6 scenarios + thresholds            W12
 | Migrations | Alembic | 1.13+ |
 | DB | PostgreSQL | 16 |
 | Cache / rate-limit | Redis | 7+ |
-| Scraper | Playwright | 1.48+ |
+| Scraper | Playwright | 1.61+ |
 | Auth | python-jose (JWT) + magic-link | latest |
 | Email | SMTP via Resend (default) / Gmail | — |
 | Notifications | python-telegram-bot via raw HTTP | — |

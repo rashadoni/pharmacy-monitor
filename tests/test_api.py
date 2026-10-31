@@ -1206,6 +1206,276 @@ def test_site_history_ignores_legacy_zero_placeholder_and_keeps_real_failure_vis
     assert summary["last_run_id"] == successful.id
 
 
+def _pharmonline_full_run(started_at, **overrides):
+    """Полный сбор pharmonline: `ok` или с изолированными карточками (`partition`)."""
+    partition = overrides.pop("partition", None)
+    quality = {
+        "financially_eligible": True,
+        "full_catalog_verified": partition is None,
+        "sites": {"pharmonline": {"status": "ok", "products": 9443}},
+    }
+    if partition is not None:
+        quality["identity_partition"] = {
+            "version": 1,
+            "site": "pharmonline",
+            "source_complete": True,
+            "total_count": 9443,
+            "trusted_count": 9443 - partition,
+            "isolated_count": partition,
+            "excluded_product_count": partition,
+        }
+    fields = {
+        "tenant_id": 1,
+        "started_at": started_at,
+        "finished_at": started_at + timedelta(minutes=5),
+        "status": "ok" if partition is None else "degraded",
+        "catalog_scope": "full",
+        "full_catalog_sites": "pharmonline",
+        "catalog_verified": partition is None,
+        "products_scraped": 9443,
+        "products_per_site": {"pharmonline": 9443},
+        "sites_completed": "pharmonline",
+        "run_quality": quality,
+    }
+    fields.update(overrides)
+    return storage.Run(**fields)
+
+
+def test_latest_by_site_takes_a_trusted_partition_run_as_the_latest_good_run(
+    client, auth_cookie, setup_db
+):
+    """С 16.10 обзор показывал у pharmonline прогон №1034 от 13.10.
+
+    Полный сбор с четырьмя изолированными карточками кончается `degraded`, но
+    денежные расчёты его принимают — значит, и обзор должен.
+    """
+    db = setup_db
+    base = utcnow()
+    verified = _pharmonline_full_run(base - timedelta(days=17))
+    partitioned = _pharmonline_full_run(base - timedelta(hours=8), partition=4)
+    db.add_all([verified, partitioned])
+    db.commit()
+    assert storage.run_is_financially_eligible(partitioned)
+
+    rows = {
+        row["site"]: row
+        for row in client.get("/api/v1/dash/runs/latest-by-site").json()
+    }
+    row = rows["pharmonline"]
+    assert row["run"]["id"] == partitioned.id
+    assert row["latest_attempt"]["id"] == partitioned.id
+    assert row["run"]["status"] == "degraded"
+    assert row["run"]["isolated_identities"] == {
+        "site": "pharmonline",
+        "trusted_count": 9439,
+        "isolated_count": 4,
+    }
+
+    summary = client.get("/api/v1/dash/products/summary?site=pharmonline").json()
+    assert summary["last_run_id"] == partitioned.id
+
+    listed = {row["id"]: row for row in client.get("/api/v1/dash/runs?limit=5").json()}
+    assert listed[partitioned.id]["isolated_identities"]["isolated_count"] == 4
+    assert listed[verified.id]["isolated_identities"] is None
+
+
+def test_partition_run_counts_only_for_its_own_site_and_tenant(
+    client, auth_cookie, setup_db
+):
+    db = setup_db
+    base = utcnow()
+    aloe_ok = storage.Run(
+        tenant_id=1,
+        started_at=base - timedelta(days=2),
+        finished_at=base - timedelta(days=2) + timedelta(minutes=30),
+        status="ok",
+        products_scraped=8042,
+        products_per_site={"aloe": 8042},
+        sites_completed="aloe",
+    )
+    pharm_ok = _pharmonline_full_run(base - timedelta(days=3))
+    # Изолированы карточки pharmonline; aloe в том же прогоне годным от этого не стал.
+    mixed = _pharmonline_full_run(
+        base - timedelta(hours=8),
+        partition=4,
+        products_per_site={"pharmonline": 9443, "aloe": 8042},
+    )
+    mixed.run_quality = {
+        **mixed.run_quality,
+        "sites": {
+            "pharmonline": {"status": "ok", "products": 9443},
+            "aloe": {"status": "ok", "products": 8042},
+        },
+    }
+    other_tenant = _pharmonline_full_run(base - timedelta(hours=1), partition=4, tenant_id=2)
+    db.add_all([aloe_ok, pharm_ok, mixed, other_tenant])
+    db.commit()
+
+    rows = {
+        row["site"]: row
+        for row in client.get("/api/v1/dash/runs/latest-by-site").json()
+    }
+    assert rows["pharmonline"]["run"]["id"] == mixed.id
+    assert rows["pharmonline"]["latest_attempt"]["id"] == mixed.id
+    assert rows["aloe"]["run"]["id"] == aloe_ok.id
+    assert rows["aloe"]["latest_attempt"]["id"] == mixed.id
+
+
+@pytest.mark.parametrize(
+    "spoil",
+    [
+        # Изолировано больше, чем допускают расчёты: такой сбор в них не идёт.
+        {"partition": 30},
+        # Сборщик сам не допустил прогон к деньгам.
+        {"run_quality_financially_eligible": False},
+        # Ещё идёт: проверенным он станет, только когда закончится.
+        {"status": "running", "finished_at": None},
+        # Недостроенный конверт — не изоляция, а просто неудача.
+        {"drop_partition_key": "trusted_count"},
+    ],
+)
+def test_latest_by_site_keeps_other_degraded_full_runs_a_problem(
+    client, auth_cookie, setup_db, spoil
+):
+    db = setup_db
+    base = utcnow()
+    verified = _pharmonline_full_run(base - timedelta(days=3))
+    spoil = dict(spoil)
+    eligible = spoil.pop("run_quality_financially_eligible", True)
+    drop = spoil.pop("drop_partition_key", None)
+    spoil.setdefault("partition", 4)
+    newer = _pharmonline_full_run(base - timedelta(hours=8), **spoil)
+    quality = dict(newer.run_quality)
+    quality["financially_eligible"] = eligible
+    if drop:
+        quality["identity_partition"] = {
+            key: value for key, value in quality["identity_partition"].items() if key != drop
+        }
+    newer.run_quality = quality
+    db.add_all([verified, newer])
+    db.commit()
+    assert not storage.run_is_financially_eligible(newer)
+
+    row = next(
+        row
+        for row in client.get("/api/v1/dash/runs/latest-by-site").json()
+        if row["site"] == "pharmonline"
+    )
+    assert row["run"]["id"] == verified.id
+    assert row["latest_attempt"]["id"] == newer.id
+    assert row["latest_attempt"]["isolated_identities"] is None
+
+
+def test_latest_by_site_keeps_a_newer_failure_visible_after_a_partition_run(
+    client, auth_cookie, setup_db
+):
+    db = setup_db
+    base = utcnow()
+    partitioned = _pharmonline_full_run(base - timedelta(days=1), partition=4)
+    failed = _pharmonline_full_run(
+        base - timedelta(hours=2),
+        status="failed",
+        catalog_verified=False,
+        run_quality={
+            "financially_eligible": False,
+            "sites": {"pharmonline": {"status": "failed", "items_expected": 1, "products": 0}},
+        },
+        products_per_site={"pharmonline": 0},
+    )
+    db.add_all([partitioned, failed])
+    db.commit()
+
+    row = next(
+        row
+        for row in client.get("/api/v1/dash/runs/latest-by-site").json()
+        if row["site"] == "pharmonline"
+    )
+    assert row["run"]["id"] == partitioned.id
+    assert row["run"]["isolated_identities"]["isolated_count"] == 4
+    assert row["latest_attempt"]["id"] == failed.id
+
+
+def test_latest_by_site_finds_a_good_run_older_than_a_thousand_runs(
+    client, auth_cookie, setup_db
+):
+    """Прежде прогоны читались с потолком 1000 — около 110 дней ежедневного сбора."""
+    db = setup_db
+    base = utcnow() - timedelta(days=200)
+    good = storage.Run(
+        tenant_id=1,
+        started_at=base,
+        finished_at=base + timedelta(minutes=30),
+        status="ok",
+        products_scraped=8042,
+        products_per_site={"aloe": 8042},
+        sites_completed="aloe",
+    )
+    db.add(good)
+    db.flush()
+    failures = [
+        storage.Run(
+            tenant_id=1,
+            started_at=base + timedelta(hours=index + 1),
+            finished_at=base + timedelta(hours=index + 1, minutes=1),
+            status="failed",
+            products_scraped=0,
+            products_per_site={"aloe": 0},
+            run_quality={
+                "sites": {"aloe": {"status": "failed", "items_expected": 5, "products": 0}}
+            },
+        )
+        for index in range(1100)
+    ]
+    db.add_all(failures)
+    db.commit()
+
+    row = next(
+        row
+        for row in client.get("/api/v1/dash/runs/latest-by-site").json()
+        if row["site"] == "aloe"
+    )
+    assert row["run"]["id"] == good.id
+    assert row["latest_attempt"]["id"] == failures[-1].id
+    summary = client.get("/api/v1/dash/products/summary?site=aloe").json()
+    assert summary["last_run_id"] == good.id
+
+
+def test_latest_by_site_reads_runs_once_for_all_sites(client, auth_cookie, setup_db):
+    """Три сайта — один проход по прогонам, и не дальше последнего годного."""
+    from sqlalchemy import event
+
+    db = setup_db
+    base = utcnow()
+    db.add_all(
+        storage.Run(
+            tenant_id=1,
+            started_at=base - timedelta(hours=index),
+            finished_at=base - timedelta(hours=index) + timedelta(minutes=5),
+            status="ok",
+            products_scraped=10,
+            products_per_site={site: 10},
+            sites_completed=site,
+        )
+        for index, site in enumerate(("pharmonline", "aptekonline", "aloe") * 300)
+    )
+    db.commit()
+
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if "FROM runs" in statement:
+            statements.append(statement)
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        response = client.get("/api/v1/dash/runs/latest-by-site")
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert response.status_code == 200, response.text
+    assert len(statements) == 1
+
+
 def test_site_summary_does_not_reuse_another_sites_latest_run(
     client, auth_cookie, setup_db
 ):
