@@ -20,6 +20,19 @@
     Когда у клиента будет ERP-интеграция с реальной stock-историей, можно
     будет deriv'ить `monthly_volume = (stock_start - stock_end + purchases)
     / days × 30` per-product и вернуть честные ₼/мес.
+
+    «MAP» (`map_violation`) убран 2026-10-30. Он сравнивал цену товара клиента
+    с самой низкой ценой конкурентов по БРЕНДУ за 30 дней — то есть с любым
+    другим товаром бренда: пачку подгузников на 12 штук — с большой пачкой,
+    влажные салфетки — с подгузниками, а там, где бренд взят по первому слову
+    названия, — «Pambıq», «Uşaqlar» — с чем угодно. Замер на копии каталога:
+    у 63 из 65 таких советов pharmonline «пол» был ценой другого товара.
+    Честный вариант — тот же товар (кластер `matches`) — дублирует
+    PRICE_RAISE: из 216 таких советов 213 уже выдаёт он, остальные три он
+    отбрасывает как вероятно неверную пару (разница больше `max_spread_pct`).
+    Сравнения по бренду без того же товара не возвращать. Отбирать такие
+    записи из кэша, сделанного до правки, —
+    `_RETIRED_ACTION_TYPES` в `get_cached_actions_snapshot`.
 """
 
 from __future__ import annotations
@@ -56,24 +69,13 @@ ActionType = Literal[
     "undercut",
     "assortment_gap",
     "promo_response",
-    "map_violation",
 ]
 
-# Phase 4.5 (2026-05-27): MAP-violation thresholds (% gap to brand-floor).
-# Brand-floor = min observed competitor price for that brand over last N days.
-# Если клиент дешевле floor больше чем на X% — флагуем (можно поднять цену).
-_MAP_FLOOR_WINDOW_DAYS = 30
-_MAP_MIN_GAP_PCT = 5.0  # ниже — не флагуем (внутри обычного шума)
-_MAP_WARNING_GAP_PCT = 10.0  # выше — severity = "warning"
-_MAP_CRITICAL_GAP_PCT = 20.0  # выше — severity = "critical"
-# Fix 2026-06-03: защита от битых/placeholder цен. MAP-gap floor-relative (0–100%),
-# верхней границы не было → товар клиента с ценой ~0.01 (нет реальной цены на сайте,
-# сохранён как placeholder) давал gap ~99.9% и всплывал наверх как «подними с 0.01 до
-# 11.14 (+99.9%)» — мусор, который убивает доверие в демо. Зеркалит max_spread guard
-# из _price_raise_opportunities. Клиент дальше чем на _MAP_MAX_GAP_PCT ниже floor —
-# почти наверняка data-artifact или mismatch (другой размер/grade), не opportunity.
-_MAP_MAX_GAP_PCT = 80.0  # gap >= этого — не флагуем (битая цена / bad match)
-_MIN_PLAUSIBLE_PRICE = 0.20  # цена ниже — считаем «нет реальной цены» (placeholder)
+# Типы, которые больше не считаются (см. docstring модуля). Кэш, записанный до
+# их снятия, живёт до следующего проверенного сбора; при чтении такие записи
+# отбрасываются, чтобы снятый совет пропал из дашборда сразу после выкладки, а
+# не утром (бот Telegram — отдельный процесс: после своего перезапуска).
+_RETIRED_ACTION_TYPES = frozenset({"map_violation"})
 
 
 @dataclass
@@ -391,7 +393,11 @@ def get_cached_actions_snapshot(
             age_hours=age.total_seconds() / 3600,
         )
         return None
-    payload = list(row.payload) if row.payload else []
+    payload = [
+        item
+        for item in (row.payload or [])
+        if not (isinstance(item, dict) and item.get("type") in _RETIRED_ACTION_TYPES)
+    ]
     return payload, row, run
 
 
@@ -579,13 +585,6 @@ def _compute_actions_locked(
         session,
         per_type,
         tenant_id=tenant_id,
-        competitor_sites=competitors,
-    )
-    actions += _map_violations(
-        session,
-        per_type,
-        tenant_id=tenant_id,
-        client_site=effective_client,
         competitor_sites=competitors,
     )
     actions += _promo_responses(
@@ -914,164 +913,6 @@ def _assortment_gaps(
     return out
 
 
-def _map_violations(
-    session: Session,
-    max_n: int,
-    *,
-    tenant_id: int,
-    client_site: str,
-    competitor_sites: tuple[str, ...],
-) -> list[ActionItem]:
-    """Phase 4.5: Detect client products priced below brand-floor.
-
-    Brand-floor = min observed competitor price for that brand over last
-    `_MAP_FLOOR_WINDOW_DAYS` days. If client's current price is below this
-    floor by more than `_MAP_MIN_GAP_PCT`, flag it.
-
-    This is an OPPORTUNITY to raise price: вся конкуренция держит флор выше,
-    значит клиент может поднять без потери конкурентоспособности и оставить
-    себе margin. Отличается от `_price_raise_opportunities` тем, что:
-      - smоtrит на BRAND-уровне через ВСЕ продукты бренда, не один матч
-      - использует 30-дневное окно, не текущий snapshot (стабильнее)
-      - не требует point-to-point matched pair (есть бренд → есть signal)
-
-    Severity buckets:
-      - critical: gap >= _MAP_CRITICAL_GAP_PCT (20%)
-      - warning:  gap >= _MAP_WARNING_GAP_PCT  (10%)
-      - info:     gap >= _MAP_MIN_GAP_PCT       (5%)
-    """
-    from sqlalchemy import func
-
-    from src.product_policy import (
-        OFFER_OUT_OF_STOCK,
-        availability_policy_enforced,
-        current_offer_sql,
-        source_identity_eligible_sql,
-        policy_offer_eligibility,
-    )
-    from src.storage import latest_snapshots_per_product
-
-    floor_window_start = utcnow() - timedelta(days=_MAP_FLOOR_WINDOW_DAYS)
-
-    # Step 1: brand-floor per brand, computed across competitor snapshots over window.
-    # Используем discount_price если есть (как effective price), иначе price.
-    effective_price = func.coalesce(PriceSnapshot.discount_price, PriceSnapshot.price)
-    eligible_run_ids = storage.financially_eligible_run_ids(session, tenant_id=tenant_id)
-    if not eligible_run_ids:
-        return []
-    offer_predicate = (
-        current_offer_sql(Product)
-        if availability_policy_enforced()
-        else Product.offer_availability_status != OFFER_OUT_OF_STOCK
-    )
-    rows = session.execute(
-        select(
-            Product.brand,
-            func.min(effective_price).label("floor"),
-            func.count(PriceSnapshot.id).label("samples"),
-        )
-        .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
-        .where(
-            Product.tenant_id == tenant_id,
-            Product.site.in_(competitor_sites),
-            Product.brand.is_not(None),
-            source_identity_eligible_sql(Product),
-            offer_predicate,
-            PriceSnapshot.captured_at >= floor_window_start,
-            storage.trusted_snapshot_filter(eligible_run_ids),
-            effective_price.is_not(None),
-            effective_price >= _MIN_PLAUSIBLE_PRICE,
-        )
-        .group_by(Product.brand)
-    ).all()
-
-    # Минимум 3 snapshot-семпла per бренд чтобы floor был статистически валиден.
-    # Иначе одна цена-аномалия может дать ложный floor.
-    brand_floors: dict[str, float] = {b: float(f) for b, f, n in rows if f is not None and n >= 3}
-
-    if not brand_floors:
-        return []
-
-    # Step 2: client products в тех же брендах + их current effective price.
-    client_products = session.scalars(
-        select(Product).where(
-            Product.tenant_id == tenant_id,
-            Product.site == client_site,
-            Product.brand.in_(list(brand_floors.keys())),
-        )
-    ).all()
-    client_products = [
-        product for product in client_products if policy_offer_eligibility(product).eligible
-    ]
-    if not client_products:
-        return []
-
-    client_pids = [p.id for p in client_products]
-    snaps_by_pid = latest_snapshots_per_product(
-        session,
-        client_pids,
-        financially_eligible_only=True,
-        tenant_id=tenant_id,
-    )
-
-    map_violations: list[ActionItem] = []
-    for p in client_products:
-        snap = snaps_by_pid.get(p.id)
-        if snap is None:
-            continue
-        client_price = snap.discount_price or snap.price
-        if client_price is None or client_price < _MIN_PLAUSIBLE_PRICE:
-            continue  # нет цены / placeholder (~0.01) — не реальная цена, не флагуем
-
-        floor = brand_floors.get(p.brand or "")
-        if floor is None or floor <= 0:
-            continue
-
-        # Только если клиент ДЕШЕВЛЕ floor (потенциал поднять).
-        if client_price >= floor:
-            continue
-
-        gap_pct = (floor - client_price) / floor * 100.0
-        if gap_pct < _MAP_MIN_GAP_PCT:
-            continue
-        if gap_pct >= _MAP_MAX_GAP_PCT:
-            continue  # клиент в разы ниже floor → data-artifact / mismatch, не opportunity
-
-        if gap_pct >= _MAP_CRITICAL_GAP_PCT:
-            sev = "critical"
-        elif gap_pct >= _MAP_WARNING_GAP_PCT:
-            sev = "warning"
-        else:
-            sev = "info"
-
-        target = round(floor * 0.99, 2)  # чуть-чуть ниже floor → всё ещё cheapest
-        unit_gap = round(target - float(client_price), 2)
-
-        map_violations.append(
-            ActionItem(
-                type="map_violation",
-                severity=sev,
-                title=f"MAP: {p.brand} — поднять {p.name}",
-                detail=(
-                    f"Floor конкурентов по бренду {p.brand} за {_MAP_FLOOR_WINDOW_DAYS}д = "
-                    f"{floor:.2f} ₼. Ты — {client_price:.2f} ₼ (−{gap_pct:.1f}%). "
-                    f"Подними до {target:.2f} ₼ — останешься самым дешёвым, +{unit_gap:.2f} ₼/ед."
-                ),
-                product_name=p.name,
-                product_url=p.url,
-                current_value_azn=float(client_price),
-                target_value_azn=target,
-                unit_gap_azn=unit_gap,
-                spread_pct=gap_pct,
-                extra={"brand": p.brand, "floor_window_days": _MAP_FLOOR_WINDOW_DAYS},
-            )
-        )
-
-    # Sort by gap_pct desc — самые большие violations вверху.
-    map_violations.sort(key=lambda a: -(a.spread_pct or 0))
-    return map_violations[:max_n]
-
-
 def _promo_responses(
     session: Session,
     max_n: int,
@@ -1202,10 +1043,6 @@ _STRINGS: dict[str, dict[str, dict[str, str]]] = {
             "title": "Промо у {site}: {promo}",
             "detail": "Конкурент {site} запустил акцию. Проверь, не задевает ли твои топ-категории.",
         },
-        "map_violation": {
-            "title": "MAP: {brand} — поднять {name}",
-            "detail": "Floor конкурентов по бренду {brand} за {days}д = {target:.2f} ₼. Ты — {client:.2f} ₼ (−{pct:.1f}%). Подними до {target:.2f} ₼ — останешься самым дешёвым, +{delta:.2f} ₼/ед.",
-        },
     },
     "az": {
         "undercut": {
@@ -1224,10 +1061,6 @@ _STRINGS: dict[str, dict[str, dict[str, str]]] = {
             "title": "{site}-da aksiya: {promo}",
             "detail": "Rəqib {site} aksiya başlatdı. Əsas kateqoriyalarınıza təsir edib-etmədiyini yoxlayın.",
         },
-        "map_violation": {
-            "title": "MAP: {brand} — {name} qaldırın",
-            "detail": "{brand} brendi üçün rəqib floor-u ({days} gün) = {target:.2f} ₼. Siz — {client:.2f} ₼ (−{pct:.1f}%). {target:.2f} ₼-ə qaldırın — ən ucuz qalacaqsınız, +{delta:.2f} ₼/vahid.",
-        },
     },
     "en": {
         "undercut": {
@@ -1245,10 +1078,6 @@ _STRINGS: dict[str, dict[str, dict[str, str]]] = {
         "promo_response": {
             "title": "Promo at {site}: {promo}",
             "detail": "Competitor {site} launched a promotion. Check if it affects your top categories.",
-        },
-        "map_violation": {
-            "title": "MAP: {brand} — raise {name}",
-            "detail": "Competitor floor for brand {brand} over {days}d = {target:.2f} ₼. You — {client:.2f} ₼ (−{pct:.1f}%). Raise to {target:.2f} ₼ — stay cheapest and gain +{delta:.2f} ₼/unit.",
         },
     },
 }
@@ -1295,19 +1124,6 @@ def translate_action(action: dict, locale: str) -> dict:
             promo = raw_title.split(": ", 1)[1] if ": " in raw_title else raw_title
             title = tmpl["title"].format(site=site, promo=promo)
             detail = tmpl["detail"].format(site=site)
-        elif action_type == "map_violation":
-            extra = action.get("extra") or {}
-            brand = extra.get("brand") or ""
-            days = int(extra.get("floor_window_days") or _MAP_FLOOR_WINDOW_DAYS)
-            title = tmpl["title"].format(brand=brand, name=name)
-            detail = tmpl["detail"].format(
-                brand=brand,
-                days=days,
-                target=target,
-                client=current,
-                pct=pct,
-                delta=abs(delta),
-            )
         else:
             return action
     except (KeyError, ValueError):

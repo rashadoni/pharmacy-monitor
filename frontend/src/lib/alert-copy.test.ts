@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import az from "../../messages/az.json";
+import en from "../../messages/en.json";
+import ru from "../../messages/ru.json";
 import type { AlertEvent } from "./api";
 import { localizedAlertCopy, type AlertCopyPresenter } from "./alert-copy";
 
-function tFromMessages(): AlertCopyPresenter {
-  const messages = az.alerts as Record<string, string>;
+function tFromMessages(locale: { alerts: unknown } = az): AlertCopyPresenter {
+  const messages = locale.alerts as Record<string, string>;
   return (key, values = {}) => {
     const template = messages[key] ?? key;
     return Object.entries(values).reduce(
@@ -107,5 +109,52 @@ describe("localizedAlertCopy", () => {
     expect(copy.title).toBe("Qiyməti qaldırmaq olar: Test product (+12.3%)");
     expect(copy.title).not.toContain("(+12.3%) (+12.3%)");
     expect(copy.detail).toBe("Müştəri: 10.00 ₼. Rəqiblərin medianı: 11.23 ₼.");
+  });
+
+  const cheapestRaise = event({
+    rule_type: "price_raise_opportunity",
+    title: "Можно поднять: Test product (+25.0%)",
+    detail: "Клиент: 8.00 ₼. Самый дешёвый конкурент — aloe: 10.00 ₼.",
+    payload: {
+      client_price: 8,
+      cheapest_competitor: 10,
+      cheapest_competitor_site: "aloe",
+      gap_pct: 25,
+    },
+  });
+
+  it("names the cheapest competitor for price-raise alerts", () => {
+    const copy = localizedAlertCopy(cheapestRaise, tFromMessages());
+
+    expect(copy.title).toBe("Qiyməti qaldırmaq olar: Test product (+25.0%)");
+    expect(copy.detail).toBe("Müştəri: 8.00 ₼. Ən ucuz rəqib — aloe: 10.00 ₼.");
+    expect(copy.detail).not.toContain("median");
+  });
+
+  it("has the cheapest-competitor copy in every locale", () => {
+    expect(localizedAlertCopy(cheapestRaise, tFromMessages(ru)).detail).toBe(
+      "Клиент: 8.00 ₼. Самый дешёвый конкурент — aloe: 10.00 ₼.",
+    );
+    expect(localizedAlertCopy(cheapestRaise, tFromMessages(en)).detail).toBe(
+      "Client: 8.00 ₼. Cheapest competitor — aloe: 10.00 ₼.",
+    );
+  });
+
+  it("keeps the median copy for price-raise alerts stored with a median", () => {
+    for (const [locale, expected] of [
+      [ru, "Клиент: 10.00 ₼. Медиана конкурентов: 11.23 ₼."],
+      [en, "Client: 10.00 ₼. Competitor median: 11.23 ₼."],
+    ] as const) {
+      const copy = localizedAlertCopy(
+        event({
+          rule_type: "price_raise_opportunity",
+          title: "Можно поднять: Test product (+12.3%)",
+          detail: "Клиент: 10.00 ₼. Медиана конкурентов: 11.23 ₼.",
+          payload: { client_price: 10, median_competitor: 11.23, gap_pct: 12.3 },
+        }),
+        tFromMessages(locale),
+      );
+      expect(copy.detail).toBe(expected);
+    }
   });
 });

@@ -1102,7 +1102,7 @@ def test_latest_financial_snapshot_ignores_newer_partial_run(db_session):
     assert snapshots[product.id].price == 10.0
 
 
-# ─── Phase 4.5: MAP violations ────────────────────────────────────────────────
+# ─── MAP по бренду снят 2026-10-30 ────────────────────────────────────────────
 
 
 def _add_product_with_brand(s, site, name, brand, ext_id, canonical_id=None):
@@ -1120,190 +1120,90 @@ def _add_product_with_brand(s, site, name, brand, ext_id, canonical_id=None):
     return p
 
 
-def _add_brand_snapshots(s, run, products_with_prices):
-    """Adds N snapshots for product-price pairs."""
-    for product, price in products_with_prices:
-        s.add(PriceSnapshot(run_id=run.id, product_id=product.id, price=price))
-    s.flush()
-
-
-def test_map_violation_detected_when_client_below_brand_floor(db_session):
-    """Client цена < brand floor у конкурентов → map_violation flagged."""
-    # Конкуренты держат бренд Bayer на уровне 10.00+ ₼ (3 snapshots для валидности)
-    apt = _add_product_with_brand(db_session, "aptekonline", "Aspirin Bayer 100", "Bayer", "apt-1")
-    aloe = _add_product_with_brand(db_session, "aloe", "Aspirin Bayer 100", "Bayer", "aloe-1")
-    r = _make_run(db_session, [(apt, 10.50), (aloe, 11.00)])
-    # Добавим ещё один snapshot для floor-min (3 семпла минимум)
-    db_session.add(PriceSnapshot(run_id=r.id, product_id=apt.id, price=10.00))
-    db_session.flush()
-
-    # Client (pharmonline) — 7.00 ₼ — это 30% ниже floor 10.00
+def test_other_products_of_the_brand_give_no_price_advice(db_session):
+    """Случай со скриншота 2026-10-26: пачка Pampers на 12 штук против других
+    товаров бренда (большая пачка, салфетки). Прежнее правило брало самую низкую
+    цену конкурентов по бренду и советовало поднять 11.50 до 32.17 ₼. Того же
+    товара у конкурентов нет — совета нет никакого."""
+    big_pack = _add_product_with_brand(
+        db_session, "aptekonline", "Uşaq bezi Pampers 4 Premium Care N34", "Pampers", "apt-34"
+    )
+    wipes = _add_product_with_brand(
+        db_session, "aloe", "Nəm salfet Pampers №52", "Pampers", "aloe-52"
+    )
     client = _add_product_with_brand(
-        db_session, "pharmonline", "Aspirin Bayer 100", "Bayer", "ph-1"
+        db_session, "pharmonline", 'Uşaq bezi "Pampers - 4" 9-14 kq № 12', "Pampers", "ph-12"
     )
-    db_session.add(PriceSnapshot(run_id=r.id, product_id=client.id, price=7.00))
+    _make_run(
+        db_session,
+        [(big_pack, 32.50), (big_pack, 32.17), (big_pack, 33.00), (wipes, 34.00), (client, 11.50)],
+    )
     db_session.commit()
 
     actions = roi.compute_actions(db_session)
-    map_actions = [a for a in actions if a.type == "map_violation"]
-    assert len(map_actions) == 1, f"ожидали 1 map_violation, получили: {[a.type for a in actions]}"
-    a = map_actions[0]
-    assert a.severity == "critical", f"gap 30% >= 20% → critical, got {a.severity}"
-    assert a.product_name == "Aspirin Bayer 100"
-    assert a.current_value_azn == 7.00
-    assert a.target_value_azn is not None and a.target_value_azn < 10.00
+    # Расчёт состоялся: товары конкурентов без пары у клиента — «нет в ассортименте».
+    assert {a.type for a in actions} == {"assortment_gap"}
+    assert [a for a in actions if a.product_name == client.name] == []
 
 
-def test_map_violation_severity_buckets(db_session):
-    """Three buckets: critical >= 20%, warning >= 10%, info >= 5%."""
-    r = _shared_run(db_session)
-    # Three brands with floor 10.00, three client products at different gaps
-    for i, (brand, client_price, expected_sev) in enumerate(
-        [
-            ("BrandA", 7.50, "critical"),  # 25% below
-            ("BrandB", 8.80, "warning"),  # 12% below
-            ("BrandC", 9.50, "info"),  # 5% below
-        ]
-    ):
-        comp_a = _add_product_with_brand(db_session, "aptekonline", f"P{i}-{brand}", brand, f"a{i}")
-        comp_b = _add_product_with_brand(db_session, "aloe", f"P{i}-{brand}", brand, f"b{i}")
-        client = _add_product_with_brand(db_session, "pharmonline", f"P{i}-{brand}", brand, f"c{i}")
-        # 3 snapshots — нужны для валидного floor (n >= 3 в _map_violations)
-        for p, price in [(comp_a, 10.00), (comp_b, 10.50), (comp_a, 11.00), (client, client_price)]:
-            db_session.add(PriceSnapshot(run_id=r.id, product_id=p.id, price=price))
-        db_session.flush()
+def test_same_product_cheaper_than_competitors_is_one_price_raise_card(db_session):
+    """Тот же товар (кластер) дешевле у клиента — одна карточка «Подними цену».
+    Прежнее правило по бренду давало на него вторую, красную, с другой целью."""
+    match = Match(canonical_name="Aspirin Bayer 100", confidence=1.0)
+    db_session.add(match)
+    db_session.flush()
+    apt = _add_product_with_brand(
+        db_session, "aptekonline", "Aspirin Bayer 100", "Bayer", "apt-1", canonical_id=match.id
+    )
+    aloe = _add_product_with_brand(
+        db_session, "aloe", "Aspirin Bayer 100", "Bayer", "aloe-1", canonical_id=match.id
+    )
+    client = _add_product_with_brand(
+        db_session, "pharmonline", "Aspirin Bayer 100", "Bayer", "ph-1", canonical_id=match.id
+    )
+    _make_run(db_session, [(apt, 10.50), (apt, 10.00), (aloe, 11.00), (client, 7.00)])
     db_session.commit()
 
     actions = roi.compute_actions(db_session)
-    by_brand = {
-        (a.extra or {}).get("brand"): a.severity for a in actions if a.type == "map_violation"
+    for_product = [a for a in actions if a.product_name == "Aspirin Bayer 100"]
+    assert [a.type for a in for_product] == ["price_raise"]
+    assert for_product[0].current_value_azn == 7.00
+
+
+def test_cached_map_violation_written_before_removal_is_not_served(db_session):
+    """Кэш, записанный до снятия типа, отдаёт остальные советы без MAP — сразу
+    после выкладки, не дожидаясь пересчёта после ночного сбора."""
+    _make_cluster(
+        db_session,
+        "Aspirin",
+        {"pharmonline": 5.00, "aptekonline": 7.00, "aloe": 6.50},
+    )
+    actions = roi.compute_actions(db_session, client_site="pharmonline")
+    assert actions
+    eligible_run = _shared_run(db_session)
+    db_session.commit()
+    roi.cache_actions(db_session, "pharmonline", actions, run_id=eligible_run.id)
+
+    row = db_session.query(storage.RoiActionsCache).one()
+    stale = {
+        "type": "map_violation",
+        "severity": "critical",
+        "title": "MAP: Pampers — поднять Uşaq bezi Pampers 4 № 12",
+        "detail": "Floor конкурентов по бренду Pampers за 30д = 32.17 ₼.",
+        "product_name": "Uşaq bezi Pampers 4 № 12",
+        "current_value_azn": 11.5,
+        "target_value_azn": 32.17,
+        "unit_gap_azn": 20.67,
+        "spread_pct": 64.6,
+        "extra": {"brand": "Pampers", "floor_window_days": 30},
     }
-    assert by_brand.get("BrandA") == "critical", f"got: {by_brand}"
-    assert by_brand.get("BrandB") == "warning", f"got: {by_brand}"
-    assert by_brand.get("BrandC") == "info", f"got: {by_brand}"
-
-
-def test_map_violation_skipped_when_client_above_floor(db_session):
-    """Client >= floor → нет нарушения (это price_raise зона)."""
-    apt = _add_product_with_brand(db_session, "aptekonline", "X", "BrandX", "a1")
-    client = _add_product_with_brand(db_session, "pharmonline", "X", "BrandX", "c1")
-    r = _make_run(
-        db_session,
-        [
-            (apt, 5.00),
-            (apt, 5.20),
-            (apt, 5.50),  # floor = 5.00
-            (client, 6.00),  # выше floor — НЕ нарушение
-        ],
-    )
+    row.payload = [stale, *row.payload]
     db_session.commit()
 
-    actions = roi.compute_actions(db_session)
-    assert not any(a.type == "map_violation" for a in actions)
-
-
-def test_map_violation_skipped_when_insufficient_samples(db_session):
-    """Меньше 3 snapshot-семплов для бренда — floor не статистически валиден."""
-    apt = _add_product_with_brand(db_session, "aptekonline", "X", "RareBrand", "a1")
-    client = _add_product_with_brand(db_session, "pharmonline", "X", "RareBrand", "c1")
-    r = _make_run(
-        db_session,
-        [
-            (apt, 10.00),  # только 1 семпл бренда у конкурентов
-            (client, 5.00),  # 50% gap, но floor невалидный
-        ],
-    )
-    db_session.commit()
-
-    actions = roi.compute_actions(db_session)
-    assert not any(a.type == "map_violation" for a in actions)
-
-
-def test_map_violation_skipped_when_client_price_is_placeholder(db_session):
-    """Fix 2026-06-03: client цена ~0.01 (placeholder «нет цены») НЕ даёт map_violation.
-
-    Раньше gap (10−0.01)/10 = 99.9% всплывал наверху как «подними с 0.01 до 9.90
-    (+99.9%)» — мусор, ломающий доверие в демо. Теперь client_price < 0.20 → пропуск.
-    """
-    apt = _add_product_with_brand(db_session, "aptekonline", "P Bayer", "Bayer", "a1")
-    aloe = _add_product_with_brand(db_session, "aloe", "P Bayer", "Bayer", "b1")
-    client = _add_product_with_brand(db_session, "pharmonline", "P Bayer", "Bayer", "c1")
-    r = _make_run(db_session, [(apt, 10.00), (aloe, 10.50)])
-    db_session.add(PriceSnapshot(run_id=r.id, product_id=apt.id, price=11.00))  # floor=10, n=3
-    db_session.add(PriceSnapshot(run_id=r.id, product_id=client.id, price=0.01))  # placeholder
-    db_session.commit()
-
-    actions = roi.compute_actions(db_session)
-    assert not any(a.type == "map_violation" for a in actions), (
-        "placeholder 0.01 не должен давать MAP-рекомендацию"
-    )
-
-
-def test_map_violation_skipped_when_gap_implausibly_large(db_session):
-    """Fix 2026-06-03: client дешевле floor больше чем на _MAP_MAX_GAP_PCT (80%) → пропуск.
-
-    Кейс «Vena кateter»: client 0.50 ₼ (правдоподобная цена, > 0.20), но floor 44.40 →
-    gap 98.9%. Это bad-match / data-artifact, не реальная возможность поднять. Floor-guard
-    не ловит (0.50 > 0.20), ловит gap-cap.
-    """
-    apt = _add_product_with_brand(db_session, "aptekonline", "Kateter Vena", "Vena", "a1")
-    aloe = _add_product_with_brand(db_session, "aloe", "Kateter Vena", "Vena", "b1")
-    client = _add_product_with_brand(db_session, "pharmonline", "Kateter Vena", "Vena", "c1")
-    r = _make_run(db_session, [(apt, 44.40), (aloe, 45.00)])
-    db_session.add(PriceSnapshot(run_id=r.id, product_id=apt.id, price=46.00))  # floor=44.40, n=3
-    db_session.add(PriceSnapshot(run_id=r.id, product_id=client.id, price=0.50))  # gap 98.9%
-    db_session.commit()
-
-    actions = roi.compute_actions(db_session)
-    assert not any(a.type == "map_violation" for a in actions), (
-        "gap 98.9% (>80%) — почти наверняка mismatch, не должен флагаться"
-    )
-
-
-def test_map_violation_still_flagged_below_gap_cap(db_session):
-    """Boundary: правдоподобная цена + gap 70% (< 80% cap) + валидный floor → флагуется.
-
-    Гарантирует, что новый cap не «съедает» реальные агрессивные, но валидные возможности.
-    """
-    apt = _add_product_with_brand(db_session, "aptekonline", "P Roche", "Roche", "a1")
-    aloe = _add_product_with_brand(db_session, "aloe", "P Roche", "Roche", "b1")
-    client = _add_product_with_brand(db_session, "pharmonline", "P Roche", "Roche", "c1")
-    r = _make_run(db_session, [(apt, 10.00), (aloe, 10.50)])
-    db_session.add(PriceSnapshot(run_id=r.id, product_id=apt.id, price=11.00))  # floor=10, n=3
-    db_session.add(PriceSnapshot(run_id=r.id, product_id=client.id, price=3.00))  # gap 70%
-    db_session.commit()
-
-    actions = roi.compute_actions(db_session)
-    map_actions = [a for a in actions if a.type == "map_violation"]
-    assert len(map_actions) == 1, f"gap 70% (< 80%) должен флагаться, got: {[a.type for a in actions]}"
-    assert map_actions[0].current_value_azn == 3.00
-
-
-def test_map_violation_translation_az_en(db_session):
-    """translate_action заменяет title/detail для az/en на map_violation."""
-    apt = _add_product_with_brand(db_session, "aptekonline", "Z", "TestBrand", "a1")
-    client = _add_product_with_brand(db_session, "pharmonline", "Z", "TestBrand", "c1")
-    r = _make_run(
-        db_session,
-        [
-            (apt, 10.00),
-            (apt, 11.00),
-            (apt, 10.50),  # 3 семпла, floor = 10
-            (client, 7.00),  # 30% gap → critical
-        ],
-    )
-    db_session.commit()
-
-    actions = roi.compute_actions(db_session)
-    map_actions = [a for a in actions if a.type == "map_violation"]
-    assert len(map_actions) == 1
-
-    # сериализуем как делает кэш
-    raw = roi._action_to_dict(map_actions[0])
-    az = roi.translate_action(raw, "az")
-    assert "TestBrand" in az["title"] and "qaldırın" in az["title"]
-    assert "rəqib floor" in az["detail"].lower() or "floor" in az["detail"].lower()
-
-    en = roi.translate_action(raw, "en")
-    assert "raise" in en["title"].lower() and "TestBrand" in en["title"]
-    assert "competitor floor" in en["detail"].lower()
+    cached = roi.get_cached_actions(db_session, "pharmonline")
+    assert cached is not None
+    assert [a["type"] for a in cached] == [a.type for a in actions]
+    payload, _row, _run = roi.get_cached_actions_snapshot(db_session, "pharmonline")
+    assert payload == cached
+    items = roi.get_cached_action_items(db_session, "pharmonline")
+    assert [a.type for a in items] == [a.type for a in actions]

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Daily competitive monitoring for pharmonline.az vs aptekonline.az and aloe.az"
 requires-python = ">=3.11"
 dependencies = [
-    "playwright>=1.48",
+    "playwright>=1.61",         # 1.61 — first to install browsers on Ubuntu 26.04 (CI image since 2026-10-30)
     "sqlalchemy>=2.0",
     "jinja2>=3.1",
     "openpyxl>=3.1",
