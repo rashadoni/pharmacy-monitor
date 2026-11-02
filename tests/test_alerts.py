@@ -494,6 +494,65 @@ def test_category_tick_reports_local_price_drop_without_touching_the_journal(db_
     assert db_session.query(AlertEvent).count() == 0
 
 
+def test_category_tick_collapses_a_sectionwide_drop_into_one_event(db_session):
+    """Сто падений за один сбор — одно письмо про раздел, а не сто про товары.
+
+    2026-11-02 тик раздела aloe прислал владельцу 102 письма: весь «детский
+    мир» «подешевел» на 10–65%, потому что акционный ценник записался как
+    обычная цена. Здесь тот же случай в миниатюре.
+    """
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    for i in range(12):
+        product = _add_product(db_session, "aloe", f"Mass {i}", f"mass-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, tick, product, 6.90)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    events = alerts.local_price_alerts_for_partial_run(db_session, tick.id)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.severity == "critical"
+    assert "12 товаров" in event.title
+    assert "aloe" in event.title
+    assert "31.0%" in event.detail
+    assert event.payload["collapsed"] == 12
+    assert event.payload["source_run_id"] == tick.id
+    # Сводка ничего не публикует и ничего не называет товаром.
+    assert "product_id" not in event.payload
+    assert event not in db_session
+    db_session.commit()
+    assert db_session.query(AlertEvent).count() == 0
+
+
+def test_category_tick_keeps_real_drops_one_by_one(db_session):
+    """Двенадцать падений среди тридцати изменившихся — это товары, не раздел.
+
+    Порог по доле отделяет «переписали весь раздел» от обычного дня, когда
+    часть цен упала, а остальные шевельнулись в пределах нормы.
+    """
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    for i in range(12):
+        product = _add_product(db_session, "aloe", f"Dropped {i}", f"dropped-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, tick, product, 6.90)
+    for i in range(18):
+        product = _add_product(db_session, "aloe", f"Nudged {i}", f"nudged-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, tick, product, 9.80)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    events = alerts.local_price_alerts_for_partial_run(db_session, tick.id)
+
+    assert len(events) == 12
+    assert {e.rule_type for e in events} == {"price_drop_pct"}
+    assert all("Цена упала" in e.title for e in events)
+
+
 def test_category_tick_evaluates_only_local_price_rules(db_session):
     """Промо, новый товар и «конкурент дешевле» по частичной выборке не считаются.
 

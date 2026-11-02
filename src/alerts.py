@@ -592,6 +592,101 @@ def evaluate_rules(
     return fired
 
 
+# ─── Лавина ценовых событий одного сбора ─────────────────────────────────────
+#
+# 2026-11-02 один тик раздела aloe прислал владельцу 102 письма (70 critical):
+# весь «детский мир» «подешевел» на 10–65%, а новые цены оказались акционными
+# ценниками — 4.90, 6.90, 9.90, 1.50. Монитор акцию в цену не пишет: при
+# найденной перечёркнутой цене `price` хранит обычную, а акционная идёт в
+# `discount_price` (`src/scrapers/aloe.py`, обе ветки). Значит падение самой
+# `price` сразу у сотни товаров означает одно из двух: аптека переписала весь
+# раздел, или на сайте сменилась вёрстка, перечёркнутая цена перестала
+# находиться (`is_on_sale=False`) и акционный ценник записался как обычный.
+# В обоих случаях это ОДНА новость про раздел, а не сто про товары, и верить
+# таким ценам до проверки нельзя.
+#
+# Порог двойной: и число событий, и их доля среди товаров, у которых этот сбор
+# вообще застал цену изменившейся. Одной доли мало — в разделе из трёх товаров
+# она всегда единица; одного числа мало — на полном каталоге сотня настоящих
+# падений возможна.
+MASS_MOVE_MIN_EVENTS = 10
+MASS_MOVE_MIN_SHARE = 0.5
+
+_MASS_MOVE_WORDING = {"price_drop_pct": "падение", "price_change_pct": "изменение"}
+
+
+def _is_mass_move(group: list[AlertEvent], *, moved_products: int) -> bool:
+    if len(group) < MASS_MOVE_MIN_EVENTS or moved_products <= 0:
+        return False
+    return len(group) / moved_products >= MASS_MOVE_MIN_SHARE
+
+
+def _mass_move_summary(rule_type: str, group: list[AlertEvent]) -> AlertEvent:
+    """Одно событие вместо группы: сколько, насколько и куда смотреть.
+
+    Товаров в payload намеренно нет: событие про раздел, а не про товар, и
+    каждое из свёрнутых уже прошло политику в своём детекторе.
+    """
+    sites = sorted({(e.payload or {}).get("site") for e in group} - {None})
+    where = ", ".join(sites) if sites else "сайт не указан"
+    moves = sorted(
+        float((e.payload or {}).get("drop_pct") or (e.payload or {}).get("change_pct"))
+        for e in group
+        if (e.payload or {}).get("drop_pct") is not None
+        or (e.payload or {}).get("change_pct") is not None
+    )
+    word = _MASS_MOVE_WORDING.get(rule_type, "изменение")
+    lines = [f"За один частичный сбор цена изменилась сразу у {len(group)} товаров ({where})."]
+    median = None
+    if moves:
+        median = moves[len(moves) // 2]
+        lines.append(f"Разброс от {moves[0]:.1f}% до {moves[-1]:.1f}%, медиана {median:.1f}%.")
+    lines.append(
+        "Столько сразу — это про раздел, а не про товары: либо аптека переписала "
+        "весь раздел, либо на сайте сменилась вёрстка и акционный ценник записался "
+        "как обычная цена. До проверки раздела этим ценам верить нельзя."
+    )
+    if group:
+        lines.append("Например: " + "; ".join(e.title for e in group[:3]) + ".")
+    source_run_id = (group[0].payload or {}).get("source_run_id")
+    return AlertEvent(
+        rule_id=group[0].rule_id,
+        rule_type=rule_type,
+        dedup_key=f"mass|{rule_type}|run={source_run_id}|{where}",
+        severity="critical" if any(e.severity == "critical" for e in group) else group[0].severity,
+        title=f"Массовое {word} цен: {where}, {len(group)} товаров",
+        detail=" ".join(lines),
+        payload={
+            "collapsed": len(group),
+            "sites": sites,
+            "median_pct": median,
+            "source_run_id": source_run_id,
+        },
+        tenant_id=group[0].tenant_id,
+        created_at=group[0].created_at,
+    )
+
+
+def collapse_mass_price_moves(
+    events: list[AlertEvent], *, moved_products: int
+) -> list[AlertEvent]:
+    """Свернуть лавину ценовых событий сбора в одно сообщение на тип правила.
+
+    Группы, не дотянувшие до порога, возвращаются как есть — настоящее
+    одиночное падение цены владелец должен видеть товаром, а не сводкой.
+    """
+    by_type: dict[str, list[AlertEvent]] = {}
+    for event in events:
+        by_type.setdefault(event.rule_type, []).append(event)
+    out: list[AlertEvent] = []
+    for rule_type, group in by_type.items():
+        if _is_mass_move(group, moved_products=moved_products):
+            out.append(_mass_move_summary(rule_type, group))
+        else:
+            out.extend(group)
+    return out
+
+
 def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[AlertEvent]:
     """Смены цены, которые частичный сбор увидел сам, — БЕЗ записи в журнал.
 
@@ -690,8 +785,16 @@ def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[Al
                 )
             )
 
-    log.info("alerts_partial_run_local", run_id=run_id, found=len(found), rules=len(rules))
-    return found
+    collapsed = collapse_mass_price_moves(found, moved_products=len(price_moved))
+    log.info(
+        "alerts_partial_run_local",
+        run_id=run_id,
+        found=len(found),
+        sent=len(collapsed),
+        moved_products=len(price_moved),
+        rules=len(rules),
+    )
+    return collapsed
 
 
 def _is_duplicate(
