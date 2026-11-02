@@ -91,6 +91,31 @@ describe("localizedAlertCopy", () => {
     );
   });
 
+  it("renders a promotion-driven price change in the viewer's language", () => {
+    const copy = localizedAlertCopy(
+      event({
+        rule_type: "price_change_pct",
+        title: "Акция −25.0%: Changed",
+        payload: {
+          site: "aloe",
+          prev_price: 20,
+          curr_price: 15,
+          change_pct: -25,
+          direction: "down",
+          cause: "promo",
+          regular_price: 20,
+        },
+        site: "aloe",
+      }),
+      tFromMessages(az),
+    );
+
+    expect(copy.title).toBe("Aksiya −25.0%: Changed");
+    expect(copy.detail).toBe(
+      "aloe: aksiya ilə 20.00 → 15.00 ₼ (-25.0%), adi qiymət 20.00 ₼.",
+    );
+  });
+
   it("falls back to stored copy for unknown rule types", () => {
     const copy = localizedAlertCopy(
       event({

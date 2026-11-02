@@ -32,6 +32,7 @@ from src.storage import (
     AlertRule,
     Match,
     PriceSnapshot,
+    Product,
     Promo,
     Run,
     has_unfinished_run,
@@ -73,7 +74,8 @@ def _drop_is_promo(prev: PriceSnapshot, snap: PriceSnapshot) -> bool:
     critical): у всех 102 обычная цена не изменилась, а на сайте началась
     распродажа (прогон #1207, сверено с базой и с aloe.az).
     """
-    if snap.discount_price is None or snap.price is None or prev.price is None:
+    # Ноль — не акция: цена к оплате (`discount_price or price`) его отбрасывает.
+    if not snap.discount_price or snap.price is None or prev.price is None:
         return False
     if snap.discount_price >= snap.price:
         return False
@@ -81,7 +83,7 @@ def _drop_is_promo(prev: PriceSnapshot, snap: PriceSnapshot) -> bool:
 
 
 def _promo_drop_copy(
-    product, prev_price: float, curr_price: float, regular: float, pct: float
+    product: Product, prev_price: float, curr_price: float, regular: float, pct: float
 ) -> tuple[str, str]:
     return (
         f"Акция −{pct:.1f}%: {product.name[:60]}",

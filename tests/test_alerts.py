@@ -446,6 +446,22 @@ def test_deeper_promotion_with_the_same_regular_price_is_a_promotion(db_session)
     assert fired[0].title.startswith("Акция −33.3%")
 
 
+def test_zero_discount_price_is_not_a_promotion(db_session):
+    """Ноль в discount_price цена к оплате отбрасывает — акцией он не считается."""
+    p = _add_product(db_session, "aloe", "Zero", "zero")
+    yesterday = _add_run(db_session, utcnow() - timedelta(days=1))
+    today = _add_run(db_session, utcnow())
+    _add_snap(db_session, yesterday, p, 10.00)
+    _add_snap(db_session, today, p, 7.00, discount_price=0.0)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session, today.id)
+
+    assert [e.title for e in fired] == ["Цена упала на 30.0%: Zero"]
+    assert "cause" not in fired[0].payload
+
+
 def test_price_drop_of_the_regular_price_stays_a_price_drop(db_session):
     """Упала сама обычная цена — это «Цена упала», даже если идёт акция."""
     plain = _add_product(db_session, "aloe", "Plain", "plain")
