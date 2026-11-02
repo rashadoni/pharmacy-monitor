@@ -614,7 +614,9 @@ def evaluate_rules(
 # мало — в разделе из трёх товаров она всегда единица; одного числа мало — на
 # полном каталоге сотня настоящих падений возможна. Доля от всех изменившихся
 # #1207 не ловила: 102 падения на 10% и больше из 207 изменившихся — 0.49; из
-# 192 подешевевших — 0.53.
+# 192 подешевевших — 0.53. «Подешевевшие» считаются от последней записи любого
+# прогона, а события — от доверенной цены, поэтому товары самой группы в
+# знаменатель добавляются всегда: доля не бывает больше единицы.
 MASS_MOVE_MIN_EVENTS = 10
 MASS_MOVE_MIN_SHARE = 0.5
 
@@ -703,7 +705,10 @@ def _mass_move_summary(
 
 
 def collapse_mass_price_moves(
-    events: list[AlertEvent], *, moved_products: int, fell_products: int | None = None
+    events: list[AlertEvent],
+    *,
+    moved_products: int,
+    fell_product_ids: set[int] | None = None,
 ) -> list[AlertEvent]:
     """Свернуть лавину ценовых событий сбора в одно сообщение на тип и причину.
 
@@ -714,10 +719,14 @@ def collapse_mass_price_moves(
     for event in events:
         groups.setdefault((event.rule_type, _event_cause(event)), []).append(event)
     out: list[AlertEvent] = []
-    fell = moved_products if fell_products is None else fell_products
     for (rule_type, cause), group in groups.items():
         downward = rule_type == "price_drop_pct" or cause == "promo"
-        if _is_mass_move(group, moved_products=fell if downward else moved_products):
+        if downward and fell_product_ids is not None:
+            group_ids = {(e.payload or {}).get("product_id") for e in group} - {None}
+            denominator = len(fell_product_ids | group_ids)
+        else:
+            denominator = moved_products
+        if _is_mass_move(group, moved_products=denominator):
             out.append(_mass_move_summary(rule_type, cause, group))
         else:
             out.extend(group)
@@ -784,14 +793,14 @@ def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[Al
         for snap in curr_snaps
         if snap.product_id not in last_seen or payable(last_seen[snap.product_id]) != payable(snap)
     }
-    price_fell = sum(
-        1
+    price_fell = {
+        snap.product_id
         for snap in curr_snaps
         if snap.product_id in last_seen
         and payable(snap) is not None
         and payable(last_seen[snap.product_id]) is not None
         and payable(snap) < payable(last_seen[snap.product_id])
-    )
+    }
 
     now = utcnow()
     found: list[AlertEvent] = []
@@ -831,7 +840,7 @@ def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[Al
             )
 
     collapsed = collapse_mass_price_moves(
-        found, moved_products=len(price_moved), fell_products=price_fell
+        found, moved_products=len(price_moved), fell_product_ids=price_fell
     )
     log.info(
         "alerts_partial_run_local",
@@ -839,7 +848,7 @@ def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[Al
         found=len(found),
         sent=len(collapsed),
         moved_products=len(price_moved),
-        fell_products=price_fell,
+        fell_products=len(price_fell),
         rules=len(rules),
     )
     return collapsed

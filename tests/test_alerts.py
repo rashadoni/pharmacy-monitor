@@ -558,6 +558,31 @@ def test_category_tick_collapses_a_drop_wave_measured_among_products_that_fell(d
     assert "10 товаров" in events[0].title
 
 
+def test_drop_against_the_trusted_price_counts_even_if_it_rose_since_the_last_tick(db_session):
+    """Событие считается от доверенной цены, «подешевевшие» — от последней записи.
+
+    Полный сбор 10.00, первый тик 6.90, второй 7.50: второй тик даёт падение на
+    25% к доверенной цене, хотя к прошлому тику цена выросла. Такие товары
+    входят в знаменатель через саму группу — иначе при нуле «подешевевших»
+    лавина не сворачивалась, а доля выходила больше единицы.
+    """
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    first_tick = _add_category_tick(db_session)
+    second_tick = _add_category_tick(db_session)
+    for i in range(12):
+        product = _add_product(db_session, "aloe", f"Rebound {i}", f"rebound-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, first_tick, product, 6.90)
+        _add_snap(db_session, second_tick, product, 7.50)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    events = alerts.local_price_alerts_for_partial_run(db_session, second_tick.id)
+
+    assert len(events) == 1
+    assert events[0].payload["collapsed"] == 12
+
+
 def _unstored_drop(product_id: int, pct: float, *, cause: str | None = None) -> AlertEvent:
     payload = {"product_id": product_id, "site": "aloe", "drop_pct": pct, "source_run_id": 7}
     if cause:
@@ -578,7 +603,9 @@ def test_promotion_wave_is_summarised_as_a_sale_not_as_suspect_prices():
     """Начавшаяся распродажа — своя сводка, без «акционный ценник записался как обычный»."""
     events = [_unstored_drop(i, 30.0 + i, cause="promo") for i in range(12)]
 
-    out = alerts.collapse_mass_price_moves(events, moved_products=20, fell_products=12)
+    out = alerts.collapse_mass_price_moves(
+        events, moved_products=20, fell_product_ids=set(range(12))
+    )
 
     assert len(out) == 1
     summary = out[0]
@@ -591,15 +618,18 @@ def test_promotion_wave_is_summarised_as_a_sale_not_as_suspect_prices():
 
 def test_promotions_and_regular_drops_are_never_summarised_together():
     promos = [_unstored_drop(i, 40.0, cause="promo") for i in range(12)]
-    drops = [_unstored_drop(100 + i, 25.0) for i in range(11)]
+    drops = [_unstored_drop(100 + i, 25.0) for i in range(12)]
 
-    # 12 + 11 из 22 подешевевших: каждая группа — не меньше половины.
-    out = alerts.collapse_mass_price_moves(promos + drops, moved_products=22, fell_products=22)
+    # 24 подешевевших: у каждой группы ровно половина.
+    fell = {e.payload["product_id"] for e in promos + drops}
+    out = alerts.collapse_mass_price_moves(
+        promos + drops, moved_products=24, fell_product_ids=fell
+    )
 
     titles = sorted(e.title for e in out)
     assert titles == [
         "Акция в разделе: aloe, 12 товаров",
-        "Массовое падение цен: aloe, 11 товаров",
+        "Массовое падение цен: aloe, 12 товаров",
     ]
     assert len({e.dedup_key for e in out}) == 2
 
