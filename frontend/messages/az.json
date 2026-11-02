@@ -365,6 +365,8 @@
     "opens_new_tab": "yeni tabda açılacaq",
     "event_price_drop_title": "Qiymət {pct}% düşüb: {product}",
     "event_price_drop_detail": "{site}: {previous} → {current} ₼ (-{pct}%).",
+    "event_promo_drop_title": "Aksiya −{pct}%: {product}",
+    "event_promo_drop_detail": "{site}: aksiya ilə {previous} → {current} ₼ (-{pct}%), adi qiymət {regular} ₼.",
     "event_undercut_title": "{site} {pct}% daha ucuzdur: {product}",
     "event_undercut_detail": "Müştəri: {client} ₼, {site}: {competitor} ₼ (-{pct}%).",
     "event_new_product_title": "{site} saytında yeni məhsul: {product}",
