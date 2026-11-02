@@ -401,6 +401,110 @@ def test_price_drop_detects_yesterday_to_today(db_session):
     assert fired[0].payload["drop_pct"] == 30.0
 
 
+def test_price_drop_from_a_new_promotion_is_labelled_as_a_promotion(db_session):
+    """Обычная цена прежняя, появилась акционная — это акция, а не «цена упала».
+
+    2026-11-02, прогон #1207: у товара aloe 28523 обычная цена 11.10, по акции
+    3.90. Монитор записал верно (price=11.10, discount_price=3.90), а письмо
+    назвало это «Цена упала на 64.9%».
+    """
+    p = _add_product(db_session, "aloe", "Baboo su qabı", "28523")
+    yesterday = _add_run(db_session, utcnow() - timedelta(days=1))
+    today = _add_run(db_session, utcnow())
+    _add_snap(db_session, yesterday, p, 11.10)
+    _add_snap(db_session, today, p, 11.10, discount_price=3.90)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session, today.id)
+
+    assert len(fired) == 1
+    event = fired[0]
+    assert event.rule_type == "price_drop_pct"
+    assert event.dedup_key == f"drop|p={p.id}"
+    assert event.severity == "critical"
+    assert event.title == "Акция −64.9%: Baboo su qabı"
+    assert "Цена упала" not in event.title
+    assert event.detail == "aloe: 11.10 → 3.90 ₼ по акции (−64.9%), обычная цена 11.10 ₼."
+    assert event.payload["cause"] == "promo"
+    assert event.payload["regular_price"] == 11.10
+    assert event.payload["drop_pct"] == 64.86
+
+
+def test_deeper_promotion_with_the_same_regular_price_is_a_promotion(db_session):
+    p = _add_product(db_session, "aloe", "Deeper", "deeper")
+    yesterday = _add_run(db_session, utcnow() - timedelta(days=1))
+    today = _add_run(db_session, utcnow())
+    _add_snap(db_session, yesterday, p, 10.00, discount_price=9.00)
+    _add_snap(db_session, today, p, 10.00, discount_price=6.00)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session, today.id)
+
+    assert [e.payload.get("cause") for e in fired] == ["promo"]
+    assert fired[0].title.startswith("Акция −33.3%")
+
+
+def test_zero_discount_price_is_not_a_promotion(db_session):
+    """Ноль в discount_price цена к оплате отбрасывает — акцией он не считается.
+
+    Обычная цена здесь не изменилась, так что без проверки нуля падение
+    12.00 → 10.00 назвалось бы акцией: условие «акционная ниже обычной» ноль
+    проходит.
+    """
+    p = _add_product(db_session, "aloe", "Zero", "zero")
+    yesterday = _add_run(db_session, utcnow() - timedelta(days=1))
+    today = _add_run(db_session, utcnow())
+    _add_snap(db_session, yesterday, p, 10.00, discount_price=12.00)
+    _add_snap(db_session, today, p, 10.00, discount_price=0.0)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session, today.id)
+
+    assert [e.title for e in fired] == ["Цена упала на 16.7%: Zero"]
+    assert "cause" not in fired[0].payload
+
+
+def test_price_drop_of_the_regular_price_stays_a_price_drop(db_session):
+    """Упала сама обычная цена — это «Цена упала», даже если идёт акция."""
+    plain = _add_product(db_session, "aloe", "Plain", "plain")
+    both = _add_product(db_session, "aloe", "Both", "both")
+    yesterday = _add_run(db_session, utcnow() - timedelta(days=1))
+    today = _add_run(db_session, utcnow())
+    _add_snap(db_session, yesterday, plain, 10.00)
+    _add_snap(db_session, today, plain, 7.00)
+    _add_snap(db_session, yesterday, both, 10.00)
+    _add_snap(db_session, today, both, 8.00, discount_price=7.00)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session, today.id)
+
+    assert len(fired) == 2
+    for event in fired:
+        assert event.title.startswith("Цена упала на 30.0%")
+        assert "cause" not in event.payload
+
+
+def test_price_change_down_from_a_promotion_is_labelled_as_a_promotion(db_session):
+    p = _add_product(db_session, "aloe", "Changed", "changed")
+    yesterday = _add_run(db_session, utcnow() - timedelta(days=1))
+    today = _add_run(db_session, utcnow())
+    _add_snap(db_session, yesterday, p, 20.00)
+    _add_snap(db_session, today, p, 20.00, discount_price=15.00)
+    _add_rule(db_session, "price_change_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    fired = alerts.evaluate_rules(db_session, today.id)
+
+    assert len(fired) == 1
+    assert fired[0].title == "Акция −25.0%: Changed"
+    assert fired[0].payload["cause"] == "promo"
+    assert fired[0].payload["direction"] == "down"
+
+
 def test_confirmed_watchlist_tick_only_emits_local_price_change(db_session):
     """A successful pinned-SKU tick cannot emit cross-site money advice."""
     product = _add_product(db_session, "aloe", "Pinned", "pinned")
@@ -622,9 +726,7 @@ def test_promotions_and_regular_drops_are_never_summarised_together():
 
     # 24 подешевевших: у каждой группы ровно половина.
     fell = {e.payload["product_id"] for e in promos + drops}
-    out = alerts.collapse_mass_price_moves(
-        promos + drops, moved_products=24, fell_product_ids=fell
-    )
+    out = alerts.collapse_mass_price_moves(promos + drops, moved_products=24, fell_product_ids=fell)
 
     titles = sorted(e.title for e in out)
     assert titles == [
@@ -658,6 +760,22 @@ def test_category_tick_keeps_real_drops_one_by_one(db_session):
     assert len(events) == 12
     assert {e.rule_type for e in events} == {"price_drop_pct"}
     assert all("Цена упала" in e.title for e in events)
+
+
+def test_category_tick_labels_a_promotion_as_a_promotion(db_session):
+    """Письмо админу с тика — то самое, что 2026-11-02 пришло со 102 «Цена упала»."""
+    product = _add_product(db_session, "aloe", "Canpol fırça", "22387")
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    _add_snap(db_session, previous_full, product, 5.60)
+    _add_snap(db_session, tick, product, 5.60, discount_price=2.90)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    events = alerts.local_price_alerts_for_partial_run(db_session, tick.id)
+
+    assert [e.title for e in events] == ["Акция −48.2%: Canpol fırça"]
+    assert events[0].payload["cause"] == "promo"
 
 
 def test_category_tick_evaluates_only_local_price_rules(db_session):

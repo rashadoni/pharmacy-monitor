@@ -32,6 +32,7 @@ from src.storage import (
     AlertRule,
     Match,
     PriceSnapshot,
+    Product,
     Promo,
     Run,
     has_unfinished_run,
@@ -61,6 +62,36 @@ class CandidateEvent:
 
 
 # === DETECTORS ===
+
+
+def _drop_is_promo(prev: PriceSnapshot, snap: PriceSnapshot) -> bool:
+    """Цену к оплате снизила акция, а обычная цена не упала.
+
+    Сборщики пишут обычную (перечёркнутую) цену в ``price``, акционную — в
+    ``discount_price``. Если обычная цена осталась прежней или выросла, а цена к
+    оплате упала, это началась или углубилась акция, а не подешевел товар.
+    2026-11-02 тик раздела aloe «Uşaq dünyası» прислал 102 «Цена упала» (70
+    critical): у всех 102 обычная цена не изменилась, а на сайте началась
+    распродажа (прогон #1207, сверено с базой и с aloe.az).
+    """
+    # Ноль — не акция: цена к оплате (`discount_price or price`) его отбрасывает.
+    if not snap.discount_price or snap.price is None or prev.price is None:
+        return False
+    if snap.discount_price >= snap.price:
+        return False
+    return snap.price >= prev.price - 0.005
+
+
+def _promo_drop_copy(
+    product: Product, prev_price: float, curr_price: float, regular: float, pct: float
+) -> tuple[str, str]:
+    return (
+        f"Акция −{pct:.1f}%: {product.name[:60]}",
+        (
+            f"{product.site}: {prev_price:.2f} → {curr_price:.2f} ₼ по акции "
+            f"(−{pct:.1f}%), обычная цена {regular:.2f} ₼."
+        ),
+    )
 
 
 def _detect_undercut_threshold(session: Session, run_id: int, params: dict) -> list[CandidateEvent]:
@@ -156,22 +187,27 @@ def _detect_price_drop(session: Session, run_id: int, params: dict) -> list[Cand
         if site_filter and product.site != site_filter:
             continue
         sev = "warning" if drop_pct < 20 else "critical"
+        payload = {
+            "product_id": product.id,
+            "site": product.site,
+            "prev_price": prev_price,
+            "curr_price": curr_price,
+            "drop_pct": round(drop_pct, 2),
+        }
+        if _drop_is_promo(prev, snap):
+            title, detail = _promo_drop_copy(product, prev_price, curr_price, snap.price, drop_pct)
+            payload |= {"cause": "promo", "regular_price": snap.price}
+        else:
+            title = f"Цена упала на {drop_pct:.1f}%: {product.name[:60]}"
+            detail = f"{product.site}: {prev_price:.2f} → {curr_price:.2f} ₼ (−{drop_pct:.1f}%)."
         out.append(
             CandidateEvent(
                 rule_type="price_drop_pct",
                 dedup_key=f"drop|p={product.id}",
                 severity=sev,
-                title=f"Цена упала на {drop_pct:.1f}%: {product.name[:60]}",
-                detail=(
-                    f"{product.site}: {prev_price:.2f} → {curr_price:.2f} ₼ (−{drop_pct:.1f}%)."
-                ),
-                payload={
-                    "product_id": product.id,
-                    "site": product.site,
-                    "prev_price": prev_price,
-                    "curr_price": curr_price,
-                    "drop_pct": round(drop_pct, 2),
-                },
+                title=title,
+                detail=detail,
+                payload=payload,
             )
         )
     return out
@@ -223,24 +259,30 @@ def _detect_price_change(session: Session, run_id: int, params: dict) -> list[Ca
         change_word = "выросла" if direction == "up" else "снизилась"
         sign = "+" if direction == "up" else "−"
         severity = "critical" if amount >= 20 else "warning"
+        payload = {
+            "product_id": product.id,
+            "site": product.site,
+            "prev_price": prev_price,
+            "curr_price": curr_price,
+            "change_pct": round(change_pct, 2),
+            "direction": direction,
+        }
+        if direction == "down" and _drop_is_promo(prev, snap):
+            title, detail = _promo_drop_copy(product, prev_price, curr_price, snap.price, amount)
+            payload |= {"cause": "promo", "regular_price": snap.price}
+        else:
+            title = f"Цена {change_word} на {amount:.1f}%: {product.name[:60]}"
+            detail = (
+                f"{product.site}: {prev_price:.2f} → {curr_price:.2f} ₼ ({sign}{amount:.1f}%)."
+            )
         out.append(
             CandidateEvent(
                 rule_type="price_change_pct",
                 dedup_key=f"change|p={product.id}|direction={direction}",
                 severity=severity,
-                title=f"Цена {change_word} на {amount:.1f}%: {product.name[:60]}",
-                detail=(
-                    f"{product.site}: {prev_price:.2f} → {curr_price:.2f} ₼ "
-                    f"({sign}{amount:.1f}%)."
-                ),
-                payload={
-                    "product_id": product.id,
-                    "site": product.site,
-                    "prev_price": prev_price,
-                    "curr_price": curr_price,
-                    "change_pct": round(change_pct, 2),
-                    "direction": direction,
-                },
+                title=title,
+                detail=detail,
+                payload=payload,
             )
         )
     return out

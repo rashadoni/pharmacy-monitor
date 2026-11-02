@@ -61,6 +61,61 @@ describe("localizedAlertCopy", () => {
     expect(copy.detail).toBe("pharmonline: 22.00 → 15.40 ₼ (-30.0%).");
   });
 
+  it("renders a promotion-driven drop as a promotion, not a price drop", () => {
+    const promo = event({
+      rule_type: "price_drop_pct",
+      severity: "critical",
+      title: "Акция −64.9%: Baboo su qabı",
+      payload: {
+        site: "aloe",
+        prev_price: 11.1,
+        curr_price: 3.9,
+        drop_pct: 64.86,
+        cause: "promo",
+        regular_price: 11.1,
+      },
+      site: "aloe",
+    });
+
+    const ruCopy = localizedAlertCopy(promo, tFromMessages(ru));
+    expect(ruCopy.title).toBe("Акция −64.9%: Baboo su qabı");
+    expect(ruCopy.title).not.toContain("Цена упала");
+    expect(ruCopy.detail).toBe(
+      "aloe: 11.10 → 3.90 ₼ по акции (-64.9%), обычная цена 11.10 ₼.",
+    );
+    expect(localizedAlertCopy(promo, tFromMessages(az)).title).toBe(
+      "Aksiya −64.9%: Baboo su qabı",
+    );
+    expect(localizedAlertCopy(promo, tFromMessages(en)).title).toBe(
+      "Promotion −64.9%: Baboo su qabı",
+    );
+  });
+
+  it("renders a promotion-driven price change in the viewer's language", () => {
+    const copy = localizedAlertCopy(
+      event({
+        rule_type: "price_change_pct",
+        title: "Акция −25.0%: Changed",
+        payload: {
+          site: "aloe",
+          prev_price: 20,
+          curr_price: 15,
+          change_pct: -25,
+          direction: "down",
+          cause: "promo",
+          regular_price: 20,
+        },
+        site: "aloe",
+      }),
+      tFromMessages(az),
+    );
+
+    expect(copy.title).toBe("Aksiya −25.0%: Changed");
+    expect(copy.detail).toBe(
+      "aloe: aksiya ilə 20.00 → 15.00 ₼ (-25.0%), adi qiymət 20.00 ₼.",
+    );
+  });
+
   it("falls back to stored copy for unknown rule types", () => {
     const copy = localizedAlertCopy(
       event({

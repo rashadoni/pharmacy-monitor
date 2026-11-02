@@ -56,6 +56,31 @@ export function localizedAlertCopy(
   const subject = titleSubject(event);
   const site = siteOrGeneral(event, t);
 
+  // Цену к оплате снизила акция, обычная цена не упала (src/alerts.py,
+  // `_drop_is_promo`); у `price_change_pct` так бывает только вниз. События до
+  // этой правки поля `cause` не несут и остаются прежними.
+  if (
+    (event.rule_type === "price_drop_pct" ||
+      event.rule_type === "price_change_pct") &&
+    stringPayload(payload, "cause") === "promo"
+  ) {
+    const changePct = numberPayload(payload, "change_pct");
+    const promoPct =
+      numberPayload(payload, "drop_pct") ??
+      (changePct === null ? null : Math.abs(changePct));
+    const pct = promoPct === null ? "?" : promoPct.toFixed(1);
+    return {
+      title: t("event_promo_drop_title", { pct, product: subject }),
+      detail: t("event_promo_drop_detail", {
+        site,
+        previous: formatAlertAmount(numberPayload(payload, "prev_price")),
+        current: formatAlertAmount(numberPayload(payload, "curr_price")),
+        pct,
+        regular: formatAlertAmount(numberPayload(payload, "regular_price")),
+      }),
+    };
+  }
+
   if (event.rule_type === "price_drop_pct") {
     const dropPct = numberPayload(payload, "drop_pct");
     const prevPrice = numberPayload(payload, "prev_price");

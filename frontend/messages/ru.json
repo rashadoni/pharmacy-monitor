@@ -365,6 +365,8 @@
     "opens_new_tab": "откроется в новой вкладке",
     "event_price_drop_title": "Цена упала на {pct}%: {product}",
     "event_price_drop_detail": "{site}: {previous} → {current} ₼ (-{pct}%).",
+    "event_promo_drop_title": "Акция −{pct}%: {product}",
+    "event_promo_drop_detail": "{site}: {previous} → {current} ₼ по акции (-{pct}%), обычная цена {regular} ₼.",
     "event_undercut_title": "{site} дешевле на {pct}%: {product}",
     "event_undercut_detail": "Клиент: {client} ₼, {site}: {competitor} ₼ (-{pct}%).",
     "event_new_product_title": "Новый товар на {site}: {product}",
