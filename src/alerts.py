@@ -594,21 +594,27 @@ def evaluate_rules(
 
 # ─── Лавина ценовых событий одного сбора ─────────────────────────────────────
 #
-# 2026-11-02 один тик раздела aloe прислал владельцу 102 письма (70 critical):
-# весь «детский мир» «подешевел» на 10–65%, а новые цены оказались акционными
-# ценниками — 4.90, 6.90, 9.90, 1.50. Монитор акцию в цену не пишет: при
-# найденной перечёркнутой цене `price` хранит обычную, а акционная идёт в
-# `discount_price` (`src/scrapers/aloe.py`, обе ветки). Значит падение самой
-# `price` сразу у сотни товаров означает одно из двух: аптека переписала весь
-# раздел, или на сайте сменилась вёрстка, перечёркнутая цена перестала
-# находиться (`is_on_sale=False`) и акционный ценник записался как обычный.
-# В обоих случаях это ОДНА новость про раздел, а не сто про товары, и верить
-# таким ценам до проверки нельзя.
+# 2026-11-02 один тик раздела aloe «Uşaq dünyası» (прогон #1207) прислал
+# администратору письмо со 102 ценовыми событиями (70 critical). Сверка с базой
+# и с aloe.az: у всех 102 обычная цена осталась прежней, на сайте началась
+# распродажа раздела, и монитор записал её верно (`price` — обычная,
+# `discount_price` — акционная). Ошибкой было не значение, а подача: сто строк
+# про одну новость о разделе.
+#
+# Поэтому события одного сбора сворачиваются, когда их много, и отдельно по
+# причине: акция (`payload.cause == "promo"`, см. `_drop_is_promo`) — это новость
+# «в разделе распродажа», а массовое падение обычной цены — повод проверить
+# раздел: аптека переписала цены или сменилась вёрстка и перечёркнутая цена
+# перестала находиться. Смешивать их в одну сводку нельзя: второй текст про
+# первые события неверен.
 #
 # Порог двойной: и число событий, и их доля среди товаров, у которых этот сбор
-# вообще застал цену изменившейся. Одной доли мало — в разделе из трёх товаров
-# она всегда единица; одного числа мало — на полном каталоге сотня настоящих
-# падений возможна.
+# застал цену к оплате сдвинувшейся в ту же сторону (для падений и акций — среди
+# подешевевших, для «цена изменилась» — среди всех изменившихся). Одной доли
+# мало — в разделе из трёх товаров она всегда единица; одного числа мало — на
+# полном каталоге сотня настоящих падений возможна. Доля от всех изменившихся
+# #1207 не ловила: 102 падения на 10% и больше из 207 изменившихся — 0.49; из
+# 192 подешевевших — 0.53.
 MASS_MOVE_MIN_EVENTS = 10
 MASS_MOVE_MIN_SHARE = 0.5
 
@@ -621,7 +627,14 @@ def _is_mass_move(group: list[AlertEvent], *, moved_products: int) -> bool:
     return len(group) / moved_products >= MASS_MOVE_MIN_SHARE
 
 
-def _mass_move_summary(rule_type: str, group: list[AlertEvent]) -> AlertEvent:
+def _event_cause(event: AlertEvent) -> str | None:
+    cause = (event.payload or {}).get("cause")
+    return cause if isinstance(cause, str) else None
+
+
+def _mass_move_summary(
+    rule_type: str, cause: str | None, group: list[AlertEvent]
+) -> AlertEvent:
     """Одно событие вместо группы: сколько, насколько и куда смотреть.
 
     Товаров в payload намеренно нет: событие про раздел, а не про товар, и
@@ -630,58 +643,82 @@ def _mass_move_summary(rule_type: str, group: list[AlertEvent]) -> AlertEvent:
     sites = sorted({(e.payload or {}).get("site") for e in group} - {None})
     where = ", ".join(sites) if sites else "сайт не указан"
     moves = sorted(
-        float((e.payload or {}).get("drop_pct") or (e.payload or {}).get("change_pct"))
+        abs(float((e.payload or {}).get("drop_pct") or (e.payload or {}).get("change_pct")))
         for e in group
         if (e.payload or {}).get("drop_pct") is not None
         or (e.payload or {}).get("change_pct") is not None
     )
-    word = _MASS_MOVE_WORDING.get(rule_type, "изменение")
-    lines = [f"За один частичный сбор цена изменилась сразу у {len(group)} товаров ({where})."]
-    median = None
-    if moves:
-        median = moves[len(moves) // 2]
-        lines.append(f"Разброс от {moves[0]:.1f}% до {moves[-1]:.1f}%, медиана {median:.1f}%.")
-    lines.append(
-        "Столько сразу — это про раздел, а не про товары: либо аптека переписала "
-        "весь раздел, либо на сайте сменилась вёрстка и акционный ценник записался "
-        "как обычная цена. До проверки раздела этим ценам верить нельзя."
+    median = moves[len(moves) // 2] if moves else None
+    spread = (
+        f"Разброс от {moves[0]:.1f}% до {moves[-1]:.1f}%, медиана {median:.1f}%."
+        if moves
+        else None
     )
+    if cause == "promo":
+        title = f"Акция в разделе: {where}, {len(group)} товаров"
+        lines = [
+            "За один частичный сбор акция началась или углубилась сразу "
+            f"у {len(group)} товаров ({where})."
+        ]
+        if spread:
+            lines.append("Скидка к прежней цене к оплате: " + spread[0].lower() + spread[1:])
+        lines.append(
+            "Обычная цена у этих товаров не упала: на сайте распродажа, "
+            "акционные цены записаны отдельно от обычных."
+        )
+    else:
+        word = _MASS_MOVE_WORDING.get(rule_type, "изменение")
+        title = f"Массовое {word} цен: {where}, {len(group)} товаров"
+        lines = [f"За один частичный сбор цена изменилась сразу у {len(group)} товаров ({where})."]
+        if spread:
+            lines.append(spread)
+        lines.append(
+            "Столько сразу — это про раздел, а не про товары: аптека переписала "
+            "цены раздела, или на сайте сменилась вёрстка и перечёркнутая цена "
+            "перестала находиться — тогда акционный ценник записался как обычный. "
+            "Раздел стоит открыть на сайте."
+        )
     if group:
         lines.append("Например: " + "; ".join(e.title for e in group[:3]) + ".")
     source_run_id = (group[0].payload or {}).get("source_run_id")
+    payload = {
+        "collapsed": len(group),
+        "sites": sites,
+        "median_pct": median,
+        "source_run_id": source_run_id,
+    }
+    if cause:
+        payload["cause"] = cause
     return AlertEvent(
         rule_id=group[0].rule_id,
         rule_type=rule_type,
-        dedup_key=f"mass|{rule_type}|run={source_run_id}|{where}",
+        dedup_key=f"mass|{rule_type}|{cause or 'price'}|run={source_run_id}|{where}",
         severity="critical" if any(e.severity == "critical" for e in group) else group[0].severity,
-        title=f"Массовое {word} цен: {where}, {len(group)} товаров",
+        title=title,
         detail=" ".join(lines),
-        payload={
-            "collapsed": len(group),
-            "sites": sites,
-            "median_pct": median,
-            "source_run_id": source_run_id,
-        },
+        payload=payload,
         tenant_id=group[0].tenant_id,
         created_at=group[0].created_at,
     )
 
 
 def collapse_mass_price_moves(
-    events: list[AlertEvent], *, moved_products: int
+    events: list[AlertEvent], *, moved_products: int, fell_products: int | None = None
 ) -> list[AlertEvent]:
-    """Свернуть лавину ценовых событий сбора в одно сообщение на тип правила.
+    """Свернуть лавину ценовых событий сбора в одно сообщение на тип и причину.
 
     Группы, не дотянувшие до порога, возвращаются как есть — настоящее
     одиночное падение цены владелец должен видеть товаром, а не сводкой.
     """
-    by_type: dict[str, list[AlertEvent]] = {}
+    groups: dict[tuple[str, str | None], list[AlertEvent]] = {}
     for event in events:
-        by_type.setdefault(event.rule_type, []).append(event)
+        groups.setdefault((event.rule_type, _event_cause(event)), []).append(event)
     out: list[AlertEvent] = []
-    for rule_type, group in by_type.items():
-        if _is_mass_move(group, moved_products=moved_products):
-            out.append(_mass_move_summary(rule_type, group))
+    fell = moved_products if fell_products is None else fell_products
+    for (rule_type, cause), group in groups.items():
+        downward = rule_type == "price_drop_pct" or cause == "promo"
+        if _is_mass_move(group, moved_products=fell if downward else moved_products):
+            out.append(_mass_move_summary(rule_type, cause, group))
         else:
             out.extend(group)
     return out
@@ -747,6 +784,14 @@ def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[Al
         for snap in curr_snaps
         if snap.product_id not in last_seen or payable(last_seen[snap.product_id]) != payable(snap)
     }
+    price_fell = sum(
+        1
+        for snap in curr_snaps
+        if snap.product_id in last_seen
+        and payable(snap) is not None
+        and payable(last_seen[snap.product_id]) is not None
+        and payable(snap) < payable(last_seen[snap.product_id])
+    )
 
     now = utcnow()
     found: list[AlertEvent] = []
@@ -785,13 +830,16 @@ def local_price_alerts_for_partial_run(session: Session, run_id: int) -> list[Al
                 )
             )
 
-    collapsed = collapse_mass_price_moves(found, moved_products=len(price_moved))
+    collapsed = collapse_mass_price_moves(
+        found, moved_products=len(price_moved), fell_products=price_fell
+    )
     log.info(
         "alerts_partial_run_local",
         run_id=run_id,
         found=len(found),
         sent=len(collapsed),
         moved_products=len(price_moved),
+        fell_products=price_fell,
         rules=len(rules),
     )
     return collapsed
