@@ -61,6 +61,36 @@ describe("localizedAlertCopy", () => {
     expect(copy.detail).toBe("pharmonline: 22.00 → 15.40 ₼ (-30.0%).");
   });
 
+  it("renders a promotion-driven drop as a promotion, not a price drop", () => {
+    const promo = event({
+      rule_type: "price_drop_pct",
+      severity: "critical",
+      title: "Акция −64.9%: Baboo su qabı",
+      payload: {
+        site: "aloe",
+        prev_price: 11.1,
+        curr_price: 3.9,
+        drop_pct: 64.86,
+        cause: "promo",
+        regular_price: 11.1,
+      },
+      site: "aloe",
+    });
+
+    const ruCopy = localizedAlertCopy(promo, tFromMessages(ru));
+    expect(ruCopy.title).toBe("Акция −64.9%: Baboo su qabı");
+    expect(ruCopy.title).not.toContain("Цена упала");
+    expect(ruCopy.detail).toBe(
+      "aloe: 11.10 → 3.90 ₼ по акции (-64.9%), обычная цена 11.10 ₼.",
+    );
+    expect(localizedAlertCopy(promo, tFromMessages(az)).title).toBe(
+      "Aksiya −64.9%: Baboo su qabı",
+    );
+    expect(localizedAlertCopy(promo, tFromMessages(en)).title).toBe(
+      "Promotion −64.9%: Baboo su qabı",
+    );
+  });
+
   it("falls back to stored copy for unknown rule types", () => {
     const copy = localizedAlertCopy(
       event({

@@ -365,6 +365,8 @@
     "opens_new_tab": "opens in a new tab",
     "event_price_drop_title": "Price fell by {pct}%: {product}",
     "event_price_drop_detail": "{site}: {previous} → {current} ₼ (-{pct}%).",
+    "event_promo_drop_title": "Promotion −{pct}%: {product}",
+    "event_promo_drop_detail": "{site}: {previous} → {current} ₼ on promotion (-{pct}%), regular price {regular} ₼.",
     "event_undercut_title": "{site} is {pct}% cheaper: {product}",
     "event_undercut_detail": "Client: {client} ₼, {site}: {competitor} ₼ (-{pct}%).",
     "event_new_product_title": "New product on {site}: {product}",

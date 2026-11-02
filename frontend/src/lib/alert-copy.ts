@@ -60,6 +60,21 @@ export function localizedAlertCopy(
     const dropPct = numberPayload(payload, "drop_pct");
     const prevPrice = numberPayload(payload, "prev_price");
     const currPrice = numberPayload(payload, "curr_price");
+    // Цену к оплате снизила акция, обычная цена не упала (src/alerts.py,
+    // `_drop_is_promo`). События до этой правки поля `cause` не несут.
+    if (stringPayload(payload, "cause") === "promo") {
+      const pct = dropPct === null ? "?" : dropPct.toFixed(1);
+      return {
+        title: t("event_promo_drop_title", { pct, product: subject }),
+        detail: t("event_promo_drop_detail", {
+          site,
+          previous: formatAlertAmount(prevPrice),
+          current: formatAlertAmount(currPrice),
+          pct,
+          regular: formatAlertAmount(numberPayload(payload, "regular_price")),
+        }),
+      };
+    }
     return {
       title: t("event_price_drop_title", {
         pct: dropPct === null ? "?" : dropPct.toFixed(1),
