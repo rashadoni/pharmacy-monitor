@@ -598,6 +598,170 @@ def test_category_tick_reports_local_price_drop_without_touching_the_journal(db_
     assert db_session.query(AlertEvent).count() == 0
 
 
+def test_category_tick_collapses_a_sectionwide_drop_into_one_event(db_session):
+    """Сто падений за один сбор — одно письмо про раздел, а не сто про товары.
+
+    2026-11-02 тик раздела aloe прислал владельцу письмо со 102 событиями:
+    «детский мир» подешевел на 10–65%. Здесь — массовое падение самой обычной
+    цены; начавшуюся распродажу сворачивает своя сводка (тест ниже).
+    """
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    for i in range(12):
+        product = _add_product(db_session, "aloe", f"Mass {i}", f"mass-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, tick, product, 6.90)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    events = alerts.local_price_alerts_for_partial_run(db_session, tick.id)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.severity == "critical"
+    assert "12 товаров" in event.title
+    assert "aloe" in event.title
+    assert "31.0%" in event.detail
+    assert event.payload["collapsed"] == 12
+    assert event.payload["source_run_id"] == tick.id
+    # Сводка ничего не публикует и ничего не называет товаром.
+    assert "product_id" not in event.payload
+    assert event not in db_session
+    db_session.commit()
+    assert db_session.query(AlertEvent).count() == 0
+
+
+def test_category_tick_collapses_a_drop_wave_measured_among_products_that_fell(db_session):
+    """Форма прогона #1207: доля от всех изменившихся ниже половины, от подешевевших — выше.
+
+    В #1207 цена к оплате изменилась у 207 товаров, подешевела у 192, на 10% и
+    больше — у 102: 0.49 от изменившихся, 0.53 от подешевевших. Доля от всех
+    изменившихся сворачивать такую лавину не давала.
+    """
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    for i in range(10):
+        product = _add_product(db_session, "aloe", f"Big {i}", f"big-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, tick, product, 10.00, discount_price=7.00)
+    for i in range(8):
+        product = _add_product(db_session, "aloe", f"Small {i}", f"small-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, tick, product, 10.00, discount_price=9.50)
+    for i in range(3):
+        product = _add_product(db_session, "aloe", f"Up {i}", f"up-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, tick, product, 11.00)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    events = alerts.local_price_alerts_for_partial_run(db_session, tick.id)
+
+    assert len(events) == 1
+    assert events[0].payload["collapsed"] == 10
+    assert "10 товаров" in events[0].title
+
+
+def test_drop_against_the_trusted_price_counts_even_if_it_rose_since_the_last_tick(db_session):
+    """Событие считается от доверенной цены, «подешевевшие» — от последней записи.
+
+    Полный сбор 10.00, первый тик 6.90, второй 7.50: второй тик даёт падение на
+    25% к доверенной цене, хотя к прошлому тику цена выросла. Такие товары
+    входят в знаменатель через саму группу — иначе при нуле «подешевевших»
+    лавина не сворачивалась, а доля выходила больше единицы.
+    """
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    first_tick = _add_category_tick(db_session)
+    second_tick = _add_category_tick(db_session)
+    for i in range(12):
+        product = _add_product(db_session, "aloe", f"Rebound {i}", f"rebound-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, first_tick, product, 6.90)
+        _add_snap(db_session, second_tick, product, 7.50)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    events = alerts.local_price_alerts_for_partial_run(db_session, second_tick.id)
+
+    assert len(events) == 1
+    assert events[0].payload["collapsed"] == 12
+
+
+def _unstored_drop(product_id: int, pct: float, *, cause: str | None = None) -> AlertEvent:
+    payload = {"product_id": product_id, "site": "aloe", "drop_pct": pct, "source_run_id": 7}
+    if cause:
+        payload["cause"] = cause
+    return AlertEvent(
+        rule_id=1,
+        rule_type="price_drop_pct",
+        dedup_key=f"drop|p={product_id}",
+        severity="critical" if pct >= 20 else "warning",
+        title=f"{'Акция' if cause else 'Цена упала'} −{pct:.1f}%: товар {product_id}",
+        detail="",
+        payload=payload,
+        tenant_id=1,
+    )
+
+
+def test_promotion_wave_is_summarised_as_a_sale_not_as_suspect_prices():
+    """Начавшаяся распродажа — своя сводка, без «акционный ценник записался как обычный»."""
+    events = [_unstored_drop(i, 30.0 + i, cause="promo") for i in range(12)]
+
+    out = alerts.collapse_mass_price_moves(
+        events, moved_products=20, fell_product_ids=set(range(12))
+    )
+
+    assert len(out) == 1
+    summary = out[0]
+    assert summary.title == "Акция в разделе: aloe, 12 товаров"
+    assert summary.payload["cause"] == "promo"
+    assert "распродажа" in summary.detail
+    assert "вёрстка" not in summary.detail
+    assert "Массовое" not in summary.title
+
+
+def test_promotions_and_regular_drops_are_never_summarised_together():
+    promos = [_unstored_drop(i, 40.0, cause="promo") for i in range(12)]
+    drops = [_unstored_drop(100 + i, 25.0) for i in range(12)]
+
+    # 24 подешевевших: у каждой группы ровно половина.
+    fell = {e.payload["product_id"] for e in promos + drops}
+    out = alerts.collapse_mass_price_moves(promos + drops, moved_products=24, fell_product_ids=fell)
+
+    titles = sorted(e.title for e in out)
+    assert titles == [
+        "Акция в разделе: aloe, 12 товаров",
+        "Массовое падение цен: aloe, 12 товаров",
+    ]
+    assert len({e.dedup_key for e in out}) == 2
+
+
+def test_category_tick_keeps_real_drops_one_by_one(db_session):
+    """Двенадцать падений среди тридцати изменившихся — это товары, не раздел.
+
+    Порог по доле отделяет «переписали весь раздел» от обычного дня, когда
+    часть цен упала, а остальные шевельнулись в пределах нормы.
+    """
+    previous_full = _add_run(db_session, utcnow() - timedelta(days=1))
+    tick = _add_category_tick(db_session)
+    for i in range(12):
+        product = _add_product(db_session, "aloe", f"Dropped {i}", f"dropped-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, tick, product, 6.90)
+    for i in range(18):
+        product = _add_product(db_session, "aloe", f"Nudged {i}", f"nudged-{i}")
+        _add_snap(db_session, previous_full, product, 10.00)
+        _add_snap(db_session, tick, product, 9.80)
+    _add_rule(db_session, "price_drop_pct", {"min_pct": 10.0})
+    db_session.commit()
+
+    events = alerts.local_price_alerts_for_partial_run(db_session, tick.id)
+
+    assert len(events) == 12
+    assert {e.rule_type for e in events} == {"price_drop_pct"}
+    assert all("Цена упала" in e.title for e in events)
+
+
 def test_category_tick_labels_a_promotion_as_a_promotion(db_session):
     """Письмо админу с тика — то самое, что 2026-11-02 пришло со 102 «Цена упала»."""
     product = _add_product(db_session, "aloe", "Canpol fırça", "22387")
