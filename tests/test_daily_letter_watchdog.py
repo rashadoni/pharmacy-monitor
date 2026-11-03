@@ -711,7 +711,9 @@ def test_health_check_command_mails_the_admin_once_and_reports_recovery(setup, t
 
 def test_admin_learns_that_the_client_did_not_get_the_letter(setup, tmp_path):
     """Клиенту отказали, админу письмо принято: команда кончилась кодом 0, а health
-    всё равно пишет админу — warning с числом непринятых."""
+    показывает warning с числом непринятых. Письмом warning с 2026-11-03 идёт
+    только с `--alert-min-severity warning` (решение владельца: письмом — только
+    критические)."""
     s = setup
     _healthy_catalog(s)
     client_user = _reader(s)
@@ -727,21 +729,23 @@ def test_admin_learns_that_the_client_did_not_get_the_letter(setup, tmp_path):
     assert result.exit_code == 0, result.output
     assert "daily digest: принято у 1 из 2 получателей" in result.output
 
+    arguments = [
+        "health-check",
+        "--alert-email",
+        "--quiet-on-ok",
+        "--alert-state-file",
+        str(tmp_path / "health_alert_state.json"),
+    ]
     mailed = []
     with patch.object(notifier, "send_email", lambda **kwargs: mailed.append(kwargs) or True):
-        checked = CliRunner().invoke(
-            cli,
-            [
-                "health-check",
-                "--alert-email",
-                "--quiet-on-ok",
-                "--alert-state-file",
-                str(tmp_path / "health_alert_state.json"),
-            ],
-        )
-
+        checked = CliRunner().invoke(cli, arguments)
     assert checked.exit_code == 1, checked.output
     assert "[warning] daily_letter_partly_delivered" in checked.output
+    assert mailed == []
+
+    with patch.object(notifier, "send_email", lambda **kwargs: mailed.append(kwargs) or True):
+        checked = CliRunner().invoke(cli, [*arguments, "--alert-min-severity", "warning"])
+    assert checked.exit_code == 1, checked.output
     (alert,) = mailed
     assert alert["subject"] == "Pharmacy Monitor — WARNING"
     assert "почтовый сервер не принял у 1 из 2 получателей" in alert["html_body"]
