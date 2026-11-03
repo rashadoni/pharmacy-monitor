@@ -1229,8 +1229,8 @@ def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthI
     return issues
 
 
-def render_alert_html(report: HealthReport) -> str:
-    """Простое HTML-письмо для алерта."""
+def render_alert_html(report: HealthReport, *, note: str | None = None) -> str:
+    """Простое HTML-письмо для алерта. `note` — строка под шапкой."""
     color = {"ok": "#34c759", "warning": "#ff9500", "critical": "#ff3b30"}[report.status]
     title = {"ok": "✓ OK", "warning": "⚠️ Внимание", "critical": "🔴 Проблема"}[report.status]
 
@@ -1258,6 +1258,7 @@ def render_alert_html(report: HealthReport) -> str:
           Last run: #{report.last_run_id or "—"} ({report.last_run_status or "—"}) at
           {report.last_run_at.strftime("%Y-%m-%d %H:%M UTC") if report.last_run_at else "—"}
         </div>
+        {f'<div style="font-size:13px;color:#1d1d1f;margin-top:10px;">{note}</div>' if note else ""}
       </div>
       <table style="width:100%;border-collapse:collapse;font-size:13px;">
         {"".join(rows) if rows else '<tr><td style="padding:16px;color:#34c759;">All checks pass.</td></tr>'}

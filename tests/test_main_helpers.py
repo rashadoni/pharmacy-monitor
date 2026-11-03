@@ -1556,3 +1556,65 @@ def test_alert_state_with_unreadable_signature_still_gets_its_recovery():
     warning_only = '[{"code":"x","context":{},"severity":"warning"}]'
     assert alert_state_was_mailable({"signature": warning_only}, "critical") is False
     assert alert_state_was_mailable({"signature": warning_only}, "warning") is True
+
+
+def test_mixed_incident_left_by_the_old_threshold_sends_no_repeat_mail(tmp_path, monkeypatch):
+    """Инцидент «критическое + предупреждение», открытый прежним порогом: первая
+    проверка после смены порога не повторяет письмо о том же инциденте."""
+    from src.health import HealthIssue, HealthReport, health_alert_decision, health_alert_state_after
+
+    now = main_mod.utcnow()
+    state_path = tmp_path / "health.json"
+    mixed = HealthReport(
+        status="critical",
+        issues=[
+            HealthIssue("critical", "site_silent", "silent", {"site": "aloe"}),
+            HealthIssue("warning", "catalog_identity_isolated", "1", {"site": "pharmonline"}),
+        ],
+    )
+    opened = health_alert_decision(mixed, None, now=now, reminder_hours=24)
+    main_mod._write_health_alert_state(
+        str(state_path), health_alert_state_after(opened, None, now=now)
+    )
+    sent = _record_mail(monkeypatch)
+
+    def dispatch(hours):
+        return main_mod._dispatch_health_alert_email(
+            mixed,
+            alert_state_file=str(state_path),
+            reminder_hours=24,
+            now=now + timedelta(hours=hours),
+        )
+
+    assert dispatch(1) is None
+    assert dispatch(2) is None
+    assert sent == []
+    # Напоминание по-прежнему раз в сутки от настоящего письма.
+    assert dispatch(25) == "reminder"
+    assert len(sent) == 1
+
+
+def test_recovery_with_warnings_left_names_them_instead_of_all_clear(tmp_path, monkeypatch):
+    from src.health import HealthIssue, HealthReport
+
+    now = main_mod.utcnow()
+    state_path = tmp_path / "health.json"
+    critical = HealthIssue("critical", "site_silent", "silent", {"site": "aloe"})
+    warning = HealthIssue("warning", "catalog_identity_isolated", "isolated", {"site": "pharmonline"})
+    sent = _record_mail(monkeypatch)
+    for hours, report in (
+        (0, HealthReport(status="critical", issues=[critical])),
+        (1, HealthReport(status="warning", issues=[warning])),
+    ):
+        main_mod._dispatch_health_alert_email(
+            report,
+            alert_state_file=str(state_path),
+            reminder_hours=24,
+            now=now + timedelta(hours=hours),
+        )
+
+    recovered = sent[-1]
+    assert recovered["subject"] == "Pharmacy Monitor — RECOVERED"
+    assert "All checks pass" not in recovered["html_body"]
+    assert "catalog_identity_isolated" in recovered["html_body"]
+    assert "Критических проблем больше нет" in recovered["html_body"]

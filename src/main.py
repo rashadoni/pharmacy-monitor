@@ -5216,7 +5216,9 @@ def _dispatch_health_alert_email(
     по умолчанию — только критические (решение владельца 2026-11-03).
     """
     from src.health import (
+        HealthReport,
         alert_mail_view,
+        alert_signature,
         alert_state_was_mailable,
         health_alert_decision,
         health_alert_state_after,
@@ -5225,7 +5227,8 @@ def _dispatch_health_alert_email(
 
     transition_at = now or utcnow()
     last_state = _read_health_alert_state(alert_state_file)
-    report = alert_mail_view(report, min_severity)
+    full_report = report
+    report = alert_mail_view(full_report, min_severity)
     decision = health_alert_decision(
         report,
         last_state,
@@ -5233,6 +5236,20 @@ def _dispatch_health_alert_email(
         reminder_hours=reminder_hours,
     )
     if decision.action is None:
+        return None
+    if (
+        decision.action == "incident"
+        and isinstance(last_state, dict)
+        and last_state.get("version") == 2
+        and last_state.get("status") == "active"
+        and last_state.get("signature") == alert_signature(full_report)
+    ):
+        # Тот же инцидент, только его подпись записал прежний порог (вместе с
+        # предупреждениями). Переписать подпись, не отправляя письма: иначе
+        # первая проверка после смены порога повторила бы письмо о том же.
+        _write_health_alert_state(
+            alert_state_file, {**last_state, "signature": decision.signature}
+        )
         return None
     if decision.action == "recovery" and not alert_state_was_mailable(last_state, min_severity):
         # Инцидент из одних предупреждений открыл прежний порог: о нём больше не
@@ -5256,7 +5273,23 @@ def _dispatch_health_alert_email(
         if decision.action == "recovery"
         else f"Pharmacy Monitor — {report.status.upper()}"
     )
-    delivered = notifier.send_email(subject=subject, html_body=render_alert_html(report))
+    html_body = render_alert_html(report)
+    left_out = [i for i in full_report.issues if i not in report.issues]
+    if decision.action == "recovery" and left_out:
+        # Критического больше нет, а предупреждения остались: «All checks pass»
+        # было бы неправдой — письмо их называет.
+        html_body = render_alert_html(
+            HealthReport(
+                status="ok",
+                issues=left_out,
+                last_run_id=report.last_run_id,
+                last_run_at=report.last_run_at,
+                last_run_status=report.last_run_status,
+            ),
+            note="Критических проблем больше нет. Остались предупреждения — "
+            "письмом о них не пишем:",
+        )
+    delivered = notifier.send_email(subject=subject, html_body=html_body)
     if delivered is not True:
         raise RuntimeError("health email was not delivered: SMTP is not configured")
     next_state = health_alert_state_after(decision, last_state, now=transition_at)
