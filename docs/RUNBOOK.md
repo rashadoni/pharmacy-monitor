@@ -977,6 +977,26 @@ sudo -u caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile &
 **Симптом:** клиент жалуется, что писем приходит больше, чем ожидает (напр.
 «поставил дайджест раз в неделю, а капает по несколько раз в день»).
 
+**Состояние с 2026-11-03 (решение владельца: «одно письмо в день»).** У всех трёх
+записей `tenant_users` (id 1 и 10 — admin, id 9 — viewer клиента) стоит
+`daily_digest = true`, `weekly_digest = false`, `email_severity_min = 'off'`
+(записано в боевую базу 2026-11-03; до этого: id 1 — `false / true / warning`,
+id 10 — `true / false / warning`, id 9 — `true / false / off`). Отсюда:
+
+- письма после полного сбора (`dispatch_events_batch`) не идут никому —
+  подписанные на утреннее письмо из них выпадают, события приходят утром;
+- письма админу о ценах с тиков (`mail_unstored_events_to_admins`) и письмо об
+  автодопуске pharmonline (`mail_pharmonline_admission_to_admins`) не идут —
+  оба читают порог, а он `off`; список допущенного — в `run_quality` прогона;
+- проверка здоровья пишет на `EMAIL_TO` мимо `tenant_users` и с 2026-11-03 шлёт
+  письмом только критические проблемы (`health-check --alert-min-severity`,
+  по умолчанию `critical`). Предупреждения видны в выводе команды, на дашборде и
+  в `/status`. Инцидент из одних предупреждений, открытый прежним порогом,
+  закрывается молча, без «RECOVERED». Вернуть предупреждения письмом —
+  `--alert-min-severity warning` в `ExecStart` юнита `pharmacy-monitor-health`.
+
+Жалоба «не приходят алерты» — сначала сверить эти три колонки.
+
 **Контекст:** на `EMAIL_TO`/recipients идут НЕСКОЛЬКО независимых потоков, и
 per-user тумблеры daily/weekly (`tenant_users`, страница «Пользователи»)
 управляют ТОЛЬКО per-user дайджестом. Остальные — отдельные механизмы:

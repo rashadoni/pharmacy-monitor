@@ -166,8 +166,8 @@ def test_malformed_state_sends_no_false_recovery_but_problem_starts_incident(
 
     action = main_mod._dispatch_health_alert_email(
         HealthReport(
-            status="warning",
-            issues=[HealthIssue("warning", "site_silent", "silent", {"site": "aloe"})],
+            status="critical",
+            issues=[HealthIssue("critical", "site_silent", "silent", {"site": "aloe"})],
         ),
         alert_state_file=str(state_path),
         reminder_hours=24,
@@ -275,8 +275,8 @@ def test_health_email_delivery_failure_leaves_active_state_unchanged(tmp_path, m
     now = main_mod.utcnow()
     state_path = tmp_path / "health.json"
     problem = HealthReport(
-        status="warning",
-        issues=[HealthIssue("warning", "site_silent", "silent", {"site": "pharmonline"})],
+        status="critical",
+        issues=[HealthIssue("critical", "site_silent", "silent", {"site": "pharmonline"})],
     )
     initial = health_alert_decision(problem, None, now=now, reminder_hours=24)
     active_state = health_alert_state_after(initial, None, now=now)
@@ -308,8 +308,8 @@ def test_health_email_smtp_skip_does_not_persist_incident_state(tmp_path, monkey
     with pytest.raises(RuntimeError, match="SMTP is not configured"):
         main_mod._dispatch_health_alert_email(
             HealthReport(
-                status="warning",
-                issues=[HealthIssue("warning", "site_silent", "silent", {"site": "aloe"})],
+                status="critical",
+                issues=[HealthIssue("critical", "site_silent", "silent", {"site": "aloe"})],
             ),
             alert_state_file=str(state_path),
             reminder_hours=24,
@@ -333,8 +333,8 @@ def test_health_check_quiet_ok_still_dispatches_recovery(tmp_path, monkeypatch):
     now = main_mod.utcnow()
     state_path = tmp_path / "health.json"
     problem = HealthReport(
-        status="warning",
-        issues=[HealthIssue("warning", "full_catalog_unverified", "degraded")],
+        status="critical",
+        issues=[HealthIssue("critical", "full_catalog_unverified", "degraded")],
     )
     initial = health_alert_decision(problem, None, now=now, reminder_hours=24)
     main_mod._write_health_alert_state(
@@ -1444,3 +1444,115 @@ def test_intraday_product_limit_is_bounded(monkeypatch):
     assert main_mod._intraday_product_limit() == 600
     monkeypatch.setenv("INTRADAY_PRODUCT_LIMIT", "invalid")
     assert main_mod._intraday_product_limit() == 600
+
+# ─── Письмом — только критические (решение владельца 2026-11-03) ──────────────
+
+
+def _record_mail(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        main_mod.notifier, "send_email", lambda **kwargs: sent.append(kwargs) or True
+    )
+    return sent
+
+
+def test_health_warning_alone_sends_no_mail_and_opens_no_incident(tmp_path, monkeypatch):
+    from src.health import HealthIssue, HealthReport
+
+    sent = _record_mail(monkeypatch)
+    state_path = tmp_path / "health.json"
+    warning = HealthReport(
+        status="warning",
+        issues=[HealthIssue("warning", "catalog_identity_isolated", "1", {"site": "pharmonline"})],
+    )
+
+    assert (
+        main_mod._dispatch_health_alert_email(
+            warning, alert_state_file=str(state_path), reminder_hours=24, now=main_mod.utcnow()
+        )
+        is None
+    )
+    assert sent == []
+    assert not state_path.exists()
+
+
+def test_warning_incident_left_by_the_old_threshold_closes_without_a_recovery_mail(
+    tmp_path, monkeypatch
+):
+    """На сервере лежит активный инцидент из одного warning, открытый прежним
+    порогом. Новый порог не должен прислать о нём «RECOVERED»."""
+    from src.health import (
+        HealthIssue,
+        HealthReport,
+        health_alert_decision,
+        health_alert_state_after,
+    )
+
+    now = main_mod.utcnow()
+    state_path = tmp_path / "health.json"
+    warning = HealthReport(
+        status="warning",
+        issues=[HealthIssue("warning", "catalog_identity_isolated", "1", {"site": "pharmonline"})],
+    )
+    opened = health_alert_decision(warning, None, now=now, reminder_hours=24)
+    main_mod._write_health_alert_state(
+        str(state_path), health_alert_state_after(opened, None, now=now)
+    )
+    sent = _record_mail(monkeypatch)
+
+    for report in (warning, HealthReport(status="ok")):
+        assert (
+            main_mod._dispatch_health_alert_email(
+                report,
+                alert_state_file=str(state_path),
+                reminder_hours=24,
+                now=now + timedelta(hours=25),
+            )
+            is None
+        )
+    assert sent == []
+    state = main_mod._read_health_alert_state(str(state_path))
+    assert state["status"] == "ok"
+    assert state["last_sent_at"] == now.isoformat()
+
+
+def test_critical_incident_still_mails_and_recovers_when_only_warnings_remain(
+    tmp_path, monkeypatch
+):
+    from src.health import HealthIssue, HealthReport
+
+    now = main_mod.utcnow()
+    state_path = tmp_path / "health.json"
+    warning = HealthIssue("warning", "catalog_identity_isolated", "1", {"site": "pharmonline"})
+    critical = HealthIssue("critical", "site_silent", "silent", {"site": "aloe"})
+    sent = _record_mail(monkeypatch)
+
+    def dispatch(report, hours):
+        return main_mod._dispatch_health_alert_email(
+            report,
+            alert_state_file=str(state_path),
+            reminder_hours=24,
+            now=now + timedelta(hours=hours),
+        )
+
+    assert dispatch(HealthReport(status="critical", issues=[critical, warning]), 0) == "incident"
+    assert sent[-1]["subject"] == "Pharmacy Monitor — CRITICAL"
+    # В письме только критическое: предупреждение туда не попадает.
+    assert "site_silent" in sent[-1]["html_body"]
+    assert "catalog_identity_isolated" not in sent[-1]["html_body"]
+    # Предупреждение пропало или появилось новое — это не новый инцидент.
+    assert dispatch(HealthReport(status="critical", issues=[critical]), 1) is None
+    assert len(sent) == 1
+    # Критическое ушло, предупреждение осталось — письмо о восстановлении.
+    assert dispatch(HealthReport(status="warning", issues=[warning]), 2) == "recovery"
+    assert sent[-1]["subject"] == "Pharmacy Monitor — RECOVERED"
+
+
+def test_alert_state_with_unreadable_signature_still_gets_its_recovery():
+    from src.health import alert_state_was_mailable
+
+    assert alert_state_was_mailable({"signature": "site_silent:aloe"}, "critical") is True
+    assert alert_state_was_mailable({"signature": "[]"}, "critical") is True
+    warning_only = '[{"code":"x","context":{},"severity":"warning"}]'
+    assert alert_state_was_mailable({"signature": warning_only}, "critical") is False
+    assert alert_state_was_mailable({"signature": warning_only}, "warning") is True
