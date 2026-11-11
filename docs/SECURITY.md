@@ -64,6 +64,7 @@ sqlmap -u "https://your-domain.com/api/v1/dash/comparison?search=test" \
 - [ ] All user-supplied text rendered through React JSX (auto-escaped) — never `dangerouslySetInnerHTML` with non-trusted content
 - [ ] `grep -rn "dangerouslySetInnerHTML" frontend/src/` returns 0 matches
 - [ ] Error messages from API don't echo user input verbatim into HTML
+- [ ] A validation refusal (422) names the field and the reason and never returns the submitted value: `detail[]` carries `type`, `loc`, `msg`, `ctx` — no `input`. A validator's message is a constant string, never an f-string with the value (`tests/test_validation_refusal_echoes_nothing.py`)
 
 ## CSRF
 
