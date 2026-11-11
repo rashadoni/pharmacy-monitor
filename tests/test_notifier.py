@@ -181,7 +181,7 @@ def test_send_email_skip_without_smtp_host(monkeypatch, caplog):
 
 
 def test_send_email_no_recipients_raises(monkeypatch):
-    """SMTP задан но нет получателей → ValueError."""
+    """SMTP задан, но нет получателей → ошибка отправки с классом ValueError."""
     monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
     monkeypatch.setenv("SMTP_USER", "u@x")
     monkeypatch.setenv("SMTP_PASSWORD", "p")
@@ -189,8 +189,9 @@ def test_send_email_no_recipients_raises(monkeypatch):
     import src.watchlist as wl
 
     monkeypatch.setattr(wl, "active_recipient_emails", lambda _s: [])
-    with pytest.raises(ValueError, match="No recipients"):
+    with pytest.raises(notifier.EmailSendError, match="ValueError: No recipients") as raised:
         notifier.send_email("S", "<p></p>")
+    assert raised.value.error_type == "ValueError"
 
 
 def test_send_email_sends_via_smtplib(monkeypatch):
@@ -294,10 +295,12 @@ def test_send_email_with_attachment(monkeypatch):
 
 
 def test_send_email_smtp_failure_propagates(monkeypatch):
-    """SMTP exception НЕ ловится внутри send_email — propagate up.
+    """Сбой отправки НЕ глотается внутри send_email — выходит к вызывающему.
 
     Это намеренно: caller (alerts dispatcher) сам решает что делать
-    с failed delivery (retry / drop).
+    с failed delivery (retry / drop). Выходит он как `EmailSendError` — с
+    классом исходной ошибки, но без её текста как есть: в нём бывает адрес
+    (tests/test_log_carries_no_address.py, слой 2).
     """
     monkeypatch.setenv("SMTP_HOST", "x")
     monkeypatch.setenv("SMTP_USER", "u")
@@ -318,5 +321,6 @@ def test_send_email_smtp_failure_propagates(monkeypatch):
             pass
 
     monkeypatch.setattr("smtplib.SMTP", BoomSMTP)
-    with pytest.raises(ConnectionRefusedError):
+    with pytest.raises(notifier.EmailSendError, match="ConnectionRefusedError: nope") as raised:
         notifier.send_email("S", "<p></p>")
+    assert raised.value.error_type == "ConnectionRefusedError"
