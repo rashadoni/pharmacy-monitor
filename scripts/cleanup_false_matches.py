@@ -21,6 +21,13 @@ CSV формат (с заголовком):
 Идемпотентность: повторный запуск с тем же CSV безопасен (rejection уже есть,
 detach сходит в no-op).
 
+`rejections_written` в итоговой строке — не число новых записей. Каждая строка
+CSV добавляет в него пары «её товар — участник кластера на момент этой строки»,
+по которым отказ в силе: созданные, включённые снова и уже существовавшие
+(такая запись подтверждается). Поэтому повтор строки в файле и повторный запуск
+могут посчитать уже записанные пары ещё раз, не добавив ни одной записи. Строки
+кластера, которого уже нет, идут в `skipped`.
+
 Usage:
     # Dry-run — печатает что будет сделано:
     python -m scripts.cleanup_false_matches data/false_matches.csv
@@ -81,7 +88,7 @@ def _parse_csv(path: Path) -> list[CleanupRow]:
 
 
 def cleanup(csv_path: Path, apply: bool = False) -> int:
-    """Apply cleanup. Returns number of rejection records written."""
+    """Apply cleanup. Returns `rejections_written` (confirmed pairs, see module docstring)."""
     rows = _parse_csv(csv_path)
     if not rows:
         print(f"CSV {csv_path} has 0 data rows. Nothing to do.")
@@ -119,11 +126,23 @@ def cleanup(csv_path: Path, apply: bool = False) -> int:
                 )
                 if apply:
                     # Создадим rejection с каждым из текущих участников кластера.
+                    # Список перечитываем из базы: сессия без expire_on_commit, и
+                    # в устаревшем списке числился бы товар, уже отвязанный в
+                    # этом запуске, — отказ записался бы и с ним (а с самим собой
+                    # — упал). break_match сбрасывает список сам; здесь строка не
+                    # полагается на то, кто менял кластер до неё.
+                    db.expire(match, ["products"])
+                    # Для пары из разных тенантов add_rejection записи не создаёт
+                    # и возвращает None — такую пару не считаем.
                     for other in match.products:
-                        match_actions.add_rejection(
+                        if match_actions.add_rejection(
                             db, r.detach_product_id, other.id, reason=r.reason or "bulk_cleanup"
-                        )
-                        rejections_written += 1
+                        ):
+                            rejections_written += 1
+                    # add_rejection делает только flush. Коммитим строку сразу, как
+                    # break_match коммитит обычную: без этого её отказы сохранялись,
+                    # лишь если после неё шла строка, дошедшая до break_match.
+                    db.commit()
                 continue
 
             cluster_before = len(match.products)
@@ -140,8 +159,10 @@ def cleanup(csv_path: Path, apply: bool = False) -> int:
                 reason=r.reason or "bulk_cleanup",
             )
             rejections_written += rej_count
-            cluster_after = sum(1 for p in match.products if p.id != r.detach_product_id)
-            if cluster_after < 2:
+            # Распущен ли кластер — по самому кластеру, а не по списку его
+            # участников: `match` после удаления — объект вне сессии, а его
+            # `products` — состав до отвязки.
+            if db.get(storage.Match, r.match_id) is None:
                 matches_dissolved += 1
 
     if not apply:

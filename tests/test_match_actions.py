@@ -114,6 +114,135 @@ def test_break_match_dissolves_cluster_if_only_one_left(db_session):
     assert db_session.get(Match, match_id) is None
 
 
+# --- break_match: несколько отвязок от одного кластера в одной сессии ---------
+#
+# `db_session` собрана как `storage.make_session`: без autoflush и без
+# expire_on_commit. Список участников кластера, прочитанный одной отвязкой,
+# остаётся в сессии и после commit — вместе с товаром, который она отвязала.
+
+
+def _stored_clusters(s) -> tuple[dict[int, int | None], set[int]]:
+    """Привязки товаров и живые кластеры — как они лежат в базе, а не в сессии."""
+    s.flush()
+    pairing = dict(s.execute(select(Product.id, Product.canonical_id)).all())
+    return pairing, set(s.scalars(select(Match.id)))
+
+
+def _stored_rejections(s) -> set[tuple[int, int]]:
+    s.flush()
+    return set(s.execute(select(MatchRejection.product_a_id, MatchRejection.product_b_id)).all())
+
+
+def _pair(a: Product, b: Product) -> tuple[int, int]:
+    return (a.id, b.id) if a.id < b.id else (b.id, a.id)
+
+
+def test_break_match_twice_in_one_session_dissolves_the_cluster(db_session):
+    """Из кластера трёх товаров отвязаны два: остался один — кластера нет.
+
+    Вторая отвязка считала первый товар оставшимся: писала с ним отказ ещё раз
+    и видела «двоих оставшихся» — кластер из одного товара жил дальше.
+    """
+    m, [x, y, z] = _make_match_cluster(
+        db_session, "Aspirin", ["pharmonline", "aptekonline", "aloe"]
+    )
+    match_id = m.id
+
+    assert ma.break_match(db_session, match_id, x.id) == 2
+    assert ma.break_match(db_session, match_id, y.id) == 1
+
+    assert _stored_clusters(db_session) == ({x.id: None, y.id: None, z.id: None}, set())
+    assert _stored_rejections(db_session) == {_pair(x, y), _pair(x, z), _pair(y, z)}
+
+
+def test_break_match_twice_in_one_session_keeps_a_cluster_of_two(db_session):
+    """Из четырёх отвязаны два: кластер жив, а отказ с уже отвязанным не считается."""
+    m, [x, y, z, w] = _make_match_cluster(
+        db_session, "Aspirin", ["pharmonline", "aptekonline", "aloe", "fourth"]
+    )
+
+    assert ma.break_match(db_session, m.id, x.id) == 3
+    assert ma.break_match(db_session, m.id, y.id) == 2
+
+    assert _stored_clusters(db_session) == (
+        {x.id: None, y.id: None, z.id: m.id, w.id: m.id},
+        {m.id},
+    )
+    assert _stored_rejections(db_session) == {
+        _pair(x, y),
+        _pair(x, z),
+        _pair(x, w),
+        _pair(y, z),
+        _pair(y, w),
+    }
+
+
+def test_break_match_leaves_the_current_members_in_the_session(db_session):
+    """После отвязки вызывающий видит в `match.products` тех, кто остался."""
+    m, [x, y, z] = _make_match_cluster(
+        db_session, "Aspirin", ["pharmonline", "aptekonline", "aloe"]
+    )
+
+    ma.break_match(db_session, m.id, x.id)
+
+    assert {p.id for p in m.products} == {y.id, z.id}
+
+
+def test_break_match_after_a_swap_in_the_same_session(db_session):
+    """Состав менялся в этой сессии другой операцией — отвязка видит итог.
+
+    Замена товара сайта список участников в сессии не обновляет: отказ
+    записался бы с заменённым товаром, которого в кластере уже нет, а с
+    пришедшим на его место — нет.
+    """
+    m, [x, y, z] = _make_match_cluster(
+        db_session, "Aspirin", ["pharmonline", "aptekonline", "aloe"]
+    )
+    z_new = _make_product(db_session, site="aloe", external_id="aloe-new", name="Aspirin")
+    db_session.commit()
+    assert ma.swap_alternative(db_session, m.id, "aloe", z_new.id) is True
+
+    assert ma.break_match(db_session, m.id, x.id) == 2
+
+    assert _stored_rejections(db_session) == {_pair(z, z_new), _pair(x, y), _pair(x, z_new)}
+    assert _stored_clusters(db_session) == (
+        {x.id: None, y.id: m.id, z.id: None, z_new.id: m.id},
+        {m.id},
+    )
+
+
+def test_break_match_sees_a_member_detached_without_flush(db_session):
+    """Состав читается из базы вместе с тем, что сессия ещё не записала."""
+    m, [x, y, z] = _make_match_cluster(
+        db_session, "Aspirin", ["pharmonline", "aptekonline", "aloe"]
+    )
+    match_id = m.id
+    x.canonical_id = None  # autoflush выключен: в базе x пока в кластере
+
+    assert ma.break_match(db_session, match_id, y.id) == 1
+
+    assert _stored_clusters(db_session) == ({x.id: None, y.id: None, z.id: None}, set())
+    assert _stored_rejections(db_session) == {_pair(y, z)}
+
+
+def test_break_match_counts_a_pair_that_was_rejected_before(db_session):
+    """Число — пары, по которым отказ теперь в силе, а не новые строки.
+
+    Отказ, существовавший до вызова, подтверждается (и включается снова, если
+    был снят) — и входит в счёт наравне с созданным.
+    """
+    m, [x, y, z] = _make_match_cluster(
+        db_session, "Aspirin", ["pharmonline", "aptekonline", "aloe"]
+    )
+    ma.add_rejection(db_session, x.id, y.id, reason="earlier").is_active = False
+    db_session.commit()
+
+    assert ma.break_match(db_session, m.id, x.id) == 2
+
+    assert _stored_rejections(db_session) == {_pair(x, y), _pair(x, z)}
+    assert ma.is_rejected(db_session, x.id, y.id) is True
+
+
 def test_find_alternatives_ranks_by_similarity(db_session):
     m, _ = _make_match_cluster(db_session, "Paracetamol 500mg", ["pharmonline", "aloe"])
     # Кандидаты на aptekonline (unmatched)
