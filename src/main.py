@@ -30,7 +30,14 @@ from sqlalchemy import desc, func, inspect, select, text
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import NO_VALUE
 
-load_dotenv(override=True)
+# Настройки процесс берёт из своего окружения. `.env` читается только из корня
+# этого чекаута и только для имён, которых в окружении нет: это удобство
+# локальной разработки, а не второй источник настроек. Раньше вызов был без пути
+# и с перекрытием окружения: python-dotenv искал `.env`, поднимаясь по каталогам
+# от этого файла (или от cwd), и найденное побеждало — на сервере файл рядом с
+# кодом был сильнее и /etc/pharmacy-monitor/env, и того, что подаёт workflow.
+# Правило и проверка сервера — docs/RUNBOOK.md «Откуда процесс берёт настройки».
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
 from src import pharmonline_identity_recovery as identity_recovery  # noqa: E402
