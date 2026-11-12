@@ -142,6 +142,11 @@ def test_registry_names_the_client_and_both_competitors():
         ("1,199.99 AZN", 1199.99),
         ("1.199,99", 1199.99),
         ("1,199", 1199.0),
+        ("1.199 AZN", 1199.0),
+        ("2.500", 2500.0),
+        ("1.199.000", 1199000.0),
+        ("949.99", 949.99),
+        ("949.5", 949.5),
         ("12,5", 12.5),
         (0, None),
         (-5, None),
@@ -860,6 +865,31 @@ async def test_kontakt_discovery_with_an_unread_section_is_an_error_not_a_shorte
     with pytest.raises(PageFetchError) as error:
         await scraper.discover_categories()
     assert "1 sections were not read" in error.value.reason
+
+
+async def test_kontakt_discovery_steps_over_a_dead_menu_link():
+    # Сайт сам отвечает 404: под мёртвой ссылкой ничего нет, каталог не короче.
+    scraper = fast(KontaktScraper)
+    menu = {
+        "root": {
+            "data": {
+                "categories": [
+                    {"url_path": "kohne-kampaniya", "is_category": True, "children": []},
+                    {"url_path": "tv", "is_category": True, "children": []},
+                ]
+            }
+        }
+    }
+
+    def site(request):
+        path = urlsplit(str(request.url)).path
+        if path == "/kohne-kampaniya.data":
+            return httpx.Response(404, text="yoxdur")
+        page = menu if path == "/_root.data" else kontakt_listing([kontakt_item()], 1)
+        return httpx.Response(200, text=turbo_encode(page))
+
+    serve(scraper, site)
+    assert await scraper.discover_categories() == ["tv"]
 
 
 @pytest.mark.parametrize(

@@ -308,6 +308,11 @@ class KontaktScraper(HttpCatalogScraper):
             try:
                 data = await self._route_data(path)
             except PageFetchError as exc:
+                if exc.status == 404:
+                    # Сайт сам ответил, что страницы нет: мёртвая ссылка в
+                    # меню. Под ней ничего нет, каталог от неё не короче.
+                    log.warning("kontakt_menu_link_is_dead", category=path)
+                    continue
                 log.warning("kontakt_category_probe_failed", category=path, error=exc.reason)
                 unread.append(path)
                 continue
