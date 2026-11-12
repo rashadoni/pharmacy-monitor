@@ -216,9 +216,18 @@ class KontaktScraper(HttpCatalogScraper):
                     result.abort_reason = "invalid_total"
                     return result
                 result.expected_items = total
-                # Число страниц считаем сами: сайт может назвать «1 страницу»
-                # и у пустой категории.
-                result.expected_pages = math.ceil(total / _PAGE_SIZE)
+                # Число страниц считаем сами, по размеру страницы, который
+                # назвал сайт: «1 страницу» он может назвать и у пустой
+                # категории.
+                declared_size = (listing.get("page_info") or {}).get("page_size")
+                page_size = (
+                    declared_size
+                    if isinstance(declared_size, int)
+                    and not isinstance(declared_size, bool)
+                    and declared_size > 0
+                    else _PAGE_SIZE
+                )
+                result.expected_pages = math.ceil(total / page_size)
             result.visited_pages = page
             if not items and page <= (result.expected_pages or 0):
                 result.abort_reason = "empty_page_before_last"
@@ -303,17 +312,24 @@ class KontaktScraper(HttpCatalogScraper):
                 unread.append(path)
                 continue
             children: list[str | None] = []
-            if data.get("type") == "CATEGORY" and isinstance(data.get("products"), dict):
+            page_type = data.get("type")
+            subcategories = (data.get("subcategoriesPage") or {}).get("subcategories")
+            if page_type == "CATEGORY" and isinstance(data.get("products"), dict):
                 listings.append(path)
                 nested = (data.get("category") or {}).get("children")
                 for child in nested if isinstance(nested, list) else []:
                     if isinstance(child, dict) and child.get("url_path"):
                         children.append(str(child["url_path"]).strip("/"))
-            else:
-                subcategories = (data.get("subcategoriesPage") or {}).get("subcategories")
-                for sub in subcategories if isinstance(subcategories, list) else []:
+            elif page_type == "SUBCATEGORY" and isinstance(subcategories, list):
+                for sub in subcategories:
                     if isinstance(sub, dict):
                         children.append(category_path_from_link(sub.get("categoryLink")))
+            else:
+                # Страница незнакомого вида: что под ней, неизвестно. Молча
+                # пропустить её — значит молча укоротить каталог.
+                log.warning("kontakt_category_page_not_understood", category=path, type=page_type)
+                unread.append(path)
+                continue
             queue.extend(child for child in children if child and child not in visited)
 
         if unread:

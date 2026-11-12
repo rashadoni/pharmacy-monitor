@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import ssl
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -106,9 +107,17 @@ def price_or_none(raw: object) -> float | None:
         return None
     if isinstance(raw, str):
         raw = raw.replace("\xa0", " ").replace("AZN", "").replace("₼", "")
-        raw = raw.replace(" ", "").replace(",", ".").strip()
+        raw = raw.replace(" ", "").strip()
         if not raw:
             return None
+        if "," in raw and "." in raw:
+            # Оба знака: дробный — тот, что правее («1,199.99» и «1.199,99»).
+            thousands = "," if raw.rfind(".") > raw.rfind(",") else "."
+            raw = raw.replace(thousands, "").replace(",", ".")
+        elif re.fullmatch(r"\d{1,3}(,\d{3})+", raw):
+            raw = raw.replace(",", "")  # «1,199» — разделитель тысяч
+        else:
+            raw = raw.replace(",", ".")
     try:
         value = float(raw)
     except (TypeError, ValueError):
@@ -275,7 +284,9 @@ class HttpCatalogScraper(BaseScraper):
             attempts = min(_env_int("DECODO_PAGE_ATTEMPTS", 10), max(len(order), self.max_retries))
         last_reason = "no attempt was made"
         last_status: int | None = None
-        blocked_status: int | None = None
+        refused_status: int | None = None
+        refused_exits: set[int | None] = set()
+        site_answered = False
         for attempt in range(attempts):
             port = None if direct else order[attempt % len(order)]
             if attempt:
@@ -306,18 +317,23 @@ class HttpCatalogScraper(BaseScraper):
             if protection or status == 403:
                 # 403 без знакомой страницы — тоже отказ в доступе (у
                 # Cloudflare их несколько видов): другой выход может пройти.
-                blocked_status = status
+                refused_status = status
+                refused_exits.add(port)
                 last_reason, last_status = "access refused", status
-                if direct:
+                if len(refused_exits) >= len(order):
+                    # Отказали все выходы (без прокси он один): тот же адрес
+                    # получит тот же отказ.
                     break
                 continue
             last_reason, last_status = f"HTTP {status}", status
             if status not in _TRANSIENT_STATUSES:
-                # Постоянный отказ сайта (404, 410…) от смены выхода не зависит.
+                # Постоянный ответ самого сайта (404, 410…): до сайта дошли, и
+                # от смены выхода он не зависит.
+                site_answered = True
                 break
-        if blocked_status is not None:
+        if refused_status is not None and not site_answered:
             raise CaptchaDetected(
-                f"{self.site_name}: access refused instead of content (HTTP {blocked_status})"
+                f"{self.site_name}: access refused instead of content (HTTP {refused_status})"
             )
         raise PageFetchError(last_reason, status=last_status)
 

@@ -9,10 +9,11 @@
 пропавшая из вёрстки ссылка иначе превращала бы каждый раздел в «полный» раздел
 из одной страницы.
 
-Чего проход не видит: товар, снятый с сайта посреди обхода, сдвигает список
-вверх, и один из следующих товаров может не попасть ни на одну страницу. Без
-числа товаров от сайта это не обнаружить; новый товар, наоборот, даёт повтор
-(он отбрасывается), но ничего не теряет.
+Сдвиг списка посреди обхода виден по карточке, пришедшей второй раз (товар
+переехал выше или добавился новый): такой проход неполон и повторяется. Не
+виден один случай: товар, снятый с сайта посреди обхода, сдвигает список вверх
+без повтора, и один из следующих товаров может не попасть ни на одну страницу.
+Без числа товаров от сайта этого не обнаружить.
 
 Товар узнаётся по номеру товара на сайте — он стоит в классе карточки
 (``product-108753_…``). Обычная цена — ``old-price``, действующая —
@@ -167,9 +168,11 @@ def build_products(
         old_match = _OLD_PRICE_RE.search(block_html)
         current = price_or_none(_text(new_match[1])) if new_match else None
         old = price_or_none(_text(old_match[1])) if old_match else None
-        if (new_match and current is None) or (old_match and old is None) or (old and not current):
-            # Цена написана, но не прочитана, или есть только зачёркнутая:
+        if old_match and current is None:
+            # Есть зачёркнутая цена, а действующей нет или она не прочиталась:
             # выдать зачёркнутую за действующую хуже, чем не выдать товар.
+            # Товар вовсе без цены («по запросу») отказом не считается — у
+            # него цена пуста, как и на других сайтах.
             failures += 1
             continue
         # У товара без скидки сайт пишет одну цену — в «new-price».
@@ -212,16 +215,20 @@ class IrshadScraper(HttpCatalogScraper):
     async def _collect_category(self, category_slug: str, limit: int | None) -> CategoryPass:
         result = CategoryPass()
         seen: set[str] = set()
+        seen_cards: set[str] = set()
         page = 1
         # Позвал ли сайт на эту страницу ссылкой «показать ещё» с предыдущей.
         announced = True
-        while page <= _MAX_PAGES:
+        # Страница-подтверждение за последней разрешённой запрашивается всё равно.
+        while page <= _MAX_PAGES or not announced:
             try:
                 page_html = await self._list_page(category_slug, page)
             except (PageFetchError, CaptchaDetected) as exc:
                 return self.page_failed(result, page, exc)
-            result.visited_pages = page
             cards = split_cards(page_html)
+            if cards or page == 1:
+                # Пустая страница-подтверждение страницей списка не считается.
+                result.visited_pages = page
             if not cards:
                 if page == 1:
                     # Раздела нет или вёрстка сменилась.
@@ -237,14 +244,20 @@ class IrshadScraper(HttpCatalogScraper):
                 # конца списка пропал из вёрстки, верить ему больше нельзя.
                 result.abort_reason = "load_more_marker_missing"
                 return result
+            if any(product_id in seen_cards for product_id, _ in cards):
+                # Карточка, которую уже видели: список сдвинулся между
+                # страницами (товар переехал выше или добавился новый), и
+                # какой-то другой товар мог не попасть ни на одну.
+                result.abort_reason = "listing_shifted_between_pages"
+                return result
+            seen_cards.update(product_id for product_id, _ in cards)
             for product_id, card_html in cards:
                 products, failures = build_products(product_id, card_html, category_slug)
                 result.raw_items += failures
                 result.item_failures += failures
                 for product in products:
                     if product.external_id in seen:
-                        # Тот же товар второй раз: цвет, у которого есть и своя
-                        # карточка, или список, сдвинувшийся на новый товар.
+                        # Цвет, у которого есть и своя карточка: тот же товар.
                         continue
                     seen.add(product.external_id)
                     result.raw_items += 1

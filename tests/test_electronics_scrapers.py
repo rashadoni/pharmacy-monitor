@@ -139,6 +139,10 @@ def test_registry_names_the_client_and_both_competitors():
         (949.99, 949.99),
         ("949.99 AZN", 949.99),
         ("1 199,50 ₼", 1199.5),
+        ("1,199.99 AZN", 1199.99),
+        ("1.199,99", 1199.99),
+        ("1,199", 1199.0),
+        ("12,5", 12.5),
         (0, None),
         (-5, None),
         ("", None),
@@ -301,6 +305,31 @@ async def test_a_refusal_on_one_exit_decides_even_if_the_last_exit_only_timed_ou
         await scraper.fetch("https://kontakt.az/a.data")
 
 
+async def test_an_answer_from_the_site_itself_outweighs_a_refusal_on_another_exit(monkeypatch):
+    _decodo(monkeypatch)
+    scraper = fast(KontaktScraper)
+
+    def by_exit(request):
+        if ":30001" in request.extensions["pm_proxy"]:
+            return httpx.Response(403, text=CLOUDFLARE_CHALLENGE)
+        return httpx.Response(404, text="yoxdur")
+
+    seen = serve(scraper, by_exit)
+    with pytest.raises(PageFetchError) as error:
+        await scraper.fetch("https://kontakt.az/a.data")
+    assert error.value.status == 404
+    assert len(seen) == 2
+
+
+async def test_a_single_exit_is_not_asked_again_after_a_refusal(monkeypatch):
+    _decodo(monkeypatch, ports="30001")
+    scraper = fast(KontaktScraper)
+    seen = serve(scraper, lambda _request: httpx.Response(403, text=CLOUDFLARE_CHALLENGE))
+    with pytest.raises(CaptchaDetected):
+        await scraper.fetch("https://kontakt.az/a.data")
+    assert len(seen) == 1
+
+
 async def test_a_single_exit_still_retries_a_transient_answer(monkeypatch):
     _decodo(monkeypatch, ports="30001")
     scraper = fast(KontaktScraper)
@@ -428,7 +457,7 @@ def kontakt_item(sku="TM-DG-TVA-1118-TV-1654", regular=6299.99, final=5049.99, i
     }
 
 
-def kontakt_listing(items, total, page=1, pages=1, children=()):
+def kontakt_listing(items, total, page=1, pages=1, children=(), size=16):
     return {
         "routes/$": {
             "data": {
@@ -440,7 +469,7 @@ def kontakt_listing(items, total, page=1, pages=1, children=()):
                 },
                 "products": {
                     "total_count": total,
-                    "page_info": {"current_page": page, "page_size": 16, "total_pages": pages},
+                    "page_info": {"current_page": page, "page_size": size, "total_pages": pages},
                     "items": items,
                 },
             }
@@ -643,6 +672,21 @@ async def test_kontakt_pass_the_run_would_reject_is_not_called_complete(
     assert len(seen) == KontaktScraper.category_attempts
 
 
+async def test_kontakt_page_count_follows_the_page_size_the_site_names():
+    scraper = fast(KontaktScraper)
+
+    def site(request):
+        page = int(parse_qs(urlsplit(str(request.url)).query).get("p", ["1"])[0])
+        skus = range(24) if page == 1 else range(24, 40)
+        items = [kontakt_item(sku=f"SKU-{n}") for n in skus]
+        return httpx.Response(200, text=turbo_encode(kontakt_listing(items, 40, page, 2, size=24)))
+
+    seen = serve(scraper, site)
+    products = await collect(scraper, "c")
+    assert len(products) == 40 and len(seen) == 2
+    assert scraper._route_statuses["c"].complete
+
+
 async def test_kontakt_empty_page_before_the_last_is_a_break():
     scraper = fast(KontaktScraper)
 
@@ -816,6 +860,42 @@ async def test_kontakt_discovery_with_an_unread_section_is_an_error_not_a_shorte
     with pytest.raises(PageFetchError) as error:
         await scraper.discover_categories()
     assert "1 sections were not read" in error.value.reason
+
+
+@pytest.mark.parametrize(
+    "odd_page",
+    [
+        # Список, чьи товары сайт отдал отложенным значением.
+        {"routes/$": {"data": {"type": "CATEGORY", "products": None}}},
+        # Витрина раздела без списка подразделов.
+        {"routes/$": {"data": {"type": "SUBCATEGORY", "subcategoriesPage": None}}},
+        # Страница вида, которого сборщик не знает.
+        {"routes/$": {"data": {"type": "LANDING"}}},
+    ],
+)
+async def test_kontakt_discovery_does_not_skip_a_page_it_does_not_understand(odd_page):
+    scraper = fast(KontaktScraper)
+    menu = {
+        "root": {
+            "data": {
+                "categories": [
+                    {"url_path": "qeribe", "is_category": True, "children": []},
+                    {"url_path": "tv", "is_category": True, "children": []},
+                ]
+            }
+        }
+    }
+
+    def site(request):
+        path = urlsplit(str(request.url)).path
+        page = {"/_root.data": menu, "/qeribe.data": odd_page}.get(
+            path, kontakt_listing([kontakt_item()], 1)
+        )
+        return httpx.Response(200, text=turbo_encode(page))
+
+    serve(scraper, site)
+    with pytest.raises(PageFetchError):
+        await scraper.discover_categories()
 
 
 # -- Baku Electronics -----------------------------------------------------------
@@ -1205,7 +1285,8 @@ async def test_irshad_category_follows_load_more_until_it_disappears():
     status = scraper._route_statuses["boyuk-meiset-texnikasi/iqlim/kondisioner"]
     assert status.complete and status.abort_reason is None
     assert status.expected_items is None
-    assert (status.visited_pages, status.raw_items, status.parsed_items) == (3, 8, 8)
+    # Пустая страница-подтверждение страницей списка не считается.
+    assert (status.visited_pages, status.raw_items, status.parsed_items) == (2, 8, 8)
     assert status.item_failures == 0 and status.pages_skipped == 0
 
 
@@ -1219,17 +1300,70 @@ def irshad_site(pages: dict[str, str]):
     return site
 
 
-async def test_irshad_product_seen_twice_is_kept_once_and_the_pass_stays_complete():
-    # Цвет, у которого есть и своя карточка, или список, сдвинувшийся на новый
-    # товар: повтор ничего не теряет и проход не портит.
+def irshad_renumbered(page_html: str, mapping: dict[str, str]) -> str:
+    """Та же вёрстка с другими номерами товаров (все замены разом)."""
+    patterns = ("product-{}_", 'data-selected-id="{}"', 'value="{}"')
+    for step, (old, _new) in enumerate(mapping.items()):
+        for kind, pattern in enumerate(patterns):
+            page_html = page_html.replace(pattern.format(old), f"\x00{step}:{kind}\x00")
+    for step, (_old, new) in enumerate(mapping.items()):
+        for kind, pattern in enumerate(patterns):
+            page_html = page_html.replace(f"\x00{step}:{kind}\x00", pattern.format(new))
+    return page_html
+
+
+async def test_irshad_card_seen_on_two_pages_means_the_listing_shifted():
+    # Товар переехал выше, пока шёл обход: его карточка пришла второй раз, а
+    # какой-то другой товар мог не попасть ни на одну страницу.
     scraper = fast(IrshadScraper)
     first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
-    serve(scraper, irshad_site({"1": first, "2": IRSHAD_LAST_PAGE}))
+    seen = serve(scraper, irshad_site({"1": first, "2": IRSHAD_LAST_PAGE}))
     products = await collect(scraper, "c")
     status = scraper._route_statuses["c"]
-    assert [p.external_id for p in products] == ["108753", "108751", "85759", "108719"]
+    assert len(products) == 4
+    assert not status.complete
+    assert status.abort_reason == "listing_shifted_between_pages"
+    assert len(seen) == 2 * IrshadScraper.category_attempts
+
+
+async def test_irshad_colour_that_also_has_its_own_card_is_kept_once():
+    # 108719 — цвет в карточке 85759 на первой странице и своя карточка на
+    # второй. Это один товар, а не сдвиг списка.
+    scraper = fast(IrshadScraper)
+    first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
+    second = irshad_renumbered(
+        IRSHAD_LAST_PAGE,
+        {"108753": "108719", "108751": "200002", "85759": "200003", "108719": "200004"},
+    )
+    serve(scraper, irshad_site({"1": first, "2": second}))
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert [p.external_id for p in products] == [
+        "108753",
+        "108751",
+        "85759",
+        "108719",
+        "200002",
+        "200003",
+        "200004",
+    ]
     assert status.complete
-    assert (status.raw_items, status.parsed_items) == (4, 4)
+    assert (status.raw_items, status.parsed_items) == (7, 7)
+
+
+async def test_irshad_page_limit_still_asks_for_the_confirmation_page(monkeypatch):
+    monkeypatch.setattr("src.scrapers.irshad._MAX_PAGES", 1)
+    scraper = fast(IrshadScraper)
+    seen = serve(scraper, irshad_site({"1": IRSHAD_LAST_PAGE}))
+    await collect(scraper, "c")
+    assert scraper._route_statuses["c"].complete
+    assert len(seen) == 2
+
+    longer = fast(IrshadScraper)
+    first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
+    serve(longer, irshad_site({"1": first, "2": IRSHAD_LAST_PAGE}))
+    await collect(longer, "c")
+    assert longer._route_statuses["c"].abort_reason == "page_limit_reached"
 
 
 async def test_irshad_end_of_list_is_not_believed_when_the_marker_vanished():
@@ -1267,20 +1401,35 @@ async def test_irshad_unreadable_offer_makes_the_pass_incomplete():
     assert (status.item_failures, status.raw_items, status.parsed_items) == (1, 4, 3)
 
 
-@pytest.mark.parametrize(
-    ("old", "new"),
-    [
-        # Действующая цена не прочиталась — зачёркнутую за неё выдавать нельзя.
-        ('<p class="new-price">', '<p class="new-price">1,199.99 AZN</p><p class="x">'),
-        # Зачёркнутая цена записана так, что не читается.
-        ('<span class="old-price">1199.99 AZN</span>', '<span class="old-price">min</span>'),
-    ],
-)
-def test_irshad_price_that_cannot_be_read_is_a_failure_not_a_guess(old, new):
+def test_irshad_unreadable_current_price_next_to_a_struck_out_one_is_a_failure():
+    # Действующая цена не прочиталась — зачёркнутую за неё выдавать нельзя.
     product_id, card = split_cards(IRSHAD_PAGE)[0]
-    assert old in card
-    products, failures = build_products(product_id, card.replace(old, new, 1), "c")
-    assert (products, failures) == ([], 1)
+    start = card.index('<p class="new-price">')
+    end = card.index("</p>", start)
+    unreadable = card[:start] + '<p class="new-price">sorğu ilə' + card[end:]
+    assert build_products(product_id, unreadable, "c") == ([], 1)
+
+
+def test_irshad_unreadable_struck_out_price_leaves_the_current_one():
+    product_id, card = split_cards(IRSHAD_PAGE)[0]
+    card = card.replace(
+        '<span class="old-price">1199.99 AZN</span>', '<span class="old-price">-</span>'
+    )
+    (product,), failures = build_products(product_id, card, "c")
+    assert failures == 0
+    assert (product.price, product.discount_price, product.is_on_sale) == (949.99, None, False)
+
+
+def test_irshad_offer_without_any_price_is_a_product_with_no_price():
+    # «Цена по запросу»: товар есть, цены нет — как на других сайтах.
+    product_id, card = split_cards(IRSHAD_PAGE)[0]
+    card = card.replace('<span class="old-price">1199.99 AZN</span>', "")
+    start = card.index('<p class="new-price">')
+    end = card.index("</p>", start)
+    card = card[:start] + '<p class="new-price">0 AZN' + card[end:]
+    (product,), failures = build_products(product_id, card, "c")
+    assert failures == 0
+    assert (product.price, product.discount_price, product.is_on_sale) == (None, None, False)
 
 
 def test_irshad_struck_out_price_alone_is_never_the_current_price():
