@@ -622,6 +622,54 @@ def health_alert_state_after(
     }
 
 
+_SEVERITY_RANK = {"ok": 0, "warning": 1, "critical": 2}
+
+
+def alert_mail_view(report: HealthReport, min_severity: Severity) -> HealthReport:
+    """Отчёт для письма: только проблемы не ниже `min_severity`.
+
+    Решение владельца 2026-11-03: письмом приходят только критические поломки,
+    предупреждения видны в `health-check`, на дашборде и в `/status`. Статус
+    пересчитывается по оставшимся проблемам, поэтому машина состояний письма
+    (`health_alert_decision`) видит предупреждение как «всё в порядке»: оно не
+    открывает инцидент и не меняет подпись критического.
+    """
+    floor = _SEVERITY_RANK[min_severity]
+    issues = [i for i in report.issues if _SEVERITY_RANK.get(i.severity, 0) >= floor]
+    status: Severity = max(
+        (i.severity for i in issues), key=lambda sev: _SEVERITY_RANK[sev], default="ok"
+    )
+    return HealthReport(
+        status=status,
+        issues=issues,
+        last_run_id=report.last_run_id,
+        last_run_at=report.last_run_at,
+        last_run_status=report.last_run_status,
+    )
+
+
+def alert_state_was_mailable(last_state: dict | None, min_severity: Severity) -> bool:
+    """Был ли в активном инциденте из состояния хоть один пункт не ниже порога.
+
+    Нужно, чтобы смена порога не прислала ложное «RECOVERED»: инцидент из одних
+    предупреждений, открытый прежним порогом, закрывается молча. Подпись, которую
+    не разобрать (v1 `code:site`, чужой формат), считается достойной письма —
+    лишнее «восстановлено» лучше потерянного.
+    """
+    signature = last_state.get("signature") if isinstance(last_state, dict) else None
+    try:
+        items = json.loads(signature)
+    except (TypeError, ValueError):
+        return True
+    if not isinstance(items, list) or not items:
+        return True
+    floor = _SEVERITY_RANK[min_severity]
+    severities = [item.get("severity") if isinstance(item, dict) else None for item in items]
+    if any(sev not in _SEVERITY_RANK for sev in severities):
+        return True
+    return any(_SEVERITY_RANK[sev] >= floor for sev in severities)
+
+
 def alert_due(
     signature: str,
     last_state: dict | None,
@@ -1181,8 +1229,8 @@ def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthI
     return issues
 
 
-def render_alert_html(report: HealthReport) -> str:
-    """Простое HTML-письмо для алерта."""
+def render_alert_html(report: HealthReport, *, note: str | None = None) -> str:
+    """Простое HTML-письмо для алерта. `note` — строка под шапкой."""
     color = {"ok": "#34c759", "warning": "#ff9500", "critical": "#ff3b30"}[report.status]
     title = {"ok": "✓ OK", "warning": "⚠️ Внимание", "critical": "🔴 Проблема"}[report.status]
 
@@ -1210,6 +1258,7 @@ def render_alert_html(report: HealthReport) -> str:
           Last run: #{report.last_run_id or "—"} ({report.last_run_status or "—"}) at
           {report.last_run_at.strftime("%Y-%m-%d %H:%M UTC") if report.last_run_at else "—"}
         </div>
+        {f'<div style="font-size:13px;color:#1d1d1f;margin-top:10px;">{note}</div>' if note else ""}
       </div>
       <table style="width:100%;border-collapse:collapse;font-size:13px;">
         {"".join(rows) if rows else '<tr><td style="padding:16px;color:#34c759;">All checks pass.</td></tr>'}

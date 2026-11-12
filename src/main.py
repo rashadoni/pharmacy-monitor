@@ -5208,9 +5208,18 @@ def _dispatch_health_alert_email(
     alert_state_file: str,
     reminder_hours: float,
     now=None,
+    min_severity: str = "critical",
 ) -> str | None:
-    """Send one state-machine transition email and persist it after success."""
+    """Send one state-machine transition email and persist it after success.
+
+    Письмо видит только проблемы не ниже `min_severity` (`alert_mail_view`);
+    по умолчанию — только критические (решение владельца 2026-11-03).
+    """
     from src.health import (
+        HealthReport,
+        alert_mail_view,
+        alert_signature,
+        alert_state_was_mailable,
         health_alert_decision,
         health_alert_state_after,
         render_alert_html,
@@ -5218,6 +5227,8 @@ def _dispatch_health_alert_email(
 
     transition_at = now or utcnow()
     last_state = _read_health_alert_state(alert_state_file)
+    full_report = report
+    report = alert_mail_view(full_report, min_severity)
     decision = health_alert_decision(
         report,
         last_state,
@@ -5226,13 +5237,59 @@ def _dispatch_health_alert_email(
     )
     if decision.action is None:
         return None
+    if (
+        decision.action == "incident"
+        and isinstance(last_state, dict)
+        and last_state.get("version") == 2
+        and last_state.get("status") == "active"
+        and last_state.get("signature") == alert_signature(full_report)
+    ):
+        # Тот же инцидент, только его подпись записал прежний порог (вместе с
+        # предупреждениями). Переписать подпись, не отправляя письма: иначе
+        # первая проверка после смены порога повторила бы письмо о том же.
+        _write_health_alert_state(
+            alert_state_file, {**last_state, "signature": decision.signature}
+        )
+        return None
+    if decision.action == "recovery" and not alert_state_was_mailable(last_state, min_severity):
+        # Инцидент из одних предупреждений открыл прежний порог: о нём больше не
+        # пишем, значит и «восстановлено» слать не о чем. Состояние закрывается
+        # молча; last_sent_at — время последнего настоящего письма.
+        _write_health_alert_state(
+            alert_state_file,
+            {
+                "version": 2,
+                "status": "ok",
+                "signature": None,
+                "recovered_signature": decision.previous_signature,
+                "recovered_at": transition_at.isoformat(),
+                "last_sent_at": last_state.get("last_sent_at") or transition_at.isoformat(),
+            },
+        )
+        return None
 
     subject = (
         "Pharmacy Monitor — RECOVERED"
         if decision.action == "recovery"
         else f"Pharmacy Monitor — {report.status.upper()}"
     )
-    delivered = notifier.send_email(subject=subject, html_body=render_alert_html(report))
+    html_body = render_alert_html(report)
+    left_out = [i for i in full_report.issues if i not in report.issues]
+    if decision.action == "recovery" and left_out:
+        # Критического больше нет, а предупреждения остались: «All checks pass»
+        # было бы неправдой — письмо их называет.
+        html_body = render_alert_html(
+            HealthReport(
+                status="ok",
+                issues=left_out,
+                last_run_id=report.last_run_id,
+                last_run_at=report.last_run_at,
+                last_run_status=report.last_run_status,
+            ),
+            note="Критических проблем больше нет. Остались предупреждения — "
+            "письмом о них не пишем:",
+        )
+    delivered = notifier.send_email(subject=subject, html_body=html_body)
     if delivered is not True:
         raise RuntimeError("health email was not delivered: SMTP is not configured")
     next_state = health_alert_state_after(decision, last_state, now=transition_at)
@@ -5258,7 +5315,16 @@ def _dispatch_health_alert_email(
 @click.option(
     "--alert-email",
     is_flag=True,
-    help="Отправить email-алерт получателям при warning/critical",
+    help="Отправить email-алерт получателям (с какой важности — --alert-min-severity)",
+)
+@click.option(
+    "--alert-min-severity",
+    type=click.Choice(["warning", "critical"]),
+    default="critical",
+    show_default=True,
+    help="С какой важности проблема идёт письмом. Предупреждения по умолчанию "
+    "письмом не идут (решение владельца 2026-11-03): они видны в выводе команды, "
+    "на дашборде и в /status",
 )
 @click.option(
     "--quiet-on-ok",
@@ -5281,6 +5347,7 @@ def health_check_cmd(
     max_age_hours: int,
     min_products: int,
     alert_email: bool,
+    alert_min_severity: str,
     quiet_on_ok: bool,
     alert_cooldown_hours: float,
     alert_state_file: str,
@@ -5312,6 +5379,7 @@ def health_check_cmd(
                 report,
                 alert_state_file=alert_state_file,
                 reminder_hours=alert_cooldown_hours,
+                min_severity=alert_min_severity,
             )
             if not quiet_healthy:
                 if action == "incident":
@@ -5320,6 +5388,12 @@ def health_check_cmd(
                     click.echo("→ Email-напоминание отправлено")
                 elif action == "recovery":
                     click.echo("→ Email о восстановлении отправлен")
+                elif (
+                    report.status != "ok"
+                    and alert_min_severity == "critical"
+                    and not any(i.severity == "critical" for i in report.issues)
+                ):
+                    click.echo("→ Email не отправляется: письмом идут только критические проблемы")
                 elif report.status != "ok":
                     click.echo(
                         f"→ Email подавлен (напоминание раз в {alert_cooldown_hours}ч — "
