@@ -178,6 +178,21 @@ When confirming a UI change via screenshot (browser MCP, computer-use, screensho
 ### Local secrets backup (NOT in git)
 `data/.prod-secrets-DO-NOT-COMMIT` — has PG_PASS, JWT_SECRET, API_KEY (mode 0600)
 
+## Профиль «электроника» (с 2026-11-12) — `docs/ELECTRONICS.md`
+
+Второй клиент того же продукта: Kontakt Home (клиент), Irshad и Baku Electronics
+(конкуренты). Решение владельца: не тенант в аптечной базе, а отдельный экземпляр
+того же кода со своей базой и входом; набор сайтов экземпляра задаёт профиль,
+по умолчанию — аптеки. На 2026-11-12 сделан первый шаг из пяти: три сборщика без
+браузера (`src/scrapers/kontakt.py`, `irshad.py`, `bakuelectronics.py`, общая
+основа — `http_catalog.py`) и проба с живого сайта
+(`python -m src.scrapers.electronics`). В общий прогон они не включены
+(`SCRAPER_CLASSES` о них не знает) и в базу не пишут — аптечный прод этой
+правкой не затронут. Irshad исполнен против живого сайта; Kontakt Home и Baku
+Electronics с сервера открываются только через прокси и против живого сайта не
+исполнялись. Что проверено, что нет и что дальше — в `docs/ELECTRONICS.md`;
+смотреть код и тот файл, а не эту строку.
+
 ## Active work-in-progress
 
 **⚠️ POLICY (client, 2026-07-13): страна происхождения — часть identity ДЛЯ ВСЕГО, включая trade-name.** Разная страна = РАЗНЫЙ товар (X-Brain Türkiyə ≠ X-Brain Azərbaycan). Это **отменяет** прежнее исключение 2026-05-31 «trade-name препараты НЕ затронуты» — оно больше не действует, не восстанавливать. Enforced: `matcher._has_conflicting_country` напрямую в `_hard_conflict` + `_pairwise_spec_conflict`, **без** commodity-гейта.
