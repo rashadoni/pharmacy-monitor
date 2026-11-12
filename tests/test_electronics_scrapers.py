@@ -261,6 +261,87 @@ async def test_a_blocked_exit_is_replaced_and_the_working_one_is_kept(monkeypatc
     assert exits == ["30001", "30002", "30002"]
 
 
+async def test_a_503_challenge_is_protection_not_a_server_fault():
+    scraper = fast(KontaktScraper)
+    serve(scraper, lambda _request: httpx.Response(503, text=CLOUDFLARE_CHALLENGE))
+    with pytest.raises(CaptchaDetected):
+        await scraper.fetch("https://kontakt.az/x.data")
+
+
+async def test_a_refusal_without_proxy_is_not_asked_again():
+    # Тот же адрес получит тот же отказ: шесть запросов на раздел ни к чему.
+    scraper = fast(IrshadScraper)
+    seen = serve(scraper, lambda _request: httpx.Response(403, text=CLOUDFLARE_BLOCK))
+    with pytest.raises(CaptchaDetected):
+        await scraper.fetch("https://irshad.az/az")
+    assert len(seen) == 1
+
+
+async def test_a_bare_403_through_proxy_tries_other_exits_and_is_called_a_refusal(monkeypatch):
+    _decodo(monkeypatch)
+    scraper = fast(KontaktScraper)
+    seen = serve(scraper, lambda _request: httpx.Response(403, text="error code: 1020"))
+    with pytest.raises(CaptchaDetected):
+        await scraper.fetch("https://kontakt.az/a.data")
+    exits = [request.extensions["pm_proxy"].rsplit(":", 1)[1] for request in seen]
+    assert exits == ["30001", "30002", "30003"]
+
+
+async def test_a_refusal_on_one_exit_decides_even_if_the_last_exit_only_timed_out(monkeypatch):
+    _decodo(monkeypatch)
+    scraper = fast(KontaktScraper)
+
+    def by_exit(request):
+        if ":30003" in request.extensions["pm_proxy"]:
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(403, text=CLOUDFLARE_CHALLENGE)
+
+    serve(scraper, by_exit)
+    with pytest.raises(CaptchaDetected):
+        await scraper.fetch("https://kontakt.az/a.data")
+
+
+async def test_a_single_exit_still_retries_a_transient_answer(monkeypatch):
+    _decodo(monkeypatch, ports="30001")
+    scraper = fast(KontaktScraper)
+    answers = iter([httpx.Response(502), httpx.Response(200, text="ok")])
+    seen = serve(scraper, lambda _request: next(answers))
+    assert (await scraper.fetch("https://kontakt.az/a.data")).text == "ok"
+    assert len(seen) == 2
+
+
+async def test_the_next_category_pass_starts_from_an_exit_not_used_yet(monkeypatch):
+    _decodo(monkeypatch)
+    scraper = fast(KontaktScraper)
+
+    def by_exit(request):
+        if ":30001" in request.extensions["pm_proxy"]:
+            return httpx.Response(403, text=CLOUDFLARE_CHALLENGE)
+        return httpx.Response(200, text="ok")
+
+    seen = serve(scraper, by_exit)
+    await scraper.fetch("https://kontakt.az/a.data")  # 30001 закрыт, перешли на 30002
+    scraper._rotate_session()
+    await scraper.fetch("https://kontakt.az/b.data")
+    exits = [request.extensions["pm_proxy"].rsplit(":", 1)[1] for request in seen]
+    assert exits == ["30001", "30002", "30003"]
+
+
+async def test_a_proxy_that_refuses_the_tunnel_stops_the_site(monkeypatch):
+    # Так отказ выглядит на деле: прокси отвечает 407 на CONNECT, и до сайта
+    # запрос не доходит — httpx бросает ProxyError.
+    _decodo(monkeypatch)
+    scraper = fast(KontaktScraper)
+
+    def refused(request):
+        raise httpx.ProxyError("407 Proxy Authentication Required", request=request)
+
+    seen = serve(scraper, refused)
+    with pytest.raises(SiteScrapeFatalError):
+        await scraper.fetch("https://kontakt.az/a.data")
+    assert len(seen) == 1
+
+
 @pytest.mark.parametrize("status", [402, 407])
 async def test_a_rejected_proxy_account_stops_the_site(monkeypatch, status):
     _decodo(monkeypatch)
@@ -271,17 +352,22 @@ async def test_a_rejected_proxy_account_stops_the_site(monkeypatch, status):
     assert len(seen) == 1
 
 
-async def test_the_proxy_password_never_reaches_an_error_message(monkeypatch):
+@pytest.mark.parametrize("error_class", [httpx.ProxyError, httpx.ConnectError])
+async def test_the_proxy_password_never_reaches_an_error_message(monkeypatch, error_class):
     _decodo(monkeypatch)
     scraper = fast(KontaktScraper)
 
     def broken(request):
-        raise httpx.ConnectError("refused", request=request)
+        # Как у настоящих ошибок прокси: адрес с паролем стоит в самом тексте.
+        proxy_url = request.extensions["pm_proxy"]
+        assert "p%3Dss" in proxy_url
+        raise error_class(f"cannot reach {proxy_url}", request=request)
 
     serve(scraper, broken)
     with pytest.raises(PageFetchError) as error:
         await scraper.fetch("https://kontakt.az/a.data")
-    assert "p=ss" not in str(error.value) and "p%3Dss" not in str(error.value)
+    for text in (str(error.value), error.value.reason, repr(error.value.args)):
+        assert "p=ss" not in text and "p%3Dss" not in text and "decodo" not in text
 
 
 # -- Kontakt Home ---------------------------------------------------------------
@@ -342,12 +428,16 @@ def kontakt_item(sku="TM-DG-TVA-1118-TV-1654", regular=6299.99, final=5049.99, i
     }
 
 
-def kontakt_listing(items, total, page=1, pages=1):
+def kontakt_listing(items, total, page=1, pages=1, children=()):
     return {
         "routes/$": {
             "data": {
                 "type": "CATEGORY",
-                "category": {"id": 8649, "name": "Televizorlar"},
+                "category": {
+                    "id": 8649,
+                    "name": "Televizorlar",
+                    "children": [{"url_path": child} for child in children],
+                },
                 "products": {
                     "total_count": total,
                     "page_info": {"current_page": page, "page_size": 16, "total_pages": pages},
@@ -518,11 +608,90 @@ async def test_kontakt_explicitly_empty_category_counts_as_verified():
     scraper = fast(KontaktScraper)
     serve(
         scraper,
-        lambda _request: httpx.Response(200, text=turbo_encode(kontakt_listing([], 0, 1, 0))),
+        # Сайт может назвать «1 страницу» и у пустой категории.
+        lambda _request: httpx.Response(200, text=turbo_encode(kontakt_listing([], 0, 1, 1))),
     )
     result = await scraper.scrape(["bos"])
     assert result.item_results["bos"] == {"status": "ok", "products": 0, "verified_empty": True}
     assert result.route_statuses["bos"].complete
+
+
+@pytest.mark.parametrize(
+    ("skus", "total", "reason", "counts"),
+    [
+        # Повтор товара: записей больше, чем назвал сайт.
+        (["A", "A", "B"], 2, "item_count_mismatch", (3, 2, 0)),
+        # Запись без артикула: товаров меньше, чем записей.
+        (["A", ""], 2, "item_parse_failures", (2, 1, 1)),
+    ],
+)
+async def test_kontakt_pass_the_run_would_reject_is_not_called_complete(
+    skus, total, reason, counts
+):
+    scraper = fast(KontaktScraper)
+    items = [kontakt_item(sku=sku) for sku in skus]
+    seen = serve(
+        scraper,
+        lambda _request: httpx.Response(200, text=turbo_encode(kontakt_listing(items, total))),
+    )
+    await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert not status.complete
+    assert status.abort_reason == reason
+    assert (status.raw_items, status.parsed_items, status.item_failures) == counts
+    # Неполный проход повторён, а не отдан с первого раза.
+    assert len(seen) == KontaktScraper.category_attempts
+
+
+async def test_kontakt_empty_page_before_the_last_is_a_break():
+    scraper = fast(KontaktScraper)
+
+    def site(request):
+        page = int(parse_qs(urlsplit(str(request.url)).query).get("p", ["1"])[0])
+        items = [kontakt_item(sku=f"SKU-{n}") for n in range(16)] if page == 1 else []
+        return httpx.Response(200, text=turbo_encode(kontakt_listing(items, 20, page, 2)))
+
+    serve(scraper, site)
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert len(products) == 16
+    assert not status.complete and status.abort_reason == "empty_page_before_last"
+
+
+async def test_kontakt_protection_midway_keeps_the_pages_already_read():
+    scraper = fast(KontaktScraper)
+
+    def site(request):
+        if "p=2" in str(request.url):
+            return httpx.Response(403, text=CLOUDFLARE_CHALLENGE)
+        items = [kontakt_item(sku=f"SKU-{n}") for n in range(16)]
+        return httpx.Response(200, text=turbo_encode(kontakt_listing(items, 20, 1, 2)))
+
+    serve(scraper, site)
+    result = await scraper.scrape(["c"])
+    assert len(result.products) == 16
+    status = result.route_statuses["c"]
+    assert not status.complete and status.abort_reason == "page_2_refused"
+
+
+async def test_the_better_of_two_incomplete_passes_is_the_one_given_out():
+    scraper = fast(KontaktScraper)
+    passes = {"n": 0}
+
+    def site(request):
+        page = int(parse_qs(urlsplit(str(request.url)).query).get("p", ["1"])[0])
+        if page == 1:
+            passes["n"] += 1
+        if passes["n"] == 1 and page == 1:
+            items = [kontakt_item(sku=f"FIRST-{n}") for n in range(16)]
+            return httpx.Response(200, text=turbo_encode(kontakt_listing(items, 20, 1, 2)))
+        # Вторая страница первого прохода и весь второй проход не отвечают.
+        return httpx.Response(404)
+
+    serve(scraper, site)
+    products = await collect(scraper, "c")
+    assert [p.external_id for p in products] == [f"FIRST-{n}" for n in range(16)]
+    assert scraper._route_statuses["c"].abort_reason.startswith("page_2_failed")
 
 
 async def test_kontakt_page_failure_marks_the_route_and_keeps_what_was_read():
@@ -600,7 +769,9 @@ async def test_kontakt_discovers_listings_by_walking_down_from_the_menu():
             ["https://kontakt.az/telefoniya/aksesuarlar/cexollar"]
         ),
         "/telefoniya/aksesuarlar/cexollar.data": kontakt_listing([], 0, 1, 0),
-        "/gaming.data": kontakt_listing([kontakt_item()], 1),
+        # Категория-список со вложенной категорией: вложенная тоже в обходе.
+        "/gaming.data": kontakt_listing([kontakt_item()], 1, children=["gaming/konsollar"]),
+        "/gaming/konsollar.data": kontakt_listing([kontakt_item()], 1),
     }
 
     def site(request):
@@ -614,9 +785,37 @@ async def test_kontakt_discovers_listings_by_walking_down_from_the_menu():
     assert await scraper.discover_categories() == [
         "gaming",
         "telefoniya/smartfonlar",
+        "gaming/konsollar",
         "telefoniya/aksesuarlar/cexollar",
     ]
     assert not any("brand" in str(request.url) for request in seen)
+
+
+async def test_kontakt_discovery_with_an_unread_section_is_an_error_not_a_shorter_list():
+    scraper = fast(KontaktScraper)
+    menu = {
+        "root": {
+            "data": {
+                "categories": [
+                    {"url_path": "telefoniya", "is_category": True, "children": []},
+                    {"url_path": "tv", "is_category": True, "children": []},
+                ]
+            }
+        }
+    }
+
+    def site(request):
+        path = urlsplit(str(request.url)).path
+        if path == "/_root.data":
+            return httpx.Response(200, text=turbo_encode(menu))
+        if path == "/tv.data":
+            return httpx.Response(200, text=turbo_encode(kontakt_listing([kontakt_item()], 1)))
+        return httpx.Response(502)
+
+    serve(scraper, site)
+    with pytest.raises(PageFetchError) as error:
+        await scraper.discover_categories()
+    assert "1 sections were not read" in error.value.reason
 
 
 # -- Baku Electronics -----------------------------------------------------------
@@ -797,6 +996,82 @@ async def test_bakuelectronics_discovery_replaces_a_broken_section_with_its_chil
     ]
 
 
+@pytest.mark.parametrize(
+    ("codes", "total", "reason", "counts"),
+    [
+        ([1, 1, 2], 2, "item_count_mismatch", (3, 2, 0)),
+        ([1, None], 2, "item_parse_failures", (2, 1, 1)),
+        ([1], 3, "item_count_mismatch", (1, 1, 0)),
+    ],
+)
+async def test_bakuelectronics_pass_the_run_would_reject_is_not_called_complete(
+    codes, total, reason, counts
+):
+    scraper = fast(BakuElectronicsScraper)
+
+    def site(request):
+        if urlsplit(str(request.url)).path == "/":
+            return httpx.Response(200, text=be_home())
+        return httpx.Response(200, json=be_page([be_item(code=c) for c in codes], total))
+
+    serve(scraper, site)
+    await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert not status.complete
+    assert status.abort_reason == reason
+    assert (status.raw_items, status.parsed_items, status.item_failures) == counts
+
+
+async def test_bakuelectronics_empty_page_before_the_last_is_a_break():
+    scraper = fast(BakuElectronicsScraper)
+
+    def site(request):
+        url = urlsplit(str(request.url))
+        if url.path == "/":
+            return httpx.Response(200, text=be_home())
+        page = int(parse_qs(url.query).get("page", ["1"])[0])
+        items = [be_item(code=c) for c in range(18)] if page == 1 else []
+        return httpx.Response(200, json=be_page(items, 25, page))
+
+    serve(scraper, site)
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert len(products) == 18
+    assert not status.complete and status.abort_reason == "empty_page_before_last"
+
+
+async def test_bakuelectronics_limit_stops_early_and_says_so():
+    scraper = fast(BakuElectronicsScraper)
+
+    def site(request):
+        if urlsplit(str(request.url)).path == "/":
+            return httpx.Response(200, text=be_home())
+        return httpx.Response(200, json=be_page([be_item(code=c) for c in range(18)], 180))
+
+    seen = serve(scraper, site)
+    products = await collect(scraper, "c", limit=5)
+    assert len(products) == 5
+    assert len(seen) == 2  # главная и одна страница списка
+    assert scraper._route_statuses["c"].abort_reason == "requested_limit_reached"
+
+
+async def test_bakuelectronics_discovery_fails_when_a_section_cannot_be_replaced():
+    scraper = fast(BakuElectronicsScraper)
+
+    def site(request):
+        path = urlsplit(str(request.url)).path
+        if path == "/":
+            return httpx.Response(200, text=be_home(links=["tv-audio-video", "qizdiricilar"]))
+        if path.endswith("/qizdiricilar.json"):
+            return httpx.Response(502)
+        return httpx.Response(200, json=be_page([be_item()], 1))
+
+    serve(scraper, site)
+    with pytest.raises(PageFetchError) as error:
+        await scraper.discover_categories()
+    assert "qizdiricilar" in error.value.reason
+
+
 async def test_bakuelectronics_block_page_is_a_blocked_category():
     scraper = fast(BakuElectronicsScraper)
     serve(scraper, lambda _request: httpx.Response(403, text=CLOUDFLARE_BLOCK))
@@ -911,7 +1186,7 @@ async def test_irshad_category_follows_load_more_until_it_disappears():
         assert url.path == "/az/list-products/boyuk-meiset-texnikasi/iqlim/kondisioner"
         assert request.headers["X-Requested-With"] == "XMLHttpRequest"
         page = parse_qs(url.query)["page"][0]
-        return httpx.Response(200, text=first if page == "1" else second)
+        return httpx.Response(200, text={"1": first, "2": second}.get(page, IRSHAD_PAST_THE_END))
 
     seen = serve(scraper, site)
     products = await collect(scraper, "boyuk-meiset-texnikasi/iqlim/kondisioner")
@@ -925,27 +1200,112 @@ async def test_irshad_category_follows_load_more_until_it_disappears():
         "200003",
         "200004",
     ]
-    assert len(seen) == 2
+    # Третий запрос — страница за концом списка: конец подтверждён, а не принят на веру.
+    assert [parse_qs(urlsplit(str(r.url)).query)["page"][0] for r in seen] == ["1", "2", "3"]
     status = scraper._route_statuses["boyuk-meiset-texnikasi/iqlim/kondisioner"]
     assert status.complete and status.abort_reason is None
     assert status.expected_items is None
-    assert (status.visited_pages, status.raw_items, status.parsed_items) == (2, 8, 8)
+    assert (status.visited_pages, status.raw_items, status.parsed_items) == (3, 8, 8)
+    assert status.item_failures == 0 and status.pages_skipped == 0
 
 
-async def test_irshad_same_product_on_two_pages_means_the_listing_shifted():
+def irshad_site(pages: dict[str, str]):
+    """Сайт Irshad из страниц по номерам; за последней — пустая."""
+
+    def site(request):
+        page = parse_qs(urlsplit(str(request.url)).query)["page"][0]
+        return httpx.Response(200, text=pages.get(page, IRSHAD_PAST_THE_END))
+
+    return site
+
+
+async def test_irshad_product_seen_twice_is_kept_once_and_the_pass_stays_complete():
+    # Цвет, у которого есть и своя карточка, или список, сдвинувшийся на новый
+    # товар: повтор ничего не теряет и проход не портит.
     scraper = fast(IrshadScraper)
     first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
-    serve(
-        scraper,
-        lambda request: httpx.Response(
-            200, text=first if "page=1" in str(request.url) else IRSHAD_LAST_PAGE
-        ),
-    )
+    serve(scraper, irshad_site({"1": first, "2": IRSHAD_LAST_PAGE}))
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert [p.external_id for p in products] == ["108753", "108751", "85759", "108719"]
+    assert status.complete
+    assert (status.raw_items, status.parsed_items) == (4, 4)
+
+
+async def test_irshad_end_of_list_is_not_believed_when_the_marker_vanished():
+    # Вёрстка без ссылки «показать ещё», а товары на следующей странице есть:
+    # раньше такой раздел считался полным разделом из одной страницы.
+    scraper = fast(IrshadScraper)
+    seen = serve(scraper, irshad_site({"1": IRSHAD_LAST_PAGE, "2": IRSHAD_LAST_PAGE}))
     products = await collect(scraper, "c")
     status = scraper._route_statuses["c"]
     assert len(products) == 4
     assert not status.complete
-    assert status.abort_reason == "listing_shifted_between_pages"
+    assert status.abort_reason == "load_more_marker_missing"
+    assert len(seen) == 2 * IrshadScraper.category_attempts
+
+
+async def test_irshad_empty_page_the_site_itself_pointed_to_is_a_break():
+    scraper = fast(IrshadScraper)
+    first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
+    serve(scraper, irshad_site({"1": first}))
+    await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert not status.complete
+    assert status.abort_reason == "empty_page_before_last"
+
+
+async def test_irshad_unreadable_offer_makes_the_pass_incomplete():
+    scraper = fast(IrshadScraper)
+    broken = IRSHAD_LAST_PAGE.replace('value="108719"', 'value=""')
+    serve(scraper, irshad_site({"1": broken}))
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert [p.external_id for p in products] == ["108753", "108751", "85759"]
+    assert not status.complete
+    assert status.abort_reason == "item_parse_failures"
+    assert (status.item_failures, status.raw_items, status.parsed_items) == (1, 4, 3)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        # Действующая цена не прочиталась — зачёркнутую за неё выдавать нельзя.
+        ('<p class="new-price">', '<p class="new-price">1,199.99 AZN</p><p class="x">'),
+        # Зачёркнутая цена записана так, что не читается.
+        ('<span class="old-price">1199.99 AZN</span>', '<span class="old-price">min</span>'),
+    ],
+)
+def test_irshad_price_that_cannot_be_read_is_a_failure_not_a_guess(old, new):
+    product_id, card = split_cards(IRSHAD_PAGE)[0]
+    assert old in card
+    products, failures = build_products(product_id, card.replace(old, new, 1), "c")
+    assert (products, failures) == ([], 1)
+
+
+def test_irshad_struck_out_price_alone_is_never_the_current_price():
+    product_id, card = split_cards(IRSHAD_PAGE)[0]
+    start = card.index('<p class="new-price">')
+    without_current = card[:start] + card[card.index("</p>", start) + 4 :]
+    assert 'class="old-price"' in without_current
+    assert build_products(product_id, without_current, "c") == ([], 1)
+
+
+async def test_irshad_page_that_fails_midway_keeps_the_pages_already_read():
+    scraper = fast(IrshadScraper)
+    first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
+
+    def site(request):
+        if "page=2" in str(request.url):
+            return httpx.Response(403, text=CLOUDFLARE_BLOCK)
+        return httpx.Response(200, text=first)
+
+    serve(scraper, site)
+    result = await scraper.scrape(["c"])
+    status = result.route_statuses["c"]
+    assert len(result.products) == 4
+    assert not status.complete
+    assert status.abort_reason == "page_2_refused" and status.pages_skipped == 1
 
 
 async def test_irshad_empty_first_page_is_not_a_verified_empty_category():
@@ -993,3 +1353,10 @@ async def test_irshad_discovers_first_level_sections_and_skips_non_catalog_ones(
     )
     serve(scraper, lambda _request: httpx.Response(200, text=home))
     assert await scraper.discover_categories() == ["foto-texnika", "tv-ve-audio"]
+
+
+async def test_irshad_discovery_without_sections_is_an_error_not_an_empty_catalog():
+    scraper = fast(IrshadScraper)
+    serve(scraper, lambda _request: httpx.Response(200, text="<html><body></body></html>"))
+    with pytest.raises(PageFetchError):
+        await scraper.discover_categories()

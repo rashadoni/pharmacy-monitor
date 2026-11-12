@@ -148,7 +148,7 @@ class CategoryPass:
     pages_skipped: int = 0
     raw_items: int = 0
     item_failures: int = 0
-    # Сайт закрылся защитой: повторять категорию тем же путём бессмысленно.
+    # Сайт закрылся от нас на какой-то из страниц этого прохода.
     blocked: bool = False
 
 
@@ -233,11 +233,17 @@ class HttpCatalogScraper(BaseScraper):
         return [*ports[start:], *ports[:start]]
 
     def _rotate_session(self) -> None:
-        """Следующий проход категории начать с другого выхода прокси."""
+        """Следующий проход категории начать с другого выхода прокси.
+
+        Считаем от выхода, которым шли сейчас, а не от начального: к этому
+        времени ``fetch`` уже мог перейти на соседний, и шаг «плюс один от
+        начального» вернул бы тот же самый выход.
+        """
         ports = _decodo_ports(self.site_name)
-        if ports:
-            self._decodo_port_offset = (self._decodo_port_offset + 1) % len(ports)
-            self._active_port = ports[self._decodo_port_offset]
+        if not ports:
+            return
+        current = ports.index(self._active_port) if self._active_port in ports else -1
+        self._active_port = ports[(current + 1) % len(ports)]
 
     async def fetch(
         self,
@@ -251,21 +257,27 @@ class HttpCatalogScraper(BaseScraper):
 
         Возвращает ответ со статусом из ``accept_statuses``. Иначе:
           - ``SiteScrapeFatalError`` — прокси отклонил доступ (402/407);
-          - ``CaptchaDetected`` — сайт ответил страницей защиты на всех выходах;
+          - ``CaptchaDetected`` — сайт закрылся от нас: страница защиты или 403
+            хотя бы на одном выходе, и ни один выход страницу не отдал;
           - ``PageFetchError`` — сеть, временный или неожиданный статус.
+
+        Через прокси сбой лечится сменой выхода; напрямую выход один, поэтому
+        временный сбой повторяется с паузой, а отказ защиты — нет: тот же адрес
+        получит тот же отказ.
         """
         order = self._port_order()
         direct = order == [None]
-        attempts = (
-            max(1, self.max_retries)
-            if direct
-            else min(len(order), _env_int("DECODO_PAGE_ATTEMPTS", 10))
-        )
+        if direct:
+            attempts = max(1, self.max_retries)
+        else:
+            # Выходов может быть меньше, чем нужно попыток на временный сбой
+            # (один порт): тогда тот же выход пробуется повторно.
+            attempts = min(_env_int("DECODO_PAGE_ATTEMPTS", 10), max(len(order), self.max_retries))
         last_reason = "no attempt was made"
         last_status: int | None = None
-        blocked = False
+        blocked_status: int | None = None
         for attempt in range(attempts):
-            port = None if direct else order[attempt]
+            port = None if direct else order[attempt % len(order)]
             if attempt:
                 self.fetch_retries += 1
                 await asyncio.sleep(min(8.0, 0.5 * 2**attempt) if direct else 0.5)
@@ -276,6 +288,7 @@ class HttpCatalogScraper(BaseScraper):
                 reason = fatal_proxy_reason(exc)
                 if reason is not None:
                     raise SiteScrapeFatalError(reason) from exc
+                # Только имя класса: в тексте ошибки прокси стоит его адрес.
                 last_reason, last_status = f"proxy error: {type(exc).__name__}", None
                 continue
             except (httpx.RequestError, ssl.SSLError) as exc:
@@ -285,35 +298,60 @@ class HttpCatalogScraper(BaseScraper):
             status = response.status_code
             if port is not None and status in _PROXY_ACCOUNT_STATUSES:
                 raise SiteScrapeFatalError(f"proxy access rejected: HTTP {status}")
-            if status in accept_statuses:
-                if looks_like_protection_page(response.text):
-                    blocked, last_reason, last_status = True, "protection page", status
-                    continue
+            protection = looks_like_protection_page(response.text)
+            if status in accept_statuses and not protection:
                 if port is not None:
                     self._active_port = port
                 return response
-            if status in (403, 503) and looks_like_protection_page(response.text):
-                blocked, last_reason, last_status = True, "protection page", status
+            if protection or status == 403:
+                # 403 без знакомой страницы — тоже отказ в доступе (у
+                # Cloudflare их несколько видов): другой выход может пройти.
+                blocked_status = status
+                last_reason, last_status = "access refused", status
+                if direct:
+                    break
                 continue
             last_reason, last_status = f"HTTP {status}", status
             if status not in _TRANSIENT_STATUSES:
                 # Постоянный отказ сайта (404, 410…) от смены выхода не зависит.
                 break
-        if blocked and last_reason == "protection page":
+        if blocked_status is not None:
             raise CaptchaDetected(
-                f"{self.site_name}: protection page instead of content (HTTP {last_status})"
+                f"{self.site_name}: access refused instead of content (HTTP {blocked_status})"
             )
         raise PageFetchError(last_reason, status=last_status)
 
     # -- контракт категории --------------------------------------------------
 
     async def discover_categories(self) -> list[str]:
-        """Категории, обход которых даёт полный каталог сайта."""
+        """Категории, обход которых даёт полный каталог сайта.
+
+        Список либо полон, либо его нет: раздел, который не удалось прочитать,
+        — это ``PageFetchError``, а не список покороче. Проверка полноты
+        прогона видит только запрошенные категории, и молча пропущенный раздел
+        не числился бы пропущенным нигде.
+        """
         raise NotImplementedError
 
     async def _collect_category(self, category_slug: str, limit: int | None) -> CategoryPass:
-        """Один проход одной категории, от первой страницы до последней."""
+        """Один проход одной категории, от первой страницы до последней.
+
+        Сбой страницы не бросается наружу, а записывается в итог прохода
+        (``page_failed``): уже прочитанные страницы остаются в нём.
+        """
         raise NotImplementedError
+
+    @staticmethod
+    def page_failed(result: CategoryPass, page: int, error: Exception) -> CategoryPass:
+        """Записать в итог прохода, что страница не получена, и вернуть его."""
+        result.pages_skipped += 1
+        if isinstance(error, CaptchaDetected):
+            result.blocked = True
+            result.abort_reason = f"page_{page}_refused"
+        else:
+            reason = getattr(error, "reason", None) or type(error).__name__
+            result.abort_reason = f"page_{page}_failed: {reason}"[:200]
+        return result
 
     async def scrape_category(
         self, category_slug: str, limit: int | None = None
@@ -323,14 +361,15 @@ class HttpCatalogScraper(BaseScraper):
         Неполный проход повторяется с начала — списки сайтов не снимок, товар
         между страницами может сдвинуться. Попытки не склеиваются: наружу
         уходит один проход, полный или лучший из неполных, со своим статусом.
+        Лучший — тот, где товаров больше; при равенстве — последний.
         """
         best: CategoryPass | None = None
         for attempt in range(1, max(1, self.category_attempts) + 1):
             try:
                 current = await self._collect_category(str(category_slug), limit)
-            except CaptchaDetected:
-                current = CategoryPass(abort_reason="protection_page", blocked=True)
-            if best is None or len(current.products) > len(best.products) or current.complete:
+            except CaptchaDetected as exc:
+                current = self.page_failed(CategoryPass(), 1, exc)
+            if best is None or current.complete or len(current.products) >= len(best.products):
                 best = current
             if current.complete or current.abort_reason == "requested_limit_reached":
                 break
@@ -363,3 +402,20 @@ class HttpCatalogScraper(BaseScraper):
             )
         for product in best.products:
             yield product
+
+
+def counted_pass_is_complete(result: CategoryPass) -> bool:
+    """Проход сайта, который называет число товаров, сошёлся с этим числом.
+
+    Условие то же, что у проверки полноты прогона
+    (``main._route_failure_causes``): ни одной неразобранной записи, записей
+    пришло ровно столько, сколько сайт назвал, и все они — разные товары.
+    Иначе сборщик объявил бы полным проход, который прогон потом отвергнет, и
+    не стал бы его повторять.
+    """
+    return (
+        result.expected_items is not None
+        and result.item_failures == 0
+        and result.raw_items == result.expected_items
+        and len(result.products) == result.expected_items
+    )

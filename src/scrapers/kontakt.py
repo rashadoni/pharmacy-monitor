@@ -31,11 +31,12 @@ from urllib.parse import quote, urlsplit
 import structlog
 
 from src.product_policy import OFFER_IN_STOCK, OFFER_OUT_OF_STOCK, offer_from_boolean
-from src.scrapers.base import ScrapedProduct
+from src.scrapers.base import CaptchaDetected, ScrapedProduct
 from src.scrapers.http_catalog import (
     CategoryPass,
     HttpCatalogScraper,
     PageFetchError,
+    counted_pass_is_complete,
     price_or_none,
     sale_fields,
 )
@@ -184,7 +185,7 @@ class KontaktScraper(HttpCatalogScraper):
         )
         try:
             payload = decode_turbo_stream(response.text)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, RecursionError) as exc:
             raise PageFetchError(f"undecodable page data: {type(exc).__name__}") from exc
         data = (
             ((payload or {}).get(_ROUTE_KEY) or {}).get("data")
@@ -202,10 +203,8 @@ class KontaktScraper(HttpCatalogScraper):
         while page <= _MAX_PAGES:
             try:
                 data = await self._route_data(category_slug, page)
-            except PageFetchError as exc:
-                result.pages_skipped += 1
-                result.abort_reason = f"page_{page}_failed: {exc.reason}"[:200]
-                return result
+            except (PageFetchError, CaptchaDetected) as exc:
+                return self.page_failed(result, page, exc)
             listing = data.get("products")
             if data.get("type") != "CATEGORY" or not isinstance(listing, dict):
                 result.abort_reason = f"not_a_product_listing: {data.get('type')}"[:200]
@@ -217,12 +216,9 @@ class KontaktScraper(HttpCatalogScraper):
                     result.abort_reason = "invalid_total"
                     return result
                 result.expected_items = total
-                declared = (listing.get("page_info") or {}).get("total_pages")
-                result.expected_pages = (
-                    declared
-                    if isinstance(declared, int) and declared >= 0
-                    else math.ceil(total / _PAGE_SIZE)
-                )
+                # Число страниц считаем сами: сайт может назвать «1 страницу»
+                # и у пустой категории.
+                result.expected_pages = math.ceil(total / _PAGE_SIZE)
             result.visited_pages = page
             if not items and page <= (result.expected_pages or 0):
                 result.abort_reason = "empty_page_before_last"
@@ -247,57 +243,82 @@ class KontaktScraper(HttpCatalogScraper):
             result.abort_reason = "page_limit_reached"
             return result
 
-        if len(result.products) != result.expected_items:
-            # Товар сдвинулся между страницами (повтор или пропуск) либо сайт
-            # насчитал больше, чем показал.
-            result.abort_reason = "item_count_mismatch"
+        if not counted_pass_is_complete(result):
+            # Запись не разобрана; товар повторился или пропал между страницами
+            # (список сдвинулся); либо сайт насчитал не столько, сколько показал.
+            result.abort_reason = (
+                "item_parse_failures" if result.item_failures else "item_count_mismatch"
+            )
             return result
         result.complete = True
         return result
 
     async def discover_categories(self) -> list[str]:
-        """Все категории-списки сайта: обход от меню вниз по подразделам."""
+        """Все категории-списки сайта: от меню вниз по дереву категорий.
+
+        В обход идёт каждый пункт меню с собственной страницей, на любой
+        глубине, и всё, на что ссылаются сами страницы: подразделы витрины
+        (``SUBCATEGORY``) и вложенные категории списка (``CATEGORY``).
+        Категория-список остаётся в ответе, даже когда в нём есть её
+        родитель: включает ли список родителя товары вложенной, на сайте не
+        проверено, а повтор товара безвреден — пропуск нет.
+        """
         response = await self.fetch(f"{self.base_url}/_root.data", headers={"Accept": "*/*"})
-        payload = decode_turbo_stream(response.text)
-        menu = (((payload or {}).get("root") or {}).get("data") or {}).get("categories") or []
+        try:
+            payload = decode_turbo_stream(response.text)
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise PageFetchError(f"undecodable menu data: {type(exc).__name__}") from exc
+        root = (payload or {}).get("root") if isinstance(payload, dict) else None
+        menu = ((root or {}).get("data") or {}).get("categories") or []
 
         queue: list[str] = []
 
-        def take_menu(nodes: list) -> None:
-            for node in nodes:
+        def take_menu(nodes: object) -> None:
+            for node in nodes if isinstance(nodes, list) else []:
                 if not isinstance(node, dict):
                     continue
                 path = str(node.get("url_path") or "").strip("/")
                 if node.get("is_category") and path:
                     queue.append(path)
-                else:
-                    # Пункт меню без своей страницы — группа: берём её категории.
-                    take_menu(node.get("children") or [])
+                take_menu(node.get("children"))
 
         take_menu(menu)
+        if not queue:
+            raise PageFetchError("site menu has no categories")
 
         listings: list[str] = []
+        unread: list[str] = []
         visited: set[str] = set()
-        while queue and len(visited) < _MAX_DISCOVERY_NODES:
+        while queue:
             path = queue.pop(0)
             if path in visited:
                 continue
+            if len(visited) >= _MAX_DISCOVERY_NODES:
+                raise PageFetchError("category tree is larger than the discovery limit")
             visited.add(path)
             try:
                 data = await self._route_data(path)
             except PageFetchError as exc:
                 log.warning("kontakt_category_probe_failed", category=path, error=exc.reason)
+                unread.append(path)
                 continue
+            children: list[str | None] = []
             if data.get("type") == "CATEGORY" and isinstance(data.get("products"), dict):
                 listings.append(path)
-                continue
-            subcategories = (data.get("subcategoriesPage") or {}).get("subcategories") or []
-            for sub in subcategories:
-                child = category_path_from_link((sub or {}).get("categoryLink"))
-                if child and child not in visited:
-                    queue.append(child)
+                nested = (data.get("category") or {}).get("children")
+                for child in nested if isinstance(nested, list) else []:
+                    if isinstance(child, dict) and child.get("url_path"):
+                        children.append(str(child["url_path"]).strip("/"))
+            else:
+                subcategories = (data.get("subcategoriesPage") or {}).get("subcategories")
+                for sub in subcategories if isinstance(subcategories, list) else []:
+                    if isinstance(sub, dict):
+                        children.append(category_path_from_link(sub.get("categoryLink")))
+            queue.extend(child for child in children if child and child not in visited)
 
-        # Вложенная категория-список рядом с родительской остаётся в обходе:
-        # включает ли список родителя её товары, на сайте не проверено, а
-        # повтор товара безвреден — пропуск нет.
+        if unread:
+            # Непрочитанный раздел — это неизвестное число категорий под ним.
+            raise PageFetchError(
+                f"category tree is incomplete: {len(unread)} sections were not read"
+            )
         return listings

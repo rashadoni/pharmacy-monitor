@@ -3,8 +3,16 @@
 Сайт отдаёт список раздела готовой вёрсткой: ``/az/list-products/<раздел>``
 с параметром ``page=N`` возвращает только карточки (6 КБ на проводе против 580
 у целой страницы; замер 2026-11-12), по девять на страницу. Числа товаров в
-разделе сайт не называет: конец списка — это страница без ссылки «показать
-ещё» (``id="loadMore"``); страница за концом списка приходит пустой.
+разделе сайт не называет. Конец списка сборщик подтверждает двумя признаками
+сразу: на странице нет ссылки «показать ещё» (``id="loadMore"``) **и** следующая
+за ней страница приходит пустой. Один признак без другого — неполный проход:
+пропавшая из вёрстки ссылка иначе превращала бы каждый раздел в «полный» раздел
+из одной страницы.
+
+Чего проход не видит: товар, снятый с сайта посреди обхода, сдвигает список
+вверх, и один из следующих товаров может не попасть ни на одну страницу. Без
+числа товаров от сайта это не обнаружить; новый товар, наоборот, даёт повтор
+(он отбрасывается), но ничего не теряет.
 
 Товар узнаётся по номеру товара на сайте — он стоит в классе карточки
 (``product-108753_…``). Обычная цена — ``old-price``, действующая —
@@ -29,7 +37,7 @@ from urllib.parse import quote
 import structlog
 
 from src.product_policy import OFFER_IN_STOCK, OFFER_OUT_OF_STOCK, OFFER_UNKNOWN
-from src.scrapers.base import ScrapedProduct
+from src.scrapers.base import CaptchaDetected, ScrapedProduct
 from src.scrapers.http_catalog import (
     CategoryPass,
     HttpCatalogScraper,
@@ -155,8 +163,15 @@ def build_products(
             failures += 1
             continue
         url, name, image_url = identity
-        current = price_or_none(_text((_NEW_PRICE_RE.search(block_html) or [None, None])[1]))
-        old = price_or_none(_text((_OLD_PRICE_RE.search(block_html) or [None, None])[1]))
+        new_match = _NEW_PRICE_RE.search(block_html)
+        old_match = _OLD_PRICE_RE.search(block_html)
+        current = price_or_none(_text(new_match[1])) if new_match else None
+        old = price_or_none(_text(old_match[1])) if old_match else None
+        if (new_match and current is None) or (old_match and old is None) or (old and not current):
+            # Цена написана, но не прочитана, или есть только зачёркнутая:
+            # выдать зачёркнутую за действующую хуже, чем не выдать товар.
+            failures += 1
+            continue
         # У товара без скидки сайт пишет одну цену — в «new-price».
         price, discount_price, discount_percent, on_sale = sale_fields(old or current, current)
         products.append(
@@ -198,51 +213,62 @@ class IrshadScraper(HttpCatalogScraper):
         result = CategoryPass()
         seen: set[str] = set()
         page = 1
+        # Позвал ли сайт на эту страницу ссылкой «показать ещё» с предыдущей.
+        announced = True
         while page <= _MAX_PAGES:
             try:
                 page_html = await self._list_page(category_slug, page)
-            except PageFetchError as exc:
-                result.pages_skipped += 1
-                result.abort_reason = f"page_{page}_failed: {exc.reason}"[:200]
-                return result
+            except (PageFetchError, CaptchaDetected) as exc:
+                return self.page_failed(result, page, exc)
             result.visited_pages = page
             cards = split_cards(page_html)
             if not cards:
-                # Пустая первая страница — раздела нет или вёрстка сменилась;
-                # пустая страница, на которую сайт сам позвал, — обрыв списка.
-                result.abort_reason = "empty_listing" if page == 1 else "empty_page_before_last"
+                if page == 1:
+                    # Раздела нет или вёрстка сменилась.
+                    result.abort_reason = "empty_listing"
+                    return result
+                if announced:
+                    # Сайт сам позвал на эту страницу, а она пуста: обрыв.
+                    result.abort_reason = "empty_page_before_last"
+                    return result
+                break  # конец списка подтверждён пустой страницей за ним
+            if not announced:
+                # Ссылки «показать ещё» не было, а товары дальше есть: признак
+                # конца списка пропал из вёрстки, верить ему больше нельзя.
+                result.abort_reason = "load_more_marker_missing"
                 return result
             for product_id, card_html in cards:
                 products, failures = build_products(product_id, card_html, category_slug)
-                result.raw_items += len(products) + failures
+                result.raw_items += failures
                 result.item_failures += failures
                 for product in products:
                     if product.external_id in seen:
+                        # Тот же товар второй раз: цвет, у которого есть и своя
+                        # карточка, или список, сдвинувшийся на новый товар.
                         continue
                     seen.add(product.external_id)
+                    result.raw_items += 1
                     result.products.append(product)
                     if limit is not None and len(result.products) >= limit:
                         result.abort_reason = "requested_limit_reached"
                         return result
             more = _LOAD_MORE_RE.search(page_html)
-            if not more:
-                break
-            next_page = int(more.group(1))
-            if next_page <= page:
-                result.abort_reason = "pagination_does_not_advance"
-                return result
-            page = next_page
+            if more:
+                next_page = int(more.group(1))
+                if next_page <= page:
+                    result.abort_reason = "pagination_does_not_advance"
+                    return result
+                page, announced = next_page, True
+            else:
+                # Последняя страница по словам сайта. Проверяем: следующая
+                # обязана прийти пустой.
+                page, announced = page + 1, False
         else:
             result.abort_reason = "page_limit_reached"
             return result
 
         if result.item_failures:
             result.abort_reason = "item_parse_failures"
-            return result
-        if len(result.products) != result.raw_items:
-            # Один товар пришёл дважды: список сдвинулся между страницами, и
-            # какой-то другой товар мог не прийти вовсе.
-            result.abort_reason = "listing_shifted_between_pages"
             return result
         result.complete = True
         return result
@@ -252,4 +278,7 @@ class IrshadScraper(HttpCatalogScraper):
         response = await self.fetch(f"{self.base_url}/az")
         links = set(_HOME_LINK_RE.findall(response.text))
         parents = {link.split("/")[0] for link in links if "/" in link}
-        return sorted(parents - _NOT_CATALOG_ROOTS)
+        roots = sorted(parents - _NOT_CATALOG_ROOTS)
+        if not roots:
+            raise PageFetchError("home page has no catalog sections")
+        return roots

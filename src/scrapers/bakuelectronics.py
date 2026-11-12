@@ -35,11 +35,12 @@ from urllib.parse import quote
 import structlog
 
 from src.product_policy import offer_from_quantity
-from src.scrapers.base import ScrapedProduct
+from src.scrapers.base import CaptchaDetected, ScrapedProduct
 from src.scrapers.http_catalog import (
     CategoryPass,
     HttpCatalogScraper,
     PageFetchError,
+    counted_pass_is_complete,
     price_or_none,
     sale_fields,
 )
@@ -164,10 +165,8 @@ class BakuElectronicsScraper(HttpCatalogScraper):
         while page <= _MAX_PAGES:
             try:
                 listing = await self._listing_page(category_slug, page)
-            except PageFetchError as exc:
-                result.pages_skipped += 1
-                result.abort_reason = f"page_{page}_failed: {exc.reason}"[:200]
-                return result
+            except (PageFetchError, CaptchaDetected) as exc:
+                return self.page_failed(result, page, exc)
             items = listing["items"]
             if page == 1:
                 total = listing.get("total")
@@ -204,8 +203,10 @@ class BakuElectronicsScraper(HttpCatalogScraper):
             result.abort_reason = "page_limit_reached"
             return result
 
-        if len(result.products) != result.expected_items:
-            result.abort_reason = "item_count_mismatch"
+        if not counted_pass_is_complete(result):
+            result.abort_reason = (
+                "item_parse_failures" if result.item_failures else "item_count_mismatch"
+            )
             return result
         result.complete = True
         return result
@@ -238,6 +239,9 @@ class BakuElectronicsScraper(HttpCatalogScraper):
                 if slug.startswith(f"{parent}/") and slug.count("/") + 1 == depth
             ]
 
+        if not roots:
+            raise PageFetchError("home page has no catalog sections")
+
         routes: list[str] = []
         queue = list(roots)
         while queue:
@@ -252,6 +256,12 @@ class BakuElectronicsScraper(HttpCatalogScraper):
                     error=exc.reason,
                     replaced_by_children=len(children),
                 )
+                if not children:
+                    # Заменить нечем: список без этого раздела был бы неполным
+                    # каталогом, который выглядит полным.
+                    raise PageFetchError(
+                        f"section {slug} is not readable and has no subsections"
+                    ) from exc
                 queue.extend(children)
                 continue
             routes.append(slug)
