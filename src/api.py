@@ -2470,6 +2470,7 @@ def dash_comparison(
         category=category,
         match_ids=match_ids,
         client_site=client_site,
+        include_unavailable=True,
     )
     return _fast_json(rows[:limit])
 
@@ -2511,6 +2512,7 @@ def dash_comparison_search(
         category=category,
         match_ids=match_ids,
         client_site=client_site,
+        include_unavailable=True,
     )
     shown_match_ids = {row["canonical_id"] for row in rows}
 
@@ -2581,6 +2583,7 @@ def dash_comparison_export(
     diff_only: bool = False,
     locale: str = "ru",
     client_site: str | None = None,
+    stock: str | None = None,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
@@ -2594,6 +2597,8 @@ def dash_comparison_export(
 
     if client_site is not None:
         _require_site(client_site)
+    if stock is not None and stock not in comparison_export.STOCK_FILTERS:
+        raise HTTPException(status_code=400, detail=f"Unknown stock filter '{stock}'")
     _require_financial_policy_ready(db, tenant_id=user.tenant_id)
     locale = _normalize_locale(locale)
     query = (search or "").strip()
@@ -2612,11 +2617,15 @@ def dash_comparison_export(
             category=category,
             match_ids=match_ids,
             client_site=client_site,
+            include_unavailable=True,
         )
     if with_aloe:
         rows = [row for row in rows if "aloe" in row["prices"]]
     if diff_only:
         rows = [row for row in rows if comparison_export.has_price_difference(row)]
+    if stock is not None:
+        viewer = client_site or site_profile.CLIENT_SITE
+        rows = [row for row in rows if comparison_export.matches_stock_filter(row, stock, viewer)]
 
     generated_at = utcnow()
     content = comparison_export.build_workbook(

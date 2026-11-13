@@ -281,10 +281,14 @@ export interface ComparisonRow {
   prices: Record<
     string,
     {
-      price: number;
+      // null — только у записи «нет в наличии», если цену сайт не называл.
+      price: number | null;
       is_on_sale: boolean;
       url: string;
       product_id: number;
+      // Товара на сайте нет в наличии: запись показывают с пометкой, в
+      // min/max/разницу строки она не входит (comparison_rows.py).
+      out_of_stock?: boolean;
       country_code?: string | null;
       country_resolution_status?:
         | "resolved"
@@ -294,8 +298,9 @@ export interface ComparisonRow {
       availability_status?: "in_stock" | "out_of_stock" | "unknown";
       availability_observed_at?: string | null;
       // Per-unit normalization (2026-05-29). pack_count = штук в упаковке,
-      // unit_price = price/pack_count. Заполняются всегда; используются для
-      // отображения когда spread_basis === "unit".
+      // unit_price = price/pack_count. Заполняются у товаров в продаже (у
+      // записи «нет в наличии» их нет); используются для отображения, когда
+      // spread_basis === "unit".
       pack_count?: number;
       unit_price?: number;
       pack_size?: string | null;
@@ -1062,6 +1067,7 @@ export const api = {
     diff_only?: boolean;
     locale: string;
     client_site?: string;
+    stock?: "rival" | "own";
   }): Promise<{ blob: Blob; filename: string }> => {
     const q = new URLSearchParams({ locale: params.locale });
     if (params.search) q.set("search", params.search);
@@ -1070,6 +1076,7 @@ export const api = {
     if (params.with_aloe) q.set("with_aloe", "true");
     if (params.diff_only) q.set("diff_only", "true");
     if (params.client_site) q.set("client_site", params.client_site);
+    if (params.stock) q.set("stock", params.stock);
     const res = await fetch(`${BASE}/api/v1/dash/comparison/export.xlsx?${q}`, {
       credentials: "include",
     });
