@@ -1708,29 +1708,58 @@ def irshad_renumbered(page_html: str, mapping: dict[str, str]) -> str:
     return page_html
 
 
-async def test_irshad_card_shown_again_on_a_later_page_is_skipped_not_a_break():
-    # Товар с несколькими цветами сайт ставит в список на месте каждого цвета:
-    # на живом сайте карточка 65715 стоит на 7-й и на 16-й страницах раздела
-    # (замер 2026-11-13). Раньше повтор обрывал раздел при каждой попытке.
+async def test_irshad_card_shown_again_on_a_later_page_is_not_a_break():
+    # Товар с несколькими цветами сайт ставит в список не один раз: на живом
+    # сайте карточка 65715 стоит на 7-й и на 16-й страницах раздела (замер
+    # 2026-11-13). Раньше повтор обрывал раздел при каждой попытке.
     scraper = fast(IrshadScraper)
     first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
-    second = irshad_renumbered(IRSHAD_LAST_PAGE, {"108751": "200002", "85759": "200003"})
-    second = second.replace('value="108719"', 'value="200004"').replace(
-        'data-selected-id="108719"', 'data-selected-id="200004"'
-    )
+    # Вторая страница: два новых товара и та же многоцветная карточка 85759.
+    second = irshad_renumbered(IRSHAD_LAST_PAGE, {"108753": "200001", "108751": "200002"})
     seen = serve(scraper, irshad_site({"1": first, "2": second}))
     products = await collect(scraper, "c")
     status = scraper._route_statuses["c"]
-    # Карточка 108753 пришла второй раз и пропущена; новые товары взяты.
     ids = [p.external_id for p in products]
-    assert ids.count("108753") == 1
-    assert {"200002", "200003"} <= set(ids)
+    assert ids == ["108753", "108751", "85759", "108719", "200001", "200002"]
     assert status.complete and status.abort_reason is None
+    assert (status.raw_items, status.parsed_items, status.item_failures) == (6, 6, 0)
     assert len(seen) == 3  # две страницы и подтверждение конца, без повтора прохода
 
 
-async def test_irshad_page_made_only_of_cards_already_seen_is_a_break():
-    # Та же страница второй раз — листание сломано; это не «повтор цвета».
+async def test_irshad_repeated_card_with_a_new_colour_gives_that_colour():
+    # Вторая встреча карточки несёт цвет, которого в первой не было: карточку
+    # разбирают снова, новый товар не теряется.
+    scraper = fast(IrshadScraper)
+    first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
+    second = irshad_renumbered(IRSHAD_LAST_PAGE, {"108753": "200001", "108751": "200002"})
+    second = second.replace('value="108719"', 'value="200004"').replace(
+        'data-selected-id="108719"', 'data-selected-id="200004"'
+    )
+    serve(scraper, irshad_site({"1": first, "2": second}))
+    products = await collect(scraper, "c")
+    ids = [p.external_id for p in products]
+    assert "200004" in ids and ids.count("85759") == 1
+    assert scraper._route_statuses["c"].complete
+
+
+async def test_irshad_last_page_holding_only_a_repeated_card_ends_the_list():
+    # Новый цвет старой модели получает старший номер: её карточка встаёт в
+    # самый хвост списка, одна на последней странице. Это не сломанное листание.
+    scraper = fast(IrshadScraper)
+    first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
+    # Из страницы без ссылки «показать ещё»: карточка — кусок вёрстки до конца.
+    (repeat,) = [card for card_id, card in split_cards(IRSHAD_LAST_PAGE) if card_id == "85759"]
+    last = f'<div class="pjax-container"><div id="productGridItems">{repeat}</div></div>'
+    assert [card_id for card_id, _ in split_cards(last)] == ["85759"]
+    serve(scraper, irshad_site({"1": first, "2": last}))
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert len(products) == 4
+    assert status.complete and status.abort_reason is None
+
+
+async def test_irshad_same_page_served_twice_is_a_break():
+    # Тот же набор карточек второй раз — листание сломано; это не повтор цвета.
     scraper = fast(IrshadScraper)
     first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
     seen = serve(scraper, irshad_site({"1": first, "2": IRSHAD_LAST_PAGE}))
