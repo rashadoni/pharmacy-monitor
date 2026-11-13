@@ -20,6 +20,8 @@ export type SiteProfile = {
   /** Название магазина в тексте. */
   titles: Readonly<Record<string, string>>;
   appName: string;
+  /** Файл окружения экземпляра на сервере — его называют подсказки настроек. */
+  envFile: string;
   /**
    * Страницы, построенные на аптечной модели данных: связки категорий трёх
    * сайтов, закреплённые ссылки с колонкой на сайт, ручное сопоставление по
@@ -39,6 +41,7 @@ export const PHARMACY: SiteProfile = {
   },
   titles: { pharmonline: "Pharmonline", aptekonline: "Aptekonline", aloe: "Aloe" },
   appName: "Pharmacy Monitor",
+  envFile: "/etc/pharmacy-monitor/env",
   pharmacyPages: true,
 };
 
@@ -53,6 +56,7 @@ export const ELECTRONICS: SiteProfile = {
   },
   titles: { kontakt: "Kontakt Home", irshad: "Irshad", bakuelectronics: "Baku Electronics" },
   appName: "Price Monitor",
+  envFile: "/etc/electro-monitor/env",
   pharmacyPages: false,
 };
 
@@ -120,7 +124,9 @@ export function messagesForProfile<T>(messages: T, profile: SiteProfile = PROFIL
     replacements.push([new RegExp(escapeRegExp(PHARMACY.domains[pharmacySite]), "gi"), profile.domains[site]]);
     replacements.push([new RegExp(`\\b${escapeRegExp(pharmacySite)}\\b`, "gi"), profile.titles[site]]);
   });
-  replacements.push([new RegExp(escapeRegExp(PHARMACY.appName), "g"), profile.appName]);
+  // Раньше названия: «/etc/pharmacy-monitor/env» не должен попасть под замену имени.
+  replacements.unshift([new RegExp(escapeRegExp(PHARMACY.envFile), "g"), profile.envFile]);
+  replacements.push([new RegExp(escapeRegExp(PHARMACY.appName), "gi"), profile.appName]);
 
   const rewrite = (value: string | Messages): string | Messages => {
     if (typeof value === "string") {

@@ -65,13 +65,18 @@ describe("тексты интерфейса под профиль", () => {
   it("имена сайтов заменяются по порядку: клиент на клиента", () => {
     const messages = {
       a: "pharmonline дешевле остальных на 5%",
-      nested: { b: "Конкурент aptekonline.az или aloe; Pharmonline (вы)", c: "Pharmacy Monitor" },
+      nested: {
+        b: "Конкурент aptekonline.az или aloe; Pharmonline (вы)",
+        c: "Pharmacy Monitor",
+        d: "впишите токен в /etc/pharmacy-monitor/env",
+      },
     };
     expect(messagesForProfile(messages, ELECTRONICS)).toEqual({
       a: "Kontakt Home дешевле остальных на 5%",
       nested: {
         b: "Конкурент irshad.az или Baku Electronics; Kontakt Home (вы)",
         c: "Price Monitor",
+        d: "впишите токен в /etc/electro-monitor/env",
       },
     });
     // Исходный объект не тронут.
@@ -88,7 +93,7 @@ describe("тексты интерфейса под профиль", () => {
     ["en", en],
   ])("в текстах %s для электроники не остаётся аптечных сайтов", (_locale, messages) => {
     const rewritten = JSON.stringify(Object.values(flatten(messagesForProfile(messages, ELECTRONICS))));
-    expect(rewritten).not.toMatch(/pharmonline|aptekonline|\baloe\b|Pharmacy Monitor/i);
+    expect(rewritten).not.toMatch(/pharmonline|aptekonline|\baloe\b|Pharmacy Monitor|pharmacy-monitor/i);
     // Ключи те же: страницы ищут тексты по прежним именам.
     expect(Object.keys(flatten(messagesForProfile(messages, ELECTRONICS)))).toEqual(
       Object.keys(flatten(messages)),

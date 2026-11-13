@@ -305,16 +305,16 @@ def margin_report(session: Session, *, run_id: int | None = None) -> list[Margin
 
     current_catalog = run_id is None
     if run_id is None:
-        run_id = storage.latest_financial_run_ids_by_site(session, ("pharmonline",)).get(
-            "pharmonline"
-        )
+        run_id = storage.latest_financial_run_ids_by_site(
+            session, (site_profile.CLIENT_SITE,)
+        ).get(site_profile.CLIENT_SITE)
     run = session.get(Run, run_id) if run_id is not None else None
     if not storage.run_is_financially_eligible(run):
         return []
     if current_catalog:
         latest_attempt = storage.latest_full_catalog_attempts_by_site(
-            session, ("pharmonline",), tenant_id=run.tenant_id
-        ).get("pharmonline")
+            session, (site_profile.CLIENT_SITE,), tenant_id=run.tenant_id
+        ).get(site_profile.CLIENT_SITE)
         if latest_attempt is None or latest_attempt.id != run.id:
             return []
 

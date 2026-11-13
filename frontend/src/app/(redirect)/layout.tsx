@@ -1,9 +1,10 @@
 import type { Metadata, Viewport } from "next";
 import "../globals.css";
 import { defaultLocale } from "@/i18n/config";
+import { PROFILE } from "@/lib/site-profile";
 
 export const metadata: Metadata = {
-  title: "Pharmacy Monitor",
+  title: PROFILE.appName,
   description: "Daily competitive monitoring for AZ pharmacies",
 };
 

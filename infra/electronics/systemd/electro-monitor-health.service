@@ -9,6 +9,8 @@ Group=pm
 WorkingDirectory=/opt/electro-monitor
 EnvironmentFile=/etc/electro-monitor/env
 ExecStart=/opt/pharmacy-monitor/.venv/bin/python -m src.main health-check --quiet-on-ok --alert-email
+# Код выхода 1 и 2 — «есть предупреждения» и «есть критические», а не сбой юнита.
+SuccessExitStatus=1 2
 
 NoNewPrivileges=true
 PrivateTmp=true
