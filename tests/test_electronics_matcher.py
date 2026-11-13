@@ -288,7 +288,20 @@ def test_model_code_is_found_whatever_surrounds_it():
         ),
         ("Qəhvə maşını DeLonghi Dedica Duo EC890.GR VeroCafe", "Delonghi EC890.M", None),
         ("Tozsoran Philips XB2022/01", "Tozsoran Philips XB2022/81", None),
-        ("Robot tozsoran Samsung VR3MB77312K/TR", "Samsung VR3MB77312K/EV", None),
+        # У Samsung и LG хвост — рынок сбыта, а не исполнение: тот же товар.
+        (
+            "Robot tozsoran Samsung VR3MB77312K/TR",
+            "Samsung VR3MB77312K/EV",
+            em.STRATEGY_CODE,
+        ),
+        ("Paltaryuyan Samsung WW80T4020CE/LP", "Samsung WW80T4020CE/LE", em.STRATEGY_CODE),
+        ("Televizor LG 55UR78006LK.AMCN", "LG 55UR78006LK.AMCE", em.STRATEGY_CODE),
+        # Характеристика после косой черты — не хвост кода.
+        (
+            "Notbuk HP 15-FD0034CI/FHD IPS",
+            "Notbuk HP 15-FD0034CI/DOS",
+            em.STRATEGY_CODE,
+        ),
         (
             "Mikrodalğalı soba Samsung MS23K3614AK/BW",
             "Samsung MS23K3614AK/BW",
@@ -577,7 +590,8 @@ def test_only_the_member_that_disagrees_leaves_a_three_site_pair(db_session):
     kontakt = _product(db_session, "kontakt", "Tozsoran Philips XB2022/81", 219.99)
     irshad = _product(db_session, "irshad", "Philips XB2022/81", 229.99)
     other = _product(db_session, "bakuelectronics", "Tozsoran Philips XB2022/01", 249.99)
-    match = Match(canonical_name=kontakt.name, is_manual=False)
+    # Пара названа по товару, который из неё уйдёт.
+    match = Match(canonical_name=other.name, is_manual=False)
     db_session.add(match)
     db_session.flush()
     kontakt.canonical_id = irshad.canonical_id = other.canonical_id = match.id
@@ -587,6 +601,24 @@ def test_only_the_member_that_disagrees_leaves_a_three_site_pair(db_session):
 
     assert other.canonical_id is None
     assert kontakt.canonical_id == irshad.canonical_id == match.id
+    # Название пары — уже не название ушедшего, а товара клиента.
+    assert match.canonical_name == kontakt.name
+
+
+def test_renamed_product_does_not_take_its_pair_apart(db_session):
+    # Шаг 0 узкий: спорят только хвосты кода. Сайт дописал слово в название —
+    # по общим правилам это уже «не один товар», но сведённая пара остаётся.
+    a = _product(db_session, "kontakt", "JBL Tune 520BT Black", 99.99)
+    b = _product(db_session, "irshad", "JBL Tune 520BT Black", 109.99)
+    assert em.match_products(db_session) == 1
+    match_id = a.canonical_id
+    b.name = "JBL Tune 520BT Black Bluetooth Wireless"
+    db_session.commit()
+    assert em._same_product(em.signature(a.name), em.signature(b.name)) is None
+
+    em.match_products(db_session)
+
+    assert a.canonical_id == b.canonical_id == match_id
 
 
 def test_manual_pair_and_price_gap_do_not_take_a_pair_apart(db_session):

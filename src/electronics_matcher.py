@@ -233,6 +233,15 @@ _BUNDLE_RE = re.compile(r"(?:^|\s)\+(?=\s|$)")
 # отдельно (`Signature.tail`): сайт, не написавший хвост, товару не спорит, а
 # два РАЗНЫХ хвоста — разные исполнения («PSG6064/86» и «PSG6064/80»).
 _CODE_TAIL_RE = re.compile(r"(?<![0-9a-z-])([0-9a-z][0-9a-z-]{4,})/([0-9a-z]{1,3})(?=[\s,;)]|$)")
+# После косой черты у кода бывает не хвост, а характеристика («15-FD0034CI/FHD
+# IPS», «…/DOS»): такое слово срезается, но хвостом не считается.
+_NOT_A_TAIL = frozenset(
+    {"fhd", "hd", "uhd", "qhd", "ips", "oled", "dos", "win", "ssd", "hdd", "lte", "nfc", "kit"}
+)
+# Бренды, у которых хвост кода — рынок сбыта, а не исполнение: «…/TR» и «…/EV»
+# у Samsung, «.AMCN» и «.AMCE» у LG — один товар, завезённый разными путями.
+# Цвет и комплектация у них записаны в самом коде.
+_REGION_TAIL_BRANDS = frozenset({"samsung", "lg"})
 # «Wi-Fi + Cellular», «GPS + Cellular» — название модели, а не комплект.
 _NOT_BUNDLE_RE = re.compile(r"\+\s*(?=cellular|lte|4g|5g|gps)")
 _TOKEN_RE = re.compile(r"[0-9a-zа-яё]+(?:[-.][0-9a-zа-яё]+)*")
@@ -356,7 +365,8 @@ def signature(name: str | None) -> Signature | None:
     def _cut_tail(found: re.Match[str]) -> str:
         if not _is_model_code(found.group(1)):
             return found.group(0)
-        slash_tails.setdefault(found.group(1), found.group(2))
+        if found.group(2) not in _NOT_A_TAIL:
+            slash_tails.setdefault(found.group(1), found.group(2))
         return found.group(1)
 
     text = _CODE_TAIL_RE.sub(_cut_tail, text)
@@ -422,6 +432,20 @@ def _tails_agree(first: str | None, second: str | None) -> bool:
     return first.startswith(second) or second.startswith(first)
 
 
+def _tail_conflict(a: Signature, b: Signature) -> bool:
+    """Один код модели, а хвосты называют разные исполнения.
+
+    У брендов из ``_REGION_TAIL_BRANDS`` хвост — рынок, спором не считается.
+    """
+    return bool(
+        a.brand == b.brand
+        and a.code
+        and a.code == b.code
+        and a.brand not in _REGION_TAIL_BRANDS
+        and not _tails_agree(a.tail, b.tail)
+    )
+
+
 def _same_product(a: Signature, b: Signature) -> str | None:
     """Стратегия, по которой два товара — один; ``None`` — не один."""
     if a.brand != b.brand:
@@ -442,8 +466,9 @@ def _same_product(a: Signature, b: Signature) -> str | None:
         # (цвет, рынок): «MF01610US40/W» и «/T», «EC890.GR» и «EC890.M». Замер
         # 2026-11-13 на живых парах: таких было 5 из 773, четыре — заведомо
         # разные товары. Хвост только у одной стороны спором не считается, как
-        # и хвост, продолжающий другой («NGGF1» и «NGGF1-KIT»).
-        if not _tails_agree(a.tail, b.tail):
+        # и хвост, продолжающий другой («NGGF1» и «NGGF1-KIT»), и хвост-рынок
+        # у Samsung и LG.
+        if _tail_conflict(a, b):
             return None
         if a.markers != b.markers:
             return None
@@ -479,8 +504,8 @@ def _prices_agree(prices: dict[int, float], first: int, second: int) -> bool:
 def match_products(session: Session, *, tenant_id: int = 1) -> int:
     """Свести товары сайтов экземпляра в пары; возвращает число новых пар.
 
-    Существующие пары не сливаются. Разбирается пара в одном случае: её члены
-    по нынешним правилам больше не один товар (шаг 0). Новый товар входит в пару,
+    Существующие пары не сливаются. Разбирается пара в одном случае: у её
+    членов разные хвосты кода модели (шаг 0). Новый товар входит в пару,
     только если подходит каждому её члену, его сайт в ней не представлен ни
     живым, ни пропавшим товаром и другого такого же кандидата у сайта нет.
     Ручные пары (`is_manual`) не трогаются. Результат фиксируется здесь же —
@@ -550,13 +575,15 @@ def match_products(session: Session, *, tenant_id: int = 1) -> int:
             clusters[product.canonical_id].append(product.id)
     manual = set(session.scalars(select(Match.id).where(Match.is_manual.is_(True))).all())
 
-    # 0. Пары, которые нынешние правила уже не считают одним товаром,
-    #    расходятся: правило, появившееся после того как пара сведена, иначе
-    #    действовало бы только на новые пары. Цена здесь не судья — разошедшаяся
-    #    цена у сведённой пары и есть то, что показывает сравнение. Ручные пары
-    #    и товары без подписи не трогаются. Из пары уходит тот, кто спорит с
-    #    большим числом членов; при равенстве — не товар клиента, затем
-    #    записанный позже.
+    # 0. Пары с разными хвостами кода расходятся: правило о хвосте появилось
+    #    после того, как такие пары были сведены, и без этого шага действовало
+    #    бы только на новые. Шаг намеренно узкий — только спор хвостов: сверять
+    #    старые пары по всем правилам нельзя, сайт дописал слово в название — и
+    #    пара по линейке распалась бы. Ручные пары и товары без подписи не
+    #    трогаются. Из пары уходит тот, кто спорит с большим числом членов; при
+    #    равенстве — не товар клиента, затем записанный позже. Вместе с
+    #    распущенной парой уходят привязанные к ней остатки и закупочные цены
+    #    (каскад в базе, как у аптечного `revalidate_split`).
     split = 0
     for match_id in sorted(clusters):
         if match_id in manual:
@@ -567,8 +594,7 @@ def match_products(session: Session, *, tenant_id: int = 1) -> int:
             return sum(
                 1
                 for other in among
-                if other != product_id
-                and _same_product(signatures[product_id], signatures[other]) is None
+                if other != product_id and _tail_conflict(signatures[product_id], signatures[other])
             )
 
         detached: list[int] = []
@@ -591,14 +617,27 @@ def match_products(session: Session, *, tenant_id: int = 1) -> int:
         for product_id in detached:
             by_id[product_id].canonical_id = None
             clusters[match_id].remove(product_id)
+        match = session.get(Match, match_id)
         if len(clusters[match_id]) < 2:
             for product_id in clusters[match_id]:
                 by_id[product_id].canonical_id = None
-            match = session.get(Match, match_id)
             session.flush()
             if match is not None:
                 session.delete(match)
             del clusters[match_id]
+        elif match is not None:
+            # Пара осталась: её название не должно быть названием ушедшего.
+            names = {by_id[pid].name for pid in clusters[match_id]}
+            if match.canonical_name not in names:
+                anchor = next(
+                    (
+                        pid
+                        for pid in clusters[match_id]
+                        if by_id[pid].site == site_profile.CLIENT_SITE
+                    ),
+                    clusters[match_id][0],
+                )
+                match.canonical_name = by_id[anchor].name[:500]
         log.info(
             "electronics_pair_split",
             match_id=match_id,
