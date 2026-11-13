@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from src import daily_letter_state
 from src._time import utcnow
+from src import site_profile
 from src.cadence import (
     SITE_SCRAPE_CADENCE_HOURS,
     site_cadence_days,
@@ -740,7 +741,7 @@ def _check_site_drops(
     Playwright-дублей при живом каталоге ~9951; (2) после их чистки — 127/10333=1%
     из-за частичного run_277. Окно покрытия (2д) + свежести (3д) → ~99%.
     """
-    sites = ["pharmonline", "aptekonline", "aloe"]
+    sites = list(site_profile.SITES)
     issues: list[HealthIssue] = []
 
     last_run = session.get(Run, last_run_id)
@@ -980,7 +981,7 @@ def _check_site_silence(session: Session, max_age_hours: int = 26) -> list[Healt
     issues: list[HealthIssue] = []
     now = utcnow()
 
-    for site in ("pharmonline", "aptekonline", "aloe"):
+    for site in site_profile.SITES:
         # Если сайт ещё ни разу не скрейпился — пропустить
         total = (
             session.scalar(select(func.count()).select_from(Product).where(Product.site == site))
@@ -1032,7 +1033,7 @@ def _check_site_zero_scrape(
     последний прогон С ЭТИМ сайтом в `products_per_site`, поэтому intraday-прогон
     другого сайта (pharmonline featured) не маскирует 0 у aloe/aptek.
     """
-    sites = {"pharmonline", "aptekonline", "aloe"}
+    sites = set(site_profile.SITES)
     fresh_verified_catalogs = fresh_verified_catalogs or {}
     issues: list[HealthIssue] = []
     seen: set[str] = set()

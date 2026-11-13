@@ -14,6 +14,7 @@ import os
 import threading
 from datetime import datetime
 from src._time import utcnow
+from src import site_profile
 from pathlib import Path
 
 from sqlalchemy import (
@@ -1787,7 +1788,7 @@ def _terminal_run_ordering():
     )
 
 
-FULL_CATALOG_SITES = ("pharmonline", "aptekonline", "aloe")
+FULL_CATALOG_SITES = site_profile.SITES
 
 
 def latest_terminal_run(session, *, tenant_id: int | None = 1) -> Run | None:

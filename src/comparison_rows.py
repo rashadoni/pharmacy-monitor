@@ -25,6 +25,7 @@ from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
 from src import storage
+from src import site_profile
 from src._time import utcnow
 from src.category_taxonomy import classify_source_category, source_category_labels
 from src.normalize import pack_unit_count
@@ -145,7 +146,7 @@ def _comparison_spread(
 
 
 # Клиент — первым: это порядок колонок на странице и приоритет при равных ценах.
-_SITE_ORDER = {"pharmonline": 0, "aptekonline": 1, "aloe": 2}
+_SITE_ORDER = {site: position for position, site in enumerate(site_profile.SITES)}
 
 # Колонки товара, которые читает сборка строк сравнения. Грузим ровно их и
 # без ORM-объектов: в `products` лежат тяжёлые `description`/`normalized_attrs`,

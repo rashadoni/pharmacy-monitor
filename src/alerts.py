@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 from src._time import utcnow
+from src import site_profile
 from typing import Any, Callable
 
 import structlog
@@ -45,8 +46,8 @@ from src.run_lock import try_shared_scrape_read_lock
 
 log = structlog.get_logger()
 
-CLIENT_SITE = "pharmonline"
-COMPETITOR_SITES = ("aptekonline", "aloe")
+CLIENT_SITE = site_profile.CLIENT_SITE
+COMPETITOR_SITES = site_profile.COMPETITOR_SITES
 
 
 @dataclass

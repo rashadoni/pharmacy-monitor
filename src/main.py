@@ -32,7 +32,7 @@ from sqlalchemy.orm.attributes import NO_VALUE
 
 load_dotenv(override=True)
 
-from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
+from src import analyzer, matcher, notifier, reporter, site_profile, storage, watchlist  # noqa: E402
 from src import pharmonline_identity_recovery as identity_recovery  # noqa: E402
 from src import pharmonline_identity_resolution as identity_resolution  # noqa: E402
 from src.run_lock import SCRAPE_ADVISORY_LOCK_KEY  # noqa: E402
@@ -3046,11 +3046,20 @@ def _pharmonline_scraper_class() -> type[BaseScraper]:
     return PharmonlineScraper
 
 
-SCRAPER_CLASSES: dict[str, type[BaseScraper]] = {
-    "pharmonline": _pharmonline_scraper_class(),
-    "aptekonline": AptekonlineScraper,
-    "aloe": AloeScraper,
-}
+def _scraper_classes() -> dict[str, type[BaseScraper]]:
+    """Сборщики сайтов этого экземпляра — по его профилю (src/site_profile.py)."""
+    if site_profile.is_pharmacy():
+        return {
+            "pharmonline": _pharmonline_scraper_class(),
+            "aptekonline": AptekonlineScraper,
+            "aloe": AloeScraper,
+        }
+    from src.scrapers.electronics import ELECTRONICS_SCRAPERS
+
+    return dict(ELECTRONICS_SCRAPERS)
+
+
+SCRAPER_CLASSES: dict[str, type[BaseScraper]] = _scraper_classes()
 
 # Phase 1.4 (2026-05-27) — AI crawler fallback orchestration.
 #
@@ -5640,7 +5649,7 @@ _RULE_TYPES = (
 @click.option("--min-pct", type=float, default=None, help="Порог % для threshold-правил")
 @click.option(
     "--site",
-    type=click.Choice(["pharmonline", "aptekonline", "aloe"]),
+    type=click.Choice(list(site_profile.SITES)),
     default=None,
     help="Ограничить правило одним сайтом",
 )
@@ -6023,7 +6032,9 @@ def notify_test(email_to: str | None, chat_id: str | None) -> None:
 @cli.command("ai-crawl")
 @click.option(
     "--site",
-    type=click.Choice(["aloe", "pharmonline", "aptekonline"]),
+    # Запасной обходчик написан только для аптечных сайтов: у экземпляра с
+    # другим профилем выбирать не из чего.
+    type=click.Choice([site for site in AI_CRAWLER_BY_SITE if site in site_profile.SITES]),
     required=True,
     help="Сайт для AI-обхода (sitemap + LLM extraction)",
 )
@@ -7610,7 +7621,7 @@ def rematch_cmd(
             _release_matcher_lock(session)
 
 
-_VALIDATE_CLIENT_SITE = "pharmonline"  # сайт-клиент — валидировать только с --force
+_VALIDATE_CLIENT_SITE = site_profile.CLIENT_SITE  # сайт-клиент — валидировать только с --force
 
 
 @cli.command("validate-links")

@@ -4,6 +4,7 @@
 """
 
 from __future__ import annotations
+from src import site_profile
 
 import csv
 from pathlib import Path
@@ -20,7 +21,7 @@ from src.storage import (
     TrackedProductLink,
 )
 
-SITES = ("pharmonline", "aptekonline", "aloe")
+SITES = site_profile.SITES
 ALOE_BROAD_CATEGORY_SLUGS = {
     "dermanlar",
     "bad",
