@@ -443,6 +443,8 @@
     "tagline_pharmonline": "Main client site. Catalog, brands and ROI from pharmonline perspective.",
     "tagline_aptekonline": "Largest assortment competitor. Reference view for comparison with pharmonline.",
     "tagline_aloe": "Boutique competitor pharmacy. Reference view for comparison with pharmonline.",
+    "tagline_client": "The client's site. Catalogue, brands and price recommendations from its side.",
+    "tagline_competitor": "A competitor's site. A reference view of its catalogue for comparison with the client.",
     "benchmark_title": "Competitor benchmark",
     "benchmark_desc": "This is the {site} competitor catalog. Financial actions are calculated only for the client site pharmonline, so own-price raise or lower wording is not shown here.",
     "last_run": "Last run:",

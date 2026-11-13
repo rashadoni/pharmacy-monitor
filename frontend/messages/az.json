@@ -443,6 +443,8 @@
     "tagline_pharmonline": "Əsas müştəri saytı. pharmonline perspektivindən katalog, brendlər və ROI.",
     "tagline_aptekonline": "Çeşidə görə ən böyük rəqib. pharmonline ilə müqayisə üçün məlumat görünüşü.",
     "tagline_aloe": "Butik rəqib əczaxana. pharmonline ilə müqayisə üçün məlumat görünüşü.",
+    "tagline_client": "Müştərinin saytı. Kataloq, brendlər və qiymət tövsiyələri onun tərəfindən.",
+    "tagline_competitor": "Rəqibin saytı. Müştəri ilə müqayisə üçün kataloqun arayış kəsiyi.",
     "benchmark_title": "Rəqib göstəricisi",
     "benchmark_desc": "Bu, {site} rəqib kataloqudur. Maliyyə əməliyyatları yalnız müştərinin pharmonline saytı üçün hesablanır, buna görə burada öz qiymətini artırmaq və ya azaltmaq tövsiyələri göstərilmir.",
     "last_run": "Son icra:",

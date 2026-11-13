@@ -14,9 +14,10 @@ import {
 import { formatPrice } from "@/lib/utils";
 import { MetricStrip } from "@/components/metric-strip";
 import { TableSkeleton } from "@/components/skeleton";
+import { CLIENT_SITE, COMPETITOR_SITES } from "@/lib/site-profile";
 
-// Конкуренты показываем отдельными колонками (клиент = pharmonline).
-const COMPETITORS = ["aptekonline", "aloe"] as const;
+// Конкуренты показываем отдельными колонками; клиент и конкуренты — из профиля.
+const COMPETITORS = COMPETITOR_SITES;
 
 type SortKey = "misprice" | "label" | "skus" | "client" | "index" | "cheaper";
 
@@ -35,15 +36,15 @@ export default function CategoryComparisonPage() {
 
   const { data, isLoading, error, isFetching } = useQuery({
     queryKey: ["category-comparison", locale],
-    queryFn: () => api.categoryComparison("pharmonline", locale),
+    queryFn: () => api.categoryComparison(CLIENT_SITE, locale),
   });
   const { data: coverage, isLoading: isCoverageLoading } = useQuery({
-    queryKey: ["category-comparison-coverage", "pharmonline"],
-    queryFn: () => api.categoryComparisonCoverage("pharmonline"),
+    queryKey: ["category-comparison-coverage", CLIENT_SITE],
+    queryFn: () => api.categoryComparisonCoverage(CLIENT_SITE),
   });
   const { data: catalogRows, isLoading: isCatalogLoading } = useQuery({
-    queryKey: ["category-comparison-catalog", "pharmonline", locale],
-    queryFn: () => api.categoryCatalog("pharmonline", locale),
+    queryKey: ["category-comparison-catalog", CLIENT_SITE, locale],
+    queryFn: () => api.categoryCatalog(CLIENT_SITE, locale),
   });
   const catalogByCategory = useMemo(
     () =>
@@ -708,7 +709,7 @@ function CategoryCard({
       <div className="grid grid-cols-3 gap-2 mt-2 text-center">
         <div>
           <div className="text-[10px] text-muted-foreground uppercase">
-            pharmonline
+            {CLIENT_SITE}
           </div>
           <div className="tabular-nums text-sm">
             {formatPrice(row.avg_client_price, locale)}

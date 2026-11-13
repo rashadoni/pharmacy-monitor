@@ -24,6 +24,7 @@ import { OnboardingTip } from "@/components/onboarding-tip";
 import { QueryErrorState } from "@/components/query-error-state";
 import { useRouter } from "@/i18n/navigation";
 import { choiceParam, integerParam, queryWithPatch } from "@/lib/filter-query";
+import { SITES, isProfileSite, siteDomain } from "@/lib/site-profile";
 
 const SEVERITY_CONFIG = {
   critical: {
@@ -80,7 +81,7 @@ export default function AlertsPage() {
   const siteFilter = choiceParam(
     parsedParams,
     "site",
-    ["", "pharmonline", "aptekonline", "aloe", "general"] as const,
+    ["", ...SITES, "general"],
     "",
   );
   const sortOrder = choiceParam(
@@ -343,9 +344,11 @@ export default function AlertsPage() {
               className="min-h-11 min-w-0 rounded-md border border-border bg-card px-3 py-1 text-xs font-normal text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
             >
               <option value="">{t("filter_all_sites")}</option>
-              <option value="pharmonline">{t("site_pharmonline")}</option>
-              <option value="aptekonline">{t("site_aptekonline")}</option>
-              <option value="aloe">{t("site_aloe")}</option>
+              {SITES.map((site) => (
+                <option key={site} value={site}>
+                  {siteDomain(site)}
+                </option>
+              ))}
               <option value="general">{t("site_general")}</option>
             </select>
           </div>
@@ -645,13 +648,9 @@ function AlertCard({
   const Icon = cfg.icon;
   const dimmed = event.is_read;
   const siteLabel =
-    event.site === "pharmonline"
-      ? t("site_pharmonline")
-      : event.site === "aptekonline"
-        ? t("site_aptekonline")
-        : event.site === "aloe"
-          ? t("site_aloe")
-          : t("site_general_short");
+    event.site !== null && isProfileSite(event.site)
+      ? siteDomain(event.site)
+      : t("site_general_short");
   const severityLabel =
     event.severity === "critical"
       ? t("severity_critical")

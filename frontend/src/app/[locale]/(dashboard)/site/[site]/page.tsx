@@ -19,6 +19,7 @@ import { formatPrice, formatRelative, formatTime } from "@/lib/utils";
 import { QueryErrorState } from "@/components/query-error-state";
 import { useRouter } from "@/i18n/navigation";
 import { integerParam, queryWithPatch } from "@/lib/filter-query";
+import { CLIENT_SITE, IS_PHARMACY, SITES, siteDomain } from "@/lib/site-profile";
 
 const PAGE_LIMIT = 50;
 
@@ -56,26 +57,28 @@ function prettyCategoryLabel(c: { name: string; label?: string }): string {
   return label;
 }
 
-const VALID_SITES = ["pharmonline", "aptekonline", "aloe"] as const;
-type SiteName = (typeof VALID_SITES)[number];
+const VALID_SITES: readonly string[] = SITES;
+type SiteName = string;
 
-const SITE_META: Record<SiteName, { icon: typeof Leaf; iconColor: string; taglineKey: string }> = {
-  pharmonline: {
-    icon: Building2,
-    iconColor: "text-primary",
-    taglineKey: "tagline_pharmonline",
-  },
-  aptekonline: {
-    icon: Pill,
-    iconColor: "text-warning",
-    taglineKey: "tagline_aptekonline",
-  },
-  aloe: {
-    icon: Leaf,
-    iconColor: "text-success",
-    taglineKey: "tagline_aloe",
-  },
-};
+// Оформление — по месту сайта в профиле: клиент первым. Подписи аптечных
+// сайтов написаны под каждый из них; у другого профиля — общие для клиента и
+// для конкурента.
+const SITE_LOOKS = [
+  { icon: Building2, iconColor: "text-primary", pharmacyTaglineKey: "tagline_pharmonline" },
+  { icon: Pill, iconColor: "text-warning", pharmacyTaglineKey: "tagline_aptekonline" },
+  { icon: Leaf, iconColor: "text-success", pharmacyTaglineKey: "tagline_aloe" },
+] as const;
+
+function siteMeta(site: SiteName): { icon: typeof Leaf; iconColor: string; taglineKey: string } {
+  const position = Math.max(0, VALID_SITES.indexOf(site));
+  const look = SITE_LOOKS[position % SITE_LOOKS.length];
+  const taglineKey = IS_PHARMACY
+    ? look.pharmacyTaglineKey
+    : site === CLIENT_SITE
+      ? "tagline_client"
+      : "tagline_competitor";
+  return { icon: look.icon, iconColor: look.iconColor, taglineKey };
+}
 
 function competitorsOf(site: SiteName): SiteName[] {
   return VALID_SITES.filter((s) => s !== site);
@@ -92,7 +95,7 @@ export default function SitePage() {
     notFound();
   }
   const site = siteParam as SiteName;
-  const meta = SITE_META[site];
+  const meta = siteMeta(site);
   const Icon = meta.icon;
   const competitors = competitorsOf(site);
 
@@ -111,7 +114,7 @@ export default function SitePage() {
   const recommendationsQ = useQuery({
     queryKey: ["site", site, "roi-recommendations", locale],
     queryFn: () => api.roiRecommendations(site, locale),
-    enabled: site === "pharmonline",
+    enabled: site === CLIENT_SITE,
   });
   const roiWaitingForVerifiedScan = isVerifiedScanPendingError(recommendationsQ.error);
   const pageDataError = summaryQ.error ?? facetsQ.error ?? brandsQ.error;
@@ -121,7 +124,7 @@ export default function SitePage() {
       <header className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
-            <Icon className={`h-6 w-6 ${meta.iconColor}`} /> {site}.az
+            <Icon className={`h-6 w-6 ${meta.iconColor}`} /> {siteDomain(site)}
           </h1>
           <p className="text-sm text-muted-foreground">{t(meta.taglineKey as any)}</p>
         </div>
@@ -184,7 +187,7 @@ export default function SitePage() {
         />
       </section>
 
-      {site === "pharmonline" ? <section>
+      {site === CLIENT_SITE ? <section>
         <h2 className="text-lg font-semibold mb-3">{t("roi_title")}</h2>
         <p className="text-xs text-muted-foreground mb-3">
           {t("roi_subtitle", { site, competitors: competitors.join("/") })}

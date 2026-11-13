@@ -33,6 +33,7 @@ import { Sparkline } from "@/components/sparkline";
 import { TableSkeleton } from "@/components/skeleton";
 import { OthersSection } from "./others-section";
 import { MIN_SEARCH_CHARS, SearchBox } from "./search-box";
+import { CLIENT_SITE, IS_PHARMACY } from "@/lib/site-profile";
 import { SITES, type SiteName } from "./sites";
 
 type SortKey = "name" | "brand" | "spread" | SiteName;
@@ -90,7 +91,7 @@ export default function ComparisonPage() {
   const searching = query.length >= MIN_SEARCH_CHARS;
   const minSites = initialMinSites(searchParams.get("min_sites"));
   const diffOnly = searchParams.get("diff") === "1";
-  const withAloe = searchParams.get("aloe") === "1";
+  const withAloe = IS_PHARMACY && searchParams.get("aloe") === "1";
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const { key: sortKey, dir: sortDir } = initialSort(searchParams.get("sort"));
   const sort = useMemo(
@@ -388,12 +389,14 @@ export default function ComparisonPage() {
             <option value="name:desc">{t("th_name")} ↓</option>
             <option value="brand:asc">{t("th_brand")} ↑</option>
             <option value="brand:desc">{t("th_brand")} ↓</option>
-            <option value="pharmonline:asc">pharmonline ↑</option>
-            <option value="pharmonline:desc">pharmonline ↓</option>
-            <option value="aptekonline:asc">aptekonline ↑</option>
-            <option value="aptekonline:desc">aptekonline ↓</option>
-            <option value="aloe:asc">aloe ↑</option>
-            <option value="aloe:desc">aloe ↓</option>
+            {SITES.flatMap((site) => [
+              <option key={`${site}:asc`} value={`${site}:asc`}>
+                {site} ↑
+              </option>,
+              <option key={`${site}:desc`} value={`${site}:desc`}>
+                {site} ↓
+              </option>,
+            ])}
           </optgroup>
         </select>
         <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9">
@@ -404,14 +407,18 @@ export default function ComparisonPage() {
           />
           <span>{t("diff_only_filter")}</span>
         </label>
-        <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9">
-          <input
-            type="checkbox"
-            checked={withAloe}
-            onChange={(e) => updateQuery("aloe", e.target.checked ? "1" : null)}
-          />
-          <span>{t("with_aloe_filter")}</span>
-        </label>
+        {/* «Только с aloe» — фильтр аптечного экземпляра: у aloe каталог
+            заметно меньше двух других. У другого профиля его нет. */}
+        {IS_PHARMACY ? (
+          <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9">
+            <input
+              type="checkbox"
+              checked={withAloe}
+              onChange={(e) => updateQuery("aloe", e.target.checked ? "1" : null)}
+            />
+            <span>{t("with_aloe_filter")}</span>
+          </label>
+        ) : null}
       </div>
 
       {/* Drill-down filter chip (из /category-comparison) */}
@@ -597,7 +604,7 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
   // По умолчанию клиент = pharmonline (см. roi.CLIENT_SITE). Stable, простой
   // эвристический сигнал направления цены: если pharmonline cheapest →
   // зелёный ▼; если cheapest другой → красный ▲ (конкурент бьёт нас по цене).
-  const clientCheapest = row.cheapest_site === "pharmonline";
+  const clientCheapest = row.cheapest_site === CLIENT_SITE;
   const Icon = clientCheapest
     ? () => <span aria-hidden>▼</span>
     : () => <span aria-hidden>▲</span>;
