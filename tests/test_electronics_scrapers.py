@@ -1708,9 +1708,29 @@ def irshad_renumbered(page_html: str, mapping: dict[str, str]) -> str:
     return page_html
 
 
-async def test_irshad_card_seen_on_two_pages_means_the_listing_shifted():
-    # Товар переехал выше, пока шёл обход: его карточка пришла второй раз, а
-    # какой-то другой товар мог не попасть ни на одну страницу.
+async def test_irshad_card_shown_again_on_a_later_page_is_skipped_not_a_break():
+    # Товар с несколькими цветами сайт ставит в список на месте каждого цвета:
+    # на живом сайте карточка 65715 стоит на 7-й и на 16-й страницах раздела
+    # (замер 2026-11-13). Раньше повтор обрывал раздел при каждой попытке.
+    scraper = fast(IrshadScraper)
+    first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
+    second = irshad_renumbered(IRSHAD_LAST_PAGE, {"108751": "200002", "85759": "200003"})
+    second = second.replace('value="108719"', 'value="200004"').replace(
+        'data-selected-id="108719"', 'data-selected-id="200004"'
+    )
+    seen = serve(scraper, irshad_site({"1": first, "2": second}))
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    # Карточка 108753 пришла второй раз и пропущена; новые товары взяты.
+    ids = [p.external_id for p in products]
+    assert ids.count("108753") == 1
+    assert {"200002", "200003"} <= set(ids)
+    assert status.complete and status.abort_reason is None
+    assert len(seen) == 3  # две страницы и подтверждение конца, без повтора прохода
+
+
+async def test_irshad_page_made_only_of_cards_already_seen_is_a_break():
+    # Та же страница второй раз — листание сломано; это не «повтор цвета».
     scraper = fast(IrshadScraper)
     first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
     seen = serve(scraper, irshad_site({"1": first, "2": IRSHAD_LAST_PAGE}))
@@ -1718,7 +1738,7 @@ async def test_irshad_card_seen_on_two_pages_means_the_listing_shifted():
     status = scraper._route_statuses["c"]
     assert len(products) == 4
     assert not status.complete
-    assert status.abort_reason == "listing_shifted_between_pages"
+    assert status.abort_reason == "listing_page_repeated"
     assert len(seen) == 2 * IrshadScraper.category_attempts
 
 
