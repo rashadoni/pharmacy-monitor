@@ -278,6 +278,43 @@ def test_model_code_is_found_whatever_surrounds_it():
         ("Apple iPad 10.9 64GB Wi-Fi + Cellular Silver", "Apple iPad 10.9 64GB Wi-Fi Silver", None),
         # Прописная «İ» не ломает бренд.
         ("İndesit IWSC 51051", "Indesit IWSC 51051", None),
+        # Хвост заводского кода (замер на живых парах 2026-11-13): названный у
+        # обоих и разный — разные исполнения; у одного — подробность сайта.
+        ("Paltaryuyan maşın Midea MF01610US40/W", "MIDEA MF01610US40/T", None),
+        (
+            "Buxar generatorlu ütü Philips PSG6064/86, PerfectCare Series 6000",
+            "Philips PSG6064/80",
+            None,
+        ),
+        ("Qəhvə maşını DeLonghi Dedica Duo EC890.GR VeroCafe", "Delonghi EC890.M", None),
+        ("Tozsoran Philips XB2022/01", "Tozsoran Philips XB2022/81", None),
+        # У Samsung и LG хвост — рынок сбыта, а не исполнение: тот же товар.
+        (
+            "Robot tozsoran Samsung VR3MB77312K/TR",
+            "Samsung VR3MB77312K/EV",
+            em.STRATEGY_CODE,
+        ),
+        ("Paltaryuyan Samsung WW80T4020CE/LP", "Samsung WW80T4020CE/LE", em.STRATEGY_CODE),
+        ("Televizor LG 55UR78006LK.AMCN", "LG 55UR78006LK.AMCE", em.STRATEGY_CODE),
+        # Характеристика после косой черты — не хвост кода.
+        (
+            "Notbuk HP 15-FD0034CI/FHD IPS",
+            "Notbuk HP 15-FD0034CI/DOS",
+            em.STRATEGY_CODE,
+        ),
+        (
+            "Mikrodalğalı soba Samsung MS23K3614AK/BW",
+            "Samsung MS23K3614AK/BW",
+            em.STRATEGY_CODE,
+        ),
+        ("Mikrodalğalı soba Samsung MS23K3614AK/BW", "Samsung MS23K3614AK", em.STRATEGY_CODE),
+        ("Soyuducu LG LBB459EQYW.AEPQMER", "LG LBB459EQYW", em.STRATEGY_CODE),
+        # Хвост, продолжающий другой, — тот же товар, записанный подробнее.
+        (
+            "Kondisioner LG DualCool AI DA24CEH.NGGF1-KIT, 24000 BTU",
+            "Kondisioner LG DA24CEH.NGGF1",
+            em.STRATEGY_CODE,
+        ),
     ],
 )
 def test_pair_rule(first, second, strategy):
@@ -526,3 +563,82 @@ def test_dead_page_and_foreign_site_are_not_matched(db_session):
     _product(db_session, "aloe", "LG 55UR78006LK", 1249)
     db_session.flush()
     assert em.match_products(db_session) == 0
+
+
+def test_pair_that_the_rules_no_longer_accept_comes_apart(db_session):
+    # Пара сведена раньше, чем появилось правило о хвосте кода: без шага 0
+    # правило действовало бы только на новые пары.
+    a = _product(db_session, "bakuelectronics", "Paltaryuyan maşın Midea MF01610US40/W", 549.99)
+    b = _product(db_session, "irshad", "MIDEA MF01610US40/T", 559.99)
+    stale = Match(canonical_name=a.name, is_manual=False)
+    db_session.add(stale)
+    db_session.flush()
+    a.canonical_id = b.canonical_id = stale.id
+    stale_id = stale.id
+    db_session.commit()
+
+    em.match_products(db_session)
+
+    assert (a.canonical_id, b.canonical_id) == (None, None)
+    assert db_session.get(Match, stale_id) is None
+    # Второй прогон пару не возвращает.
+    assert em.match_products(db_session) == 0
+    assert _clusters(db_session) == []
+
+
+def test_only_the_member_that_disagrees_leaves_a_three_site_pair(db_session):
+    kontakt = _product(db_session, "kontakt", "Tozsoran Philips XB2022/81", 219.99)
+    irshad = _product(db_session, "irshad", "Philips XB2022/81", 229.99)
+    other = _product(db_session, "bakuelectronics", "Tozsoran Philips XB2022/01", 249.99)
+    # Пара названа по товару, который из неё уйдёт.
+    match = Match(canonical_name=other.name, is_manual=False)
+    db_session.add(match)
+    db_session.flush()
+    kontakt.canonical_id = irshad.canonical_id = other.canonical_id = match.id
+    db_session.commit()
+
+    em.match_products(db_session)
+
+    assert other.canonical_id is None
+    assert kontakt.canonical_id == irshad.canonical_id == match.id
+    # Название пары — уже не название ушедшего, а товара клиента.
+    assert match.canonical_name == kontakt.name
+
+
+def test_renamed_product_does_not_take_its_pair_apart(db_session):
+    # Шаг 0 узкий: спорят только хвосты кода. Сайт дописал слово в название —
+    # по общим правилам это уже «не один товар», но сведённая пара остаётся.
+    a = _product(db_session, "kontakt", "JBL Tune 520BT Black", 99.99)
+    b = _product(db_session, "irshad", "JBL Tune 520BT Black", 109.99)
+    assert em.match_products(db_session) == 1
+    match_id = a.canonical_id
+    b.name = "JBL Tune 520BT Black Bluetooth Wireless"
+    db_session.commit()
+    assert em._same_product(em.signature(a.name), em.signature(b.name)) is None
+
+    em.match_products(db_session)
+
+    assert a.canonical_id == b.canonical_id == match_id
+
+
+def test_manual_pair_and_price_gap_do_not_take_a_pair_apart(db_session):
+    # Ручную пару автомат не разбирает, даже если правила с ней не согласны.
+    a = _product(db_session, "kontakt", "Philips PSG6064/86", 749.99)
+    b = _product(db_session, "irshad", "Philips PSG6064/80", 549.99)
+    manual = Match(canonical_name=a.name, is_manual=True)
+    db_session.add(manual)
+    db_session.flush()
+    a.canonical_id = b.canonical_id = manual.id
+    # Цена сведённой пары разошлась втрое: это и показывает сравнение.
+    c = _product(db_session, "kontakt", "LG 55UR78006LK", 3000)
+    d = _product(db_session, "irshad", "LG 55UR78006LK", 1000)
+    auto = Match(canonical_name=c.name, is_manual=False)
+    db_session.add(auto)
+    db_session.flush()
+    c.canonical_id = d.canonical_id = auto.id
+    db_session.commit()
+
+    em.match_products(db_session)
+
+    assert a.canonical_id == b.canonical_id == manual.id
+    assert c.canonical_id == d.canonical_id == auto.id
