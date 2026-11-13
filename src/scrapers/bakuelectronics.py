@@ -74,6 +74,11 @@ _MAX_PAGES = 600
 _NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
 # Страницы под /catalog/, которые не разделы каталога.
 _NOT_CATEGORIES = {"muqayise-et"}
+# Карточка без названия на сайте — редкость (одна на 12 тысяч, замер
+# 2026-11-13). Больше этого числа в одном разделе — уже не битая карточка, а
+# смена формата ответа: раздел считается неполным, иначе названия всего
+# каталога молча заменились бы адресами страниц.
+_MAX_ITEMS_WITHOUT_NAME = 5
 _OWN_DOMAIN = "bakuelectronics.az"
 _LANGUAGE_PREFIXES = {"az", "ru", "en"}
 
@@ -103,13 +108,35 @@ def section_from_menu_link(link: str) -> str | None:
     return "/".join(segments[1:])
 
 
+def _name_from_slug(slug: str, code: str) -> str:
+    """Название для карточки без названия: адрес страницы без кода товара."""
+    words = [word for word in slug.split("-") if word]
+    if words and words[-1] == code:
+        words = words[:-1]
+    return " ".join(" ".join(words).split())
+
+
+def _has_no_name(item: dict) -> bool:
+    return not " ".join(str(item.get("name") or "").split())
+
+
 def build_product(item: dict, category_slug: str) -> ScrapedProduct | None:
     """Товар из записи ``items``; ``None``, если его не опознать."""
     code = item.get("product_code")
     name = " ".join(str(item.get("name") or "").split())
     slug = str(item.get("slug") or "").strip().strip("/")
-    if code in (None, "") or isinstance(code, bool) or not name or not slug:
+    if code in (None, "") or isinstance(code, bool) or not slug:
         return None
+    if not name:
+        # На сайте встречается карточка без названия (код, цена и адрес есть,
+        # `name: null` — замер 2026-11-13, раздел посуды). Это товар сайта, а не
+        # сбой разбора: отвергнуть запись значило бы каждую ночь объявлять
+        # неполным весь каталог из-за одной битой карточки. Название берётся из
+        # адреса страницы — другого у сайта нет.
+        name = _name_from_slug(slug, str(code).strip())
+        if not name:
+            return None
+        log.warning("bakuelectronics_item_without_name", product_code=str(code), slug=slug[:120])
 
     regular = price_or_none(item.get("price"))
     final = price_or_none(item.get("discounted_price"))
@@ -317,6 +344,7 @@ class BakuElectronicsScraper(HttpCatalogScraper):
     async def _collect_category(self, category_slug: str, limit: int | None) -> CategoryPass:
         result = CategoryPass()
         seen: set[str] = set()
+        without_name = 0
         page = 1
         while page <= _MAX_PAGES:
             try:
@@ -345,6 +373,8 @@ class BakuElectronicsScraper(HttpCatalogScraper):
                 if product is None:
                     result.item_failures += 1
                     continue
+                if _has_no_name(item):
+                    without_name += 1
                 if product.external_id in seen:
                     continue
                 seen.add(product.external_id)
@@ -359,6 +389,9 @@ class BakuElectronicsScraper(HttpCatalogScraper):
             result.abort_reason = "page_limit_reached"
             return result
 
+        if without_name > _MAX_ITEMS_WITHOUT_NAME:
+            result.abort_reason = "too_many_items_without_name"
+            return result
         if not counted_pass_is_complete(result):
             result.abort_reason = (
                 "item_parse_failures" if result.item_failures else "item_count_mismatch"

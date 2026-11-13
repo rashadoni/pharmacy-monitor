@@ -998,6 +998,55 @@ def be_menu(links):
     ]
 
 
+def test_bakuelectronics_card_without_a_name_is_still_a_product():
+    # Живой случай 2026-11-13: карточка с кодом, ценой и адресом, а `name: null`.
+    # Первый полный сбор сайта из-за неё был отвергнут целиком.
+    item = be_item(code=198095, price=899.99, discounted=899.99)
+    item["name"] = None
+    item["slug"] = "lefard-yemk-dsti-6-nfrlik-23-parca-vremena-goda-198095"
+    product = build_be_product(item, "qab-qacaq-tava-qazan")
+    assert product is not None
+    assert product.external_id == "198095"
+    assert product.name == "lefard yemk dsti 6 nfrlik 23 parca vremena goda"
+    assert product.price == 899.99
+
+    # Без кода или без адреса товара по-прежнему нет: узнать его не по чему.
+    assert build_be_product({**item, "product_code": None}, "c") is None
+    assert build_be_product({**item, "slug": ""}, "c") is None
+    # Адрес из одного кода названия не даёт.
+    assert build_be_product({**item, "slug": "198095"}, "c") is None
+
+
+@pytest.mark.parametrize(("nameless", "complete"), [(5, True), (6, False)])
+async def test_bakuelectronics_many_cards_without_names_make_the_section_incomplete(
+    nameless, complete
+):
+    # Одна-две карточки без названия — битые карточки сайта. Больше пяти в
+    # разделе — сайт сменил формат: принять такой раздел значило бы заменить
+    # названия адресами страниц.
+    items = []
+    for number in range(12):
+        item = be_item(code=1000 + number)
+        item["slug"] = f"tovar-{1000 + number}"
+        if number < nameless:
+            item["name"] = None
+        items.append(item)
+    scraper = fast(BakuElectronicsScraper)
+
+    def site(request):
+        if urlsplit(str(request.url)).path == "/":
+            return httpx.Response(200, text=be_home())
+        return httpx.Response(200, json=be_page(items, len(items)))
+
+    serve(scraper, site)
+    products = [product async for product in scraper.scrape_category("c")]
+    status = scraper._route_statuses["c"]
+    assert status.complete is complete
+    assert len(products) == 12
+    if not complete:
+        assert status.abort_reason == "too_many_items_without_name"
+
+
 def test_bakuelectronics_product_fields():
     product = build_be_product(be_item(), "telefonlar-qadcetler/smartfonlar-mobil-telefonlar")
     assert product.site == "bakuelectronics"
@@ -1020,7 +1069,7 @@ def test_bakuelectronics_no_sale_no_stock_and_no_identity():
     assert (product.price, product.discount_price, product.is_on_sale) == (629.99, None, False)
     assert product.offer_availability_status == "out_of_stock"
     assert build_be_product(be_item(quantity=None), "c").offer_availability_status == "unknown"
-    for field in ("product_code", "name", "slug"):
+    for field in ("product_code", "slug"):  # без названия — товар, см. тест ниже
         item = be_item()
         item[field] = None
         assert build_be_product(item, "c") is None
