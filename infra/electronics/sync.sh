@@ -42,8 +42,10 @@ for site in bakuelectronics irshad; do
 done
 # Сбор или загрузка каталога, запущенные руками командой electro-monitor,
 # идут во временном юните; их видно только по процессу.
-if pgrep -u pm -f 'python -m src\.main (run|scrape|catalog|rematch)' >/dev/null 2>&1; then
-    echo "sync: идёт ручная команда экземпляра (run / scrape / catalog / rematch) — пропуск"
+if pgrep -u pm -f 'python -m src\.main( --log-level [A-Za-z]+)? (run|scrape|catalog|rematch)' >/dev/null 2>&1; then
+    # Так же запускаются аптечные сборы из GitHub Actions: совпадение по времени
+    # отложит синхронизацию до следующего запуска — это безвредно.
+    echo "sync: идёт команда run / scrape / catalog / rematch — пропуск"
     exit 0
 fi
 

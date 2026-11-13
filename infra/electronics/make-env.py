@@ -80,7 +80,11 @@ def main() -> int:
     parts = urlsplit(raw_url)
     current = parts.path.lstrip("/")
     if not current or "/" in current or current == database:
-        print("адрес аптечной базы не содержит имени базы или уже называет новую", file=sys.stderr)
+        print(
+            "из адреса аптечной базы не удалось взять имя базы (или оно уже новое). Так бывает, "
+            "когда в пароле стоит «/», «?» или «#» без кодирования: файл не создан",
+            file=sys.stderr,
+        )
         return 1
     if not parts.username:
         print("в адресе аптечной базы нет имени роли PostgreSQL", file=sys.stderr)

@@ -195,8 +195,21 @@ def test_caddy_is_changed_only_through_a_validated_copy():
 
 
 # На сервере помощник исполняет системный интерпретатор в изолированном режиме,
-# без пакетов проекта; здесь — он же, если есть, и интерпретатор тестов.
-SYSTEM_PYTHON = ["/usr/bin/python3", "-I"] if Path("/usr/bin/python3").exists() else None
+# без пакетов проекта. Хеш пароля ему даёт пакет bcrypt, а без него — модуль
+# crypt (в Python 3.13 его уже нет): где нет ни того ни другого, тест пропускается.
+def _usable(interpreter: list[str], module: str) -> bool:
+    try:
+        probe = subprocess.run([*interpreter, "-c", f"import {module}"], capture_output=True)
+    except OSError:
+        return False
+    return probe.returncode == 0
+
+
+_SYSTEM = ["/usr/bin/python3", "-I"]
+SYSTEM_PYTHON = _SYSTEM if _usable(_SYSTEM, "bcrypt") or _usable(_SYSTEM, "crypt") else None
+# Интерпретатор тестов без пакетов проекта: пакета bcrypt не видит, идёт через crypt.
+_BARE = [sys.executable, "-I", "-S"]
+BARE_PYTHON = _BARE if not _usable(_BARE, "bcrypt") and _usable(_BARE, "crypt") else None
 
 
 def _make_env(tmp_path, source_text, interpreter=(sys.executable,)):
@@ -308,6 +321,17 @@ def test_environment_helper_runs_on_the_bare_system_interpreter(tmp_path):
     assert values["DATABASE_URL"].endswith(
         "/electro_monitor?sslmode=require&application_name=pm/api"
     )
+
+
+@pytest.mark.skipif(BARE_PYTHON is None, reason="нет интерпретатора с crypt и без bcrypt")
+def test_password_hash_made_without_the_bcrypt_package_still_opens_the_login(tmp_path):
+    done, _, values = _make_env(tmp_path, PHARMACY_ENV, interpreter=BARE_PYTHON)
+    assert done.returncode == 0, done.stderr
+    import bcrypt
+
+    _, password = done.stdout.splitlines()
+    assert bcrypt.checkpw(password.encode(), values["ADMIN_PASSWORD_HASH"].encode())
+    assert not bcrypt.checkpw(b"another password", values["ADMIN_PASSWORD_HASH"].encode())
 
 
 def test_environment_helper_refuses_instead_of_guessing(tmp_path):
