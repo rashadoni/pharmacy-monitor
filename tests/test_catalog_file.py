@@ -337,25 +337,30 @@ def test_file_much_smaller_than_the_last_accepted_one_is_refused(tmp_path):
     assert "в прошлой принятой загрузке было 20" in done.stdout + done.stderr
     assert _db(tmp_path, "select count(*) from runs")[0][0] == 1
 
-    # 18 из 20 проходит; а 17 — только по явному слову.
-    ok = _write(tmp_path, header + "".join(rows.splitlines(keepends=True)[:18]), name="ok.csv")
+    # Настоящее сокращение — 12 из 20 — проходит только по явному слову и тогда
+    # принимается целиком: прогон «ok», системе можно верить его ценам.
+    small = _write(
+        tmp_path, header + "".join(rows.splitlines(keepends=True)[:12]), name="small.csv"
+    )
+    args = ("catalog", "import", "--site", "kontakt", str(small))
+    assert _cli(tmp_path, "electronics", *args).returncode != 0
+    assert _db(tmp_path, "select count(*) from runs")[0][0] == 1
+    done = _cli(tmp_path, "electronics", *args, "--allow-shrink", "--no-alerts")
+    assert done.returncode == 0, (done.stdout + done.stderr)[-2000:]
+    status, products, quality = _db(
+        tmp_path, "select status, products_scraped, run_quality from runs order by id desc limit 1"
+    )[0]
+    assert (status, products) == ("ok", 12)
+    assert json.loads(quality)["financially_eligible"] is True
+
+    # Мерка теперь 12: файл в 11 товаров (больше девяти десятых) проходит сам.
+    eleven = _write(tmp_path, header + "".join(rows.splitlines(keepends=True)[:11]), name="11.csv")
     assert (
-        _cli(tmp_path, "electronics", "catalog", "import", "--site", "kontakt", str(ok)).returncode
+        _cli(
+            tmp_path, "electronics", "catalog", "import", "--site", "kontakt", str(eleven)
+        ).returncode
         == 0
     )
-    done = _cli(
-        tmp_path,
-        "electronics",
-        "catalog",
-        "import",
-        "--site",
-        "kontakt",
-        str(part),
-        "--allow-shrink",
-        "--no-alerts",
-    )
-    assert done.returncode == 0, (done.stdout + done.stderr)[-2000:]
-    assert _db(tmp_path, "select products_scraped from runs order by id") == [(20,), (18,), (17,)]
 
 
 def test_refused_file_writes_nothing(tmp_path):

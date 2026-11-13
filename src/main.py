@@ -3300,6 +3300,12 @@ def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
     return True
 
 
+# Сайты, для которых прогон не сверяет число товаров с прошлыми прогонами.
+# Заполняет только `catalog import --allow-shrink` на время своего прогона:
+# человек сказал, что каталог и правда сократился.
+_BASELINE_WAIVED_SITES: set[str] = set()
+
+
 def baselines_for_sites(session: Session, sites: list[str]) -> dict[str, int | None]:
     """Pre-fetch products_per_site from latest ok run for each requested site.
 
@@ -3317,7 +3323,7 @@ def baselines_for_sites(session: Session, sites: list[str]) -> dict[str, int | N
         return out
     for site in sites:
         val = last_ok.products_per_site.get(site)
-        if isinstance(val, int) and val > 0:
+        if isinstance(val, int) and val > 0 and site not in _BASELINE_WAIVED_SITES:
             out[site] = val
     return out
 
@@ -3367,7 +3373,7 @@ def run_quality_baselines_for_sites(
 
     out: dict[str, int | None] = {}
     for site, values in candidates.items():
-        if not values:
+        if not values or site in _BASELINE_WAIVED_SITES:
             out[site] = None
             continue
         sample = sorted(values[:5])
@@ -7919,16 +7925,23 @@ def catalog_import(
         # деле, он не говорит. Единственная мерка — прошлая принятая загрузка
         # этого же сайта. Общая проверка прогона для этого не годится: она
         # сравнивает с последним удачным прогоном любого сайта экземпляра.
-        previous_count = session.scalar(
-            select(storage.Run.products_scraped)
-            .where(
-                storage.Run.sites_completed == site,
-                storage.Run.catalog_scope == "full",
-                storage.Run.catalog_verified.is_(True),
-                storage.Run.status == "ok",
-            )
-            .order_by(storage.Run.id.desc())
-            .limit(1)
+        previous_count = next(
+            (
+                run.products_scraped
+                for run in session.scalars(
+                    select(storage.Run)
+                    .where(
+                        storage.Run.sites_completed == site,
+                        storage.Run.catalog_scope == "full",
+                        storage.Run.status == "ok",
+                    )
+                    .order_by(storage.Run.id.desc())
+                    .limit(20)
+                ).all()
+                # Мерка — только загрузка, которой система поверила целиком.
+                if storage.run_is_financially_eligible(run)
+            ),
+            None,
         )
         floor = catalog_file.MIN_FRACTION_OF_PREVIOUS
         if previous_count and len(catalog.products) < previous_count * floor and not allow_shrink:
@@ -7945,6 +7958,11 @@ def catalog_import(
 
     previous = SCRAPER_CLASSES.get(site)
     SCRAPER_CLASSES[site] = catalog_file.file_scraper(site, catalog)
+    if allow_shrink:
+        # Явное слово человека снимает и общие проверки прогона на число
+        # товаров: иначе файл прошёл бы ворота здесь и был бы отвергнут там,
+        # уже записав цены.
+        _BASELINE_WAIVED_SITES.add(site)
     try:
         ctx.invoke(
             run_cmd,
@@ -7959,6 +7977,7 @@ def catalog_import(
             request_id=None,
         )
     finally:
+        _BASELINE_WAIVED_SITES.discard(site)
         if previous is not None:
             SCRAPER_CLASSES[site] = previous
 

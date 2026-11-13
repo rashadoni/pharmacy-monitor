@@ -155,6 +155,59 @@ def test_model_code_is_found_whatever_surrounds_it():
         # Аксессуар под именем модели.
         ("Çexol Samsung Galaxy A55 Black", "Samsung Galaxy A55 Black", None),
         ("Samsung Galaxy S24 Ultra üçün çexol Black", "Samsung Galaxy S24 Ultra Black", None),
+        # Вторая охота разбора: 4K, NFC, Nano, мышь и клавиатура — признаки товара.
+        ("Xiaomi Mi TV Stick 4K Black", "Xiaomi Mi TV Stick Black", None),
+        ("Google Chromecast 4K White", "Google Chromecast HD White", None),
+        (
+            "Xiaomi Redmi 13C NFC 4/128GB Midnight Black",
+            "Xiaomi Redmi 13C 4/128GB Midnight Black",
+            None,
+        ),
+        ("Xiaomi Smart Band 8 NFC Black", "Xiaomi Smart Band 8 Black", None),
+        ("TP-Link Archer T3U Nano", "TP-Link Archer T3U", None),
+        ("Apple Magic Mouse White", "Apple Magic Keyboard White", None),
+        ("HP 150 Wired Mouse Black", "HP 150 Wired Keyboard Black", None),
+        ("Logitech G Pro Mouse Black", "Logitech G Pro Keyboard Black", None),
+        # Один код, а у каждой стороны своё слово — разные товары.
+        (
+            "Samsung Galaxy A55 5G SM-A556E 8/256GB Awesome Lilac",
+            "Samsung Galaxy A55 5G SM-A556E 8/256GB Awesome Lemon",
+            None,
+        ),
+        (
+            "Samsung Galaxy A55 5G SM-A556E 8/256GB Awesome Iceblue",
+            "Samsung Galaxy A55 5G SM-A556E 8/256GB Awesome Navy",
+            None,
+        ),
+        ("Samsung Galaxy A55 5G SM-A556E 8/128GB", "Samsung Galaxy A55 5G SM-A556E 8/256GB", None),
+        ("Bosch SMS25AW01R Inox", "Bosch SMS25AW01R Ağ", None),
+        ("Sony WH-CH520 Tünd göy", "Sony WH-CH520 Açıq göy", None),
+        (
+            "Lenovo IdeaPad 3 15IAU7 i5-1235U 8/512GB DOS",
+            "Lenovo IdeaPad 3 15IAU7 i5-1235U 8/512GB Windows",
+            None,
+        ),
+        ("Canon EOS 250D 18-55mm IS STM", "Canon EOS 250D 18-55mm DC III", None),
+        # Один код, а сайт дописал подробность — тот же товар.
+        ("LG 55UR78006LK", "Televizor LG 55UR78006LK LED Smart TV", em.STRATEGY_CODE),
+        ("LG 55UR78006LK", "Televizor LG 55UR78006LK 139 sm", em.STRATEGY_CODE),
+        ("LG 55UR78006LK", "LG 55UR78006LK 55 Smart 4K UHD", em.STRATEGY_CODE),
+        ("Samsung QE55Q60DAUXRU", 'Televizor Samsung QLED QE55Q60DAUXRU 55"', em.STRATEGY_CODE),
+        ("LG OLED55C4RLA", 'Televizor LG OLED 55" OLED55C4RLA', em.STRATEGY_CODE),
+        ("Bosch WAN28282GC", "Paltaryuyan Bosch Serie 4 WAN28282GC 8 kq", em.STRATEGY_CODE),
+        (
+            "Samsung WW80T4020CE/LP",
+            "Paltaryuyan maşın Samsung WW80T4020CE/LP 8 kq 1200 dövr",
+            em.STRATEGY_CODE,
+        ),
+        ("Soyuducu Bosch KGN39VL25R Boz", "Bosch KGN39VL25R Gray 203 sm", em.STRATEGY_CODE),
+        ("Philips 55PUS8108/12", "Televizor Philips 55PUS8108", em.STRATEGY_CODE),
+        ("HP 15-fd0052nia i5-1335U 8/512GB", "Noutbuk HP 15-fd0052nia", em.STRATEGY_CODE),
+        (
+            "Samsung RB34T600FSA Gümüşü",
+            "Soyuducu Samsung RB34T600FSA Silver No Frost",
+            em.STRATEGY_CODE,
+        ),
         # Прописная «İ» не ломает бренд.
         ("İndesit IWSC 51051", "Indesit IWSC 51051", None),
     ],
@@ -274,6 +327,49 @@ def test_site_taken_by_a_dead_member_stays_taken(db_session):
     em.match_products(db_session)
     assert fresh.canonical_id is None
     assert _clusters(db_session) == [(em.STRATEGY_CODE, ["irshad", "kontakt"])]
+
+
+def test_product_wanted_by_two_clusters_joins_neither_and_starts_no_pair(db_session):
+    # Две готовые пары одной модели (такое оставляют ручные правки): свободный
+    # товар подходит обеим — не входит ни в одну и новую пару не начинает.
+    for number in (1, 2):
+        member = _product(db_session, "irshad", "LG 55UR78006LK", 1249, external_id=f"i{number}")
+        match = Match(canonical_name=f"LG {number}", is_manual=False)
+        db_session.add(match)
+        db_session.flush()
+        member.canonical_id = match.id
+    kontakt = _product(db_session, "kontakt", "LG 55UR78006LK", 1299)
+    baku = _product(db_session, "bakuelectronics", "Televizor LG 55UR78006LK", 1279)
+    assert em.match_products(db_session) == 0
+    assert kontakt.canonical_id is None and baku.canonical_id is None
+    assert db_session.query(Match).count() == 2
+
+
+def test_newcomer_must_suit_a_dead_member_and_a_fellow_newcomer(db_session):
+    from src._time import utcnow
+
+    # Чёрный холодильник с мёртвой ссылкой остаётся товаром пары: белый к ней
+    # не присоединяется.
+    _product(db_session, "kontakt", "Samsung RB34T600FSA", 1500)
+    black = _product(db_session, "irshad", "Samsung RB34T600FSA Qara", 1480)
+    em.match_products(db_session)
+    black.url_dead_at = utcnow()
+    db_session.flush()
+    white = _product(db_session, "bakuelectronics", "Samsung RB34T600FSA Ağ", 1490)
+    em.match_products(db_session)
+    assert white.canonical_id is None
+
+    # К паре из одного члена разом идут чёрный и серебристый с разных сайтов:
+    # между собой они не один товар — входит только первый.
+    lone = _product(db_session, "kontakt", "Sony WH-1000XM5", 600)
+    match = Match(canonical_name="Sony", is_manual=False)
+    db_session.add(match)
+    db_session.flush()
+    lone.canonical_id = match.id
+    first = _product(db_session, "bakuelectronics", "Sony WH-1000XM5 Black", 610)
+    second = _product(db_session, "irshad", "Sony WH-1000XM5 Silver", 615)
+    em.match_products(db_session)
+    assert [first.canonical_id, second.canonical_id].count(match.id) == 1
 
 
 def test_one_sided_choice_is_not_a_pair(db_session):
