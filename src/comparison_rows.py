@@ -145,7 +145,8 @@ def _comparison_spread(
     return basis, mn, mx, cheap, spr
 
 
-# Клиент — первым: это порядок колонок на странице и приоритет при равных ценах.
+# Порядок сайтов профиля, клиент первым. Строки сравнения берут порядок глазами
+# выбранного «своего» сайта (`site_profile.viewer_sites`); это — порядок по умолчанию.
 _SITE_ORDER = {site: position for position, site in enumerate(site_profile.SITES)}
 
 

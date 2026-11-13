@@ -33,7 +33,7 @@ import { Sparkline } from "@/components/sparkline";
 import { TableSkeleton } from "@/components/skeleton";
 import { OthersSection } from "./others-section";
 import { MIN_SEARCH_CHARS, SearchBox } from "./search-box";
-import { IS_PHARMACY } from "@/lib/site-profile";
+import { IS_PHARMACY, siteTitle } from "@/lib/site-profile";
 import { useViewerSite, useViewerSites } from "@/lib/viewer-site";
 import { SITES, type SiteName } from "./sites";
 
@@ -629,7 +629,7 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
         (clientCheapest
           ? t("spread_we_cheaper", { pct: abs.toFixed(1) })
           : t("spread_they_cheaper", {
-              site: row.cheapest_site,
+              site: siteTitle(row.cheapest_site),
               pct: abs.toFixed(1),
             })) + (isUnit ? ` · ${t("per_unit_note")}` : "")
       }
@@ -887,7 +887,8 @@ function ComparisonCard({
 function TrendPanel({ row }: { row: ComparisonRow }) {
   const t = useTranslations("comparison");
   const locale = useLocale();
-  const sitesWithPrice = SITES.filter((s) => row.prices[s]);
+  const viewerSites = useViewerSites();
+  const sitesWithPrice = viewerSites.filter((s) => row.prices[s]);
   // Batch fetch: 1 запрос вместо N×3. Сортируем ids для стабильного queryKey.
   const productIds = useMemo(
     () =>
@@ -970,6 +971,7 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
 // старый товар сайта отвязывается (+rejection), новый привязывается, is_manual.
 function RelinkPanel({ row }: { row: ComparisonRow }) {
   const t = useTranslations("comparison");
+  const viewerSites = useViewerSites();
   const queryClient = useQueryClient();
   const [msg, setMsg] = useState<{
     site: string;
@@ -1011,7 +1013,7 @@ function RelinkPanel({ row }: { row: ComparisonRow }) {
         {t("relink_hint")}
       </p>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-        {SITES.map((s) => (
+        {viewerSites.map((s) => (
           <RelinkSite
             key={s}
             row={row}

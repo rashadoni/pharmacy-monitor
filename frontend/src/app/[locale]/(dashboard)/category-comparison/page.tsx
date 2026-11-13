@@ -14,6 +14,7 @@ import {
 import { formatPrice } from "@/lib/utils";
 import { MetricStrip } from "@/components/metric-strip";
 import { TableSkeleton } from "@/components/skeleton";
+import { siteTitle } from "@/lib/site-profile";
 import { useViewerSite, useViewerSites } from "@/lib/viewer-site";
 
 // Конкуренты показываем отдельными колонками. «Свой» сайт — выбранный в
@@ -717,7 +718,7 @@ function CategoryCard({
       <div className="grid grid-cols-3 gap-2 mt-2 text-center">
         <div>
           <div className="text-[10px] text-muted-foreground uppercase">
-            {viewerSite}
+            {siteTitle(viewerSite)}
           </div>
           <div className="tabular-nums text-sm">
             {formatPrice(row.avg_client_price, locale)}

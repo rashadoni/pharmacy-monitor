@@ -100,7 +100,7 @@ from src._time import utcnow
 from src.comparison_rows import (
     _COMPARISON_PRODUCT_COLUMNS,  # noqa: F401 — прежнее имя, его читают тесты
     _COMPARISON_STALE_DAYS,
-    _SITE_ORDER,
+    _SITE_ORDER,  # noqa: F401 — прежнее имя, его читают тесты
     _comparison_rows,
     _comparison_spread,  # noqa: F401 — прежнее имя
     _has_ok_run,
@@ -2529,12 +2529,16 @@ def dash_comparison_search(
         if age_days is not None and age_days > _SEARCH_OTHERS_MAX_AGE_DAYS:
             continue
         candidates.append((product, age_days))
-    # Сначала то, что можно купить; внутри — по близости к запросу.
+    # Сначала то, что можно купить; внутри — по близости к запросу, «свой» сайт
+    # раньше конкурентов.
+    viewer_order = {
+        site: position for position, site in enumerate(site_profile.viewer_sites(client_site))
+    }
     candidates.sort(
         key=lambda item: (
             item[0].offer_availability_status == "out_of_stock",
             order[item[0].id],
-            _SITE_ORDER.get(item[0].site, 9),
+            viewer_order.get(item[0].site, 9),
         )
     )
     page = candidates[:_SEARCH_OTHERS_LIMIT]
