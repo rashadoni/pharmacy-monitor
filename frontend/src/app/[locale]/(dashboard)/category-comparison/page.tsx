@@ -14,10 +14,15 @@ import {
 import { formatPrice } from "@/lib/utils";
 import { MetricStrip } from "@/components/metric-strip";
 import { TableSkeleton } from "@/components/skeleton";
-import { CLIENT_SITE, COMPETITOR_SITES } from "@/lib/site-profile";
+import { siteTitle } from "@/lib/site-profile";
+import { useViewerSite, useViewerSites } from "@/lib/viewer-site";
 
-// Конкуренты показываем отдельными колонками; клиент и конкуренты — из профиля.
-const COMPETITORS = COMPETITOR_SITES;
+// Конкуренты показываем отдельными колонками. «Свой» сайт — выбранный в
+// настройках (lib/viewer-site.ts), конкуренты — остальные сайты профиля.
+function useCompetitors(): readonly string[] {
+  const sites = useViewerSites();
+  return useMemo(() => sites.slice(1), [sites]);
+}
 
 type SortKey = "misprice" | "label" | "skus" | "client" | "index" | "cheaper";
 
@@ -28,6 +33,8 @@ export default function CategoryComparisonPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const selectedCategory = searchParams.get("category");
+  const viewerSite = useViewerSite();
+  const COMPETITORS = useCompetitors();
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({
     key: "misprice",
     dir: "desc",
@@ -35,16 +42,16 @@ export default function CategoryComparisonPage() {
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
 
   const { data, isLoading, error, isFetching } = useQuery({
-    queryKey: ["category-comparison", locale],
-    queryFn: () => api.categoryComparison(CLIENT_SITE, locale),
+    queryKey: ["category-comparison", viewerSite, locale],
+    queryFn: () => api.categoryComparison(viewerSite, locale),
   });
   const { data: coverage, isLoading: isCoverageLoading } = useQuery({
-    queryKey: ["category-comparison-coverage", CLIENT_SITE],
-    queryFn: () => api.categoryComparisonCoverage(CLIENT_SITE),
+    queryKey: ["category-comparison-coverage", viewerSite],
+    queryFn: () => api.categoryComparisonCoverage(viewerSite),
   });
   const { data: catalogRows, isLoading: isCatalogLoading } = useQuery({
-    queryKey: ["category-comparison-catalog", CLIENT_SITE, locale],
-    queryFn: () => api.categoryCatalog(CLIENT_SITE, locale),
+    queryKey: ["category-comparison-catalog", viewerSite, locale],
+    queryFn: () => api.categoryCatalog(viewerSite, locale),
   });
   const catalogByCategory = useMemo(
     () =>
@@ -692,6 +699,8 @@ function CategoryCard({
 }) {
   const t = useTranslations("category_comparison");
   const locale = useLocale();
+  const viewerSite = useViewerSite();
+  const COMPETITORS = useCompetitors();
   return (
     <button
       onClick={onClick}
@@ -709,7 +718,7 @@ function CategoryCard({
       <div className="grid grid-cols-3 gap-2 mt-2 text-center">
         <div>
           <div className="text-[10px] text-muted-foreground uppercase">
-            {CLIENT_SITE}
+            {siteTitle(viewerSite)}
           </div>
           <div className="tabular-nums text-sm">
             {formatPrice(row.avg_client_price, locale)}

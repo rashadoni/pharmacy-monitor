@@ -33,7 +33,8 @@ import { Sparkline } from "@/components/sparkline";
 import { TableSkeleton } from "@/components/skeleton";
 import { OthersSection } from "./others-section";
 import { MIN_SEARCH_CHARS, SearchBox } from "./search-box";
-import { CLIENT_SITE, IS_PHARMACY } from "@/lib/site-profile";
+import { IS_PHARMACY, siteTitle } from "@/lib/site-profile";
+import { useViewerSite, useViewerSites } from "@/lib/viewer-site";
 import { SITES, type SiteName } from "./sites";
 
 type SortKey = "name" | "brand" | "spread" | SiteName;
@@ -64,6 +65,10 @@ export default function ComparisonPage() {
   const locale = useLocale();
   const searchParams = useSearchParams();
   const router = useRouter();
+  // Чьими глазами сравнение: «свой» сайт решает цвет разницы, порядок колонок
+  // и фильтр категории (см. lib/viewer-site.ts).
+  const viewerSite = useViewerSite();
+  const viewerSites = useViewerSites();
   // Drill-down из /category-comparison: фильтр по категории товара-клиента.
   const category = searchParams.get("category");
   const urlSearch = searchParams.get("search") ?? "";
@@ -124,18 +129,23 @@ export default function ComparisonPage() {
   // Без запроса — весь список сопоставленных товаров. С запросом — поиск по
   // ВСЕМУ каталогу: строки сравнения плюс товары, у которых пары пока нет.
   const listQuery = useQuery({
-    queryKey: ["comparison", "list", minSites, category],
+    queryKey: ["comparison", "list", minSites, category, viewerSite],
     queryFn: () =>
-      api.comparison({ min_sites: minSites, category: category ?? undefined }),
+      api.comparison({
+        min_sites: minSites,
+        category: category ?? undefined,
+        client_site: viewerSite,
+      }),
     enabled: !searching,
   });
   const searchQuery = useQuery({
-    queryKey: ["comparison", "search", query, minSites, category],
+    queryKey: ["comparison", "search", query, minSites, category, viewerSite],
     queryFn: () =>
       api.comparisonSearch({
         q: query,
         min_sites: minSites,
         category: category ?? undefined,
+        client_site: viewerSite,
       }),
     enabled: searching,
     // Пока едет ответ на следующую букву, оставляем прежние результаты.
@@ -225,9 +235,9 @@ export default function ComparisonPage() {
   // P1.2: auto-collapse колонок без данных в текущем срезе. Например когда
   // включён фильтр «Только различия» — почти все строки могут не иметь aloe.
   const visibleSites = useMemo(() => {
-    if (!filtered) return SITES;
-    return SITES.filter((s) => filtered.some((r) => r.prices[s] != null));
-  }, [filtered]);
+    if (!filtered) return viewerSites;
+    return viewerSites.filter((s) => filtered.some((r) => r.prices[s] != null));
+  }, [filtered, viewerSites]);
 
   // Excel собирает сервер по тем же фильтрам, что на экране. Раньше здесь был
   // CSV из браузера: в Excel он открывался одной колонкой и с битыми буквами.
@@ -244,6 +254,7 @@ export default function ComparisonPage() {
         with_aloe: withAloe,
         diff_only: diffOnly,
         locale,
+        client_site: viewerSite,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -389,7 +400,7 @@ export default function ComparisonPage() {
             <option value="name:desc">{t("th_name")} ↓</option>
             <option value="brand:asc">{t("th_brand")} ↑</option>
             <option value="brand:desc">{t("th_brand")} ↓</option>
-            {SITES.flatMap((site) => [
+            {viewerSites.flatMap((site) => [
               <option key={`${site}:asc`} value={`${site}:asc`}>
                 {site} ↑
               </option>,
@@ -597,14 +608,15 @@ export default function ComparisonPage() {
  */
 function SpreadCell({ row }: { row: ComparisonRow }) {
   const t = useTranslations("comparison");
+  const viewerSite = useViewerSite();
   if (row.spread_pct == null || row.cheapest_site == null) {
     return <span className="text-muted-foreground/70">—</span>;
   }
   const abs = Math.abs(row.spread_pct);
-  // По умолчанию клиент = pharmonline (см. roi.CLIENT_SITE). Stable, простой
-  // эвристический сигнал направления цены: если pharmonline cheapest →
-  // зелёный ▼; если cheapest другой → красный ▲ (конкурент бьёт нас по цене).
-  const clientCheapest = row.cheapest_site === CLIENT_SITE;
+  // «Свой» сайт — выбранный в настройках (по умолчанию клиент профиля). Если
+  // он cheapest → зелёный ▼; если cheapest другой → красный ▲ (конкурент бьёт
+  // нас по цене). При равных ценах сервер ставит «свой» первым.
+  const clientCheapest = row.cheapest_site === viewerSite;
   const Icon = clientCheapest
     ? () => <span aria-hidden>▼</span>
     : () => <span aria-hidden>▲</span>;
@@ -617,7 +629,7 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
         (clientCheapest
           ? t("spread_we_cheaper", { pct: abs.toFixed(1) })
           : t("spread_they_cheaper", {
-              site: row.cheapest_site,
+              site: siteTitle(row.cheapest_site),
               pct: abs.toFixed(1),
             })) + (isUnit ? ` · ${t("per_unit_note")}` : "")
       }
@@ -817,6 +829,7 @@ function ComparisonCard({
   onReject: (r: ComparisonRow) => void;
 }) {
   const t = useTranslations("comparison");
+  const viewerSites = useViewerSites();
   return (
     <div className="rounded-lg border border-border bg-card p-3 relative">
       <button
@@ -856,7 +869,7 @@ function ComparisonCard({
         <SpreadCell row={row} />
       </div>
       <div className="grid grid-cols-3 gap-2 mt-3">
-        {SITES.map((s) => (
+        {viewerSites.map((s) => (
           <div key={s} className="text-center">
             <div className="text-[10px] text-muted-foreground uppercase">
               {s}
@@ -874,7 +887,8 @@ function ComparisonCard({
 function TrendPanel({ row }: { row: ComparisonRow }) {
   const t = useTranslations("comparison");
   const locale = useLocale();
-  const sitesWithPrice = SITES.filter((s) => row.prices[s]);
+  const viewerSites = useViewerSites();
+  const sitesWithPrice = viewerSites.filter((s) => row.prices[s]);
   // Batch fetch: 1 запрос вместо N×3. Сортируем ids для стабильного queryKey.
   const productIds = useMemo(
     () =>
@@ -957,6 +971,7 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
 // старый товар сайта отвязывается (+rejection), новый привязывается, is_manual.
 function RelinkPanel({ row }: { row: ComparisonRow }) {
   const t = useTranslations("comparison");
+  const viewerSites = useViewerSites();
   const queryClient = useQueryClient();
   const [msg, setMsg] = useState<{
     site: string;
@@ -998,7 +1013,7 @@ function RelinkPanel({ row }: { row: ComparisonRow }) {
         {t("relink_hint")}
       </p>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-        {SITES.map((s) => (
+        {viewerSites.map((s) => (
           <RelinkSite
             key={s}
             row={row}

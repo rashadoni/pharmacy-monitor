@@ -33,17 +33,18 @@ import {
   RunStatusBadge as StatusBadge,
 } from "@/components/run-status";
 import { MetricStrip } from "@/components/metric-strip";
-import { CLIENT_SITE } from "@/lib/site-profile";
+import { useViewerSite } from "@/lib/viewer-site";
 
 export default function OverviewPage() {
   const t = useTranslations("overview");
   const tCommon = useTranslations("common");
   const locale = useLocale();
+  const viewerSite = useViewerSite();
   const matchQ = useQuery({ queryKey: ["match-quality"], queryFn: api.matchQuality });
   const normalizeQ = useQuery({ queryKey: ["normalize-stats"], queryFn: api.normalizeStats });
   const recommendationsQ = useQuery({
-    queryKey: ["roi-recommendations", CLIENT_SITE, locale],
-    queryFn: () => api.roiRecommendations(undefined, locale),
+    queryKey: ["roi-recommendations", viewerSite, locale],
+    queryFn: () => api.roiRecommendations(viewerSite, locale),
   });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: () => api.runs(5) });
   const latestBySiteQ = useQuery({

@@ -83,6 +83,25 @@ describe("тексты интерфейса под профиль", () => {
     expect(messages.a).toContain("pharmonline");
   });
 
+  it("«свой магазин»: тексты о клиенте называют выбранный сайт", () => {
+    const messages = {
+      a: "pharmonline (вы) дешевле, чем aptekonline и aloe",
+      b: "сайт pharmonline.az",
+    };
+    expect(messagesForProfile(messages, ELECTRONICS, "irshad")).toEqual({
+      a: "Irshad (вы) дешевле, чем Kontakt Home и Baku Electronics",
+      b: "сайт irshad.az",
+    });
+    expect(messagesForProfile(messages, ELECTRONICS, "bakuelectronics").a).toBe(
+      "Baku Electronics (вы) дешевле, чем Kontakt Home и Irshad",
+    );
+    // Чужое значение — клиент профиля; аптеке выбор безразличен.
+    expect(messagesForProfile(messages, ELECTRONICS, "aloe")).toEqual(
+      messagesForProfile(messages, ELECTRONICS),
+    );
+    expect(messagesForProfile(ru, PHARMACY, "aloe")).toBe(ru);
+  });
+
   it("слово внутри другого слова не заменяется", () => {
     expect(messagesForProfile({ a: "haloed aloes" }, ELECTRONICS)).toEqual({ a: "haloed aloes" });
   });

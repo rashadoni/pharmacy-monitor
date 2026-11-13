@@ -287,17 +287,17 @@ def difference_counts(rows: list[dict[str, Any]], client_site: str = CLIENT_SITE
     return counts
 
 
-def _position(row: dict[str, Any], t: dict[str, str]) -> str:
-    position = client_position(row)
+def _position(row: dict[str, Any], t: dict[str, str], client_site: str = CLIENT_SITE) -> str:
+    position = client_position(row, client_site)
     return t[f"pos_{position}"] if position else ""
 
 
-def _cheapest_sites(row: dict[str, Any]) -> str:
+def _cheapest_sites(row: dict[str, Any], sites: tuple[str, ...] = SITES) -> str:
     if row.get("min_price") is None:
         return ""
     return ", ".join(
         SITE_TITLES[site]
-        for site in SITES
+        for site in sites
         if (entry := row["prices"].get(site)) is not None
         and not entry.get("stale")
         and _compared_value(row, entry) == row["min_price"]
@@ -326,17 +326,24 @@ def _note(row: dict[str, Any], t: dict[str, str]) -> str:
     return ". ".join(notes)
 
 
-def _write_sheet(ws: Any, rows: list[dict[str, Any]], t: dict[str, str]) -> None:
+def _write_sheet(
+    ws: Any,
+    rows: list[dict[str, Any]],
+    t: dict[str, str],
+    sites: tuple[str, ...] = SITES,
+) -> None:
+    """Лист сравнения; `sites` — порядок колонок, «свой» сайт первым."""
+    client = sites[0]
     headers = [
         t["name"],
         t["brand"],
-        *(t["price"].format(site=SITE_TITLES[s]) for s in SITES),
+        *(t["price"].format(site=SITE_TITLES[s]) for s in sites),
         t["cheapest"],
         t["diff_azn"],
         t["diff_pct"],
-        t["position"].format(client=SITE_TITLES[CLIENT_SITE]),
+        t["position"].format(client=SITE_TITLES[client]),
         t["note"],
-        *(t["link"].format(site=SITE_TITLES[s]) for s in SITES),
+        *(t["link"].format(site=SITE_TITLES[s]) for s in sites),
     ]
     ws.append(headers)
     for cell in ws[1]:
@@ -345,14 +352,14 @@ def _write_sheet(ws: Any, rows: list[dict[str, Any]], t: dict[str, str]) -> None
         cell.alignment = _HEADER_ALIGN
     ws.row_dimensions[1].height = 32
 
-    price_col = {site: 3 + i for i, site in enumerate(SITES)}
-    link_col = {site: 11 + i for i, site in enumerate(SITES)}
+    price_col = {site: 3 + i for i, site in enumerate(sites)}
+    link_col = {site: 11 + i for i, site in enumerate(sites)}
     for index, row in enumerate(rows, start=2):
         _write_text(ws.cell(row=index, column=1), row.get("name"))
         _write_text(ws.cell(row=index, column=2), row.get("brand") or "")
         comparable = row.get("min_price") is not None
         differs = comparable and row["min_price"] != row["max_price"]
-        for site in SITES:
+        for site in sites:
             entry = row["prices"].get(site)
             if entry is None:
                 continue
@@ -371,13 +378,13 @@ def _write_sheet(ws: Any, rows: list[dict[str, Any]], t: dict[str, str]) -> None
                 link = ws.cell(row=index, column=link_col[site], value=SITE_TITLES[site])
                 link.hyperlink = url
                 link.font = _LINK_FONT
-        _write_text(ws.cell(row=index, column=6), _cheapest_sites(row))
+        _write_text(ws.cell(row=index, column=6), _cheapest_sites(row, sites))
         if comparable:
             diff = ws.cell(row=index, column=7, value=round(row["max_price"] - row["min_price"], 2))
             diff.number_format = _MONEY
             pct = ws.cell(row=index, column=8, value=(row.get("spread_pct") or 0.0) / 100)
             pct.number_format = _PERCENT
-        _write_text(ws.cell(row=index, column=9), _position(row, t))
+        _write_text(ws.cell(row=index, column=9), _position(row, t, client))
         _write_text(ws.cell(row=index, column=10), _note(row, t))
 
     widths = [52, 22, 14, 14, 14, 24, 12, 10, 20, 60, 16, 16, 16]
@@ -397,21 +404,24 @@ def build_workbook(
     min_sites: int = 2,
     with_aloe: bool = False,
     diff_only: bool = False,
+    client_site: str | None = None,
 ) -> bytes:
     """Собрать .xlsx из строк сравнения (формат `ComparisonRowOut`).
 
     `diff_only` — страница уже показывает только различия: второй лист тогда
-    повторял бы первый, и его не пишем.
+    повторял бы первый, и его не пишем. `client_site` — чьими глазами файл:
+    его колонка первая и про него «Позиция»; None — клиент профиля.
     """
+    sites = site_profile.viewer_sites(client_site)
     t = strings(locale)
     differing = [row for row in rows if has_price_difference(row)]
 
     wb = Workbook()
     ws_diff = wb.active
     ws_diff.title = t["sheet_diff"]
-    _write_sheet(ws_diff, differing, t)
+    _write_sheet(ws_diff, differing, t, sites)
     if not diff_only:
-        _write_sheet(wb.create_sheet(t["sheet_all"]), rows, t)
+        _write_sheet(wb.create_sheet(t["sheet_all"]), rows, t, sites)
 
     info = wb.create_sheet(t["sheet_info"])
     local = baku_time(generated_at)

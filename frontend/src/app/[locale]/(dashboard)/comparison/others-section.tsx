@@ -3,7 +3,7 @@
 import { useLocale, useTranslations } from "next-intl";
 import type { ComparisonOther } from "@/lib/api";
 import { formatPrice } from "@/lib/utils";
-import { SITES } from "./sites";
+import { useViewerSites } from "@/lib/viewer-site";
 
 /**
  * Найдено поиском, но в таблице сравнения нет: у товара пока нет пары на другом
@@ -18,6 +18,7 @@ export function OthersSection({
   others: ComparisonOther[];
   total: number;
 }) {
+  const SITES = useViewerSites();
   const t = useTranslations("comparison");
   return (
     <section className="space-y-2" data-testid="search-others">

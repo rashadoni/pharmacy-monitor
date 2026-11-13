@@ -6544,3 +6544,69 @@ def test_trusted_catalog_epoch_matches_trust_report(setup_db):
             f"v1|pharmonline:{failed.id}|aptekonline:{run.id}|aloe:{run.id}"
         )
     assert trusted_catalog_epoch(s) is None
+
+
+# ── «Свой магазин»: сравнение глазами любого сайта (client_site) ────────────
+# Экземпляр электроники показывают каждому из трёх магазинов, поэтому страница
+# сравнения и Excel принимают, чей сайт считать своим. Здесь — на аптечных
+# сайтах: сервер для всех профилей один.
+
+
+def test_comparison_ties_go_to_the_viewer_site(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_prices(
+        s, run, canonical="Same price", prices={"pharmonline": 5.0, "aptekonline": 5.0}
+    )
+    _login(client, tenant_user, s)
+
+    default = client.get("/api/v1/dash/comparison").json()
+    viewer = client.get("/api/v1/dash/comparison?client_site=aptekonline").json()
+    found = client.get("/api/v1/dash/comparison/search?q=Same&client_site=aptekonline").json()
+
+    # При равных ценах «самый дешёвый» — свой сайт: иначе паритет рисовался бы
+    # своему магазину как «конкурент дешевле».
+    assert [row["cheapest_site"] for row in default] == ["pharmonline"]
+    assert [row["cheapest_site"] for row in viewer] == ["aptekonline"]
+    assert [row["cheapest_site"] for row in found["rows"]] == ["aptekonline"]
+
+
+def test_comparison_export_is_written_for_the_viewer_site(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_prices(
+        s, run, canonical="Differs a lot", prices={"pharmonline": 10.0, "aptekonline": 8.0}
+    )
+    _login(client, tenant_user, s)
+
+    wb = _load_export(client.get("/api/v1/dash/comparison/export.xlsx?client_site=aptekonline"))
+    sheet = wb.worksheets[0]
+    header = [cell.value for cell in sheet[1]]
+    row = [cell.value for cell in sheet[2]]
+
+    # Колонка своего сайта первая, «Позиция» — про него: у Aptekonline 8.00
+    # против 10.00 — самая низкая цена.
+    assert "Aptekonline" in header[2] and "Pharmonline" in header[3] and "Aloe" in header[4]
+    assert "Aptekonline" in header[8]
+    assert row[2:5] == [8.0, 10.0, None]
+    assert row[8] == "Самая низкая"
+    assert sheet.cell(row=2, column=11).value == "Aptekonline"
+
+    default = _load_export(client.get("/api/v1/dash/comparison/export.xlsx")).worksheets[0]
+    assert "Pharmonline" in default[1][2].value
+    assert default[2][8].value == "Самая высокая"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/dash/comparison?client_site=nowhere",
+        "/api/v1/dash/comparison/search?q=x&client_site=nowhere",
+        "/api/v1/dash/comparison/export.xlsx?client_site=nowhere",
+    ],
+)
+def test_comparison_refuses_an_unknown_viewer_site(client, tenant_user, setup_db, path):
+    _login(client, tenant_user, setup_db)
+    response = client.get(path)
+    assert response.status_code == 400, response.text
+    assert "nowhere" in response.json()["detail"]

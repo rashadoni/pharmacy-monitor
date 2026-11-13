@@ -12,6 +12,11 @@ import { getRequestConfig } from "next-intl/server";
 import { cookies } from "next/headers";
 import { defaultLocale, locales, type Locale } from "./config";
 import { messagesForProfile } from "../lib/site-profile";
+import {
+  VIEWER_SITE_COOKIE,
+  VIEWER_SITE_SELECTABLE,
+  viewerSiteFromCookie,
+} from "../lib/viewer-site-cookie";
 
 function isLocale(value: string | undefined): value is Locale {
   return value !== undefined && (locales as readonly string[]).includes(value);
@@ -36,11 +41,21 @@ export default getRequestConfig(async ({ requestLocale }) => {
 });
 
 async function loadConfig(locale: Locale) {
+  // «Свой магазин» (lib/viewer-site.ts): тексты о клиенте называют его. У
+  // аптечного экземпляра куку не читаем вовсе — чтение делает страницы
+  // динамическими, а выбора там нет.
+  const viewerSite = VIEWER_SITE_SELECTABLE
+    ? viewerSiteFromCookie((await cookies()).get(VIEWER_SITE_COOKIE)?.value)
+    : undefined;
   return {
     locale,
     // Тексты называют аптечные сайты прямо; у экземпляра другого профиля
     // имена заменяются на его сайты. Аптечному возвращаются как есть.
-    messages: messagesForProfile((await import(`../../messages/${locale}.json`)).default),
+    messages: messagesForProfile(
+      (await import(`../../messages/${locale}.json`)).default,
+      undefined,
+      viewerSite,
+    ),
     timeZone: "Asia/Baku",
     now: new Date(),
   };

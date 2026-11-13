@@ -205,3 +205,16 @@ def test_no_module_keeps_its_own_copy_of_the_pharmacy_site_list():
             if listing.search(line) and not line.lstrip().startswith("#"):
                 offenders.append(f"{path.relative_to(ROOT)}:{number}: {line.strip()}")
     assert offenders == []
+
+
+def test_viewer_sites_put_the_chosen_site_first():
+    from src import site_profile
+
+    assert site_profile.viewer_sites() == site_profile.SITES
+    assert site_profile.viewer_sites(site_profile.SITES[2]) == (
+        site_profile.SITES[2],
+        site_profile.SITES[0],
+        site_profile.SITES[1],
+    )
+    with pytest.raises(ValueError, match="nowhere"):
+        site_profile.viewer_sites("nowhere")

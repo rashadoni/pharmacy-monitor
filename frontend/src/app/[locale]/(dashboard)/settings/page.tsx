@@ -3,10 +3,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslations } from "next-intl";
 import { Link, useRouter } from "@/i18n/navigation";
-import { Bell, CheckCircle2, ChevronRight, DollarSign, Globe, Key, LogOut, MessageCircle, Send, User, Users, XCircle, Zap } from "lucide-react";
+import { Bell, CheckCircle2, ChevronRight, DollarSign, Globe, Key, LogOut, MessageCircle, Send, Store, User, Users, XCircle, Zap } from "lucide-react";
 import { useState } from "react";
 import { api, type NotifPrefs } from "@/lib/api";
 import { LocaleSwitcher } from "@/components/locale-switcher";
+import { ViewerSitePicker } from "@/components/viewer-site-picker";
+import { VIEWER_SITE_SELECTABLE } from "@/lib/viewer-site";
 import { passwordProblem, type PasswordProblem } from "@/lib/password-rule";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
@@ -48,6 +50,12 @@ export default function SettingsPage() {
           </div>
         )}
       </Section>
+
+      {VIEWER_SITE_SELECTABLE && (
+        <Section title={t("viewer_site_title")} icon={Store}>
+          <ViewerSitePicker />
+        </Section>
+      )}
 
       <NotificationsSection email={meQ.data?.email} />
 

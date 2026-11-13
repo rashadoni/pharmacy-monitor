@@ -696,7 +696,9 @@
     "integration_decodo_ok": "Подключено для: {sites} · пул портов: {pool}",
     "integration_decodo_not_ok": "Не настроено · сканирование сайтов, требующих прокси, будет недоступно",
     "telegram_not_configured_title": "⚠️ Telegram-бот не настроен на сервере",
-    "telegram_not_configured_hint": "Чтобы привязать Telegram нужно сначала добавить TELEGRAM_BOT_TOKEN в /etc/pharmacy-monitor/env. Запусти:"
+    "telegram_not_configured_hint": "Чтобы привязать Telegram нужно сначала добавить TELEGRAM_BOT_TOKEN в /etc/pharmacy-monitor/env. Запусти:",
+    "viewer_site_title": "Свой магазин",
+    "viewer_site_hint": "Чьими глазами показывать цены: выбранный магазин — «свой», остальные — конкуренты. Действует на сравнение, категории, обзор и Excel в этом браузере. Утреннее письмо и алерты по-прежнему считаются для клиента экземпляра."
   },
   "severity": {
     "critical": "Критично",

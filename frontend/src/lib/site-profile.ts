@@ -111,14 +111,22 @@ type Messages = { [key: string]: string | Messages };
  * Тексты интерфейса написаны для аптечного экземпляра и называют его сайты
  * прямо («pharmonline дешевле остальных на 5%»). Для другого профиля имена
  * заменяются по порядку сайтов: клиент на клиента, первый конкурент на первого.
- * Аптечному профилю тексты возвращаются как есть.
+ * `viewerSite` — «свой магазин» (lib/viewer-site.ts): тексты о клиенте называют
+ * его, конкуренты — остальные сайты в порядке профиля. Аптечному профилю тексты
+ * возвращаются как есть.
  */
-export function messagesForProfile<T>(messages: T, profile: SiteProfile = PROFILE): T {
+export function messagesForProfile<T>(
+  messages: T,
+  profile: SiteProfile = PROFILE,
+  viewerSite: string = profile.clientSite,
+): T {
   if (profile.name === PHARMACY.name) return messages;
 
+  const client = profile.sites.includes(viewerSite) ? viewerSite : profile.clientSite;
+  const order = [client, ...profile.sites.filter((site) => site !== client)];
   const replacements: [RegExp, string][] = [];
   PHARMACY.sites.forEach((pharmacySite, position) => {
-    const site = profile.sites[position];
+    const site = order[position];
     if (!site) return;
     // Сначала адрес, потом имя: «pharmonline.az» не должен стать «Kontakt Home.az».
     replacements.push([new RegExp(escapeRegExp(PHARMACY.domains[pharmacySite]), "gi"), profile.domains[site]]);

@@ -19,7 +19,8 @@ import { formatPrice, formatRelative, formatTime } from "@/lib/utils";
 import { QueryErrorState } from "@/components/query-error-state";
 import { useRouter } from "@/i18n/navigation";
 import { integerParam, queryWithPatch } from "@/lib/filter-query";
-import { CLIENT_SITE, IS_PHARMACY, SITES, siteDomain } from "@/lib/site-profile";
+import { IS_PHARMACY, SITES, siteDomain } from "@/lib/site-profile";
+import { useViewerSite } from "@/lib/viewer-site";
 
 const PAGE_LIMIT = 50;
 
@@ -69,12 +70,15 @@ const SITE_LOOKS = [
   { icon: Leaf, iconColor: "text-success", pharmacyTaglineKey: "tagline_aloe" },
 ] as const;
 
-function siteMeta(site: SiteName): { icon: typeof Leaf; iconColor: string; taglineKey: string } {
+function siteMeta(
+  site: SiteName,
+  viewerSite: SiteName,
+): { icon: typeof Leaf; iconColor: string; taglineKey: string } {
   const position = Math.max(0, VALID_SITES.indexOf(site));
   const look = SITE_LOOKS[position % SITE_LOOKS.length];
   const taglineKey = IS_PHARMACY
     ? look.pharmacyTaglineKey
-    : site === CLIENT_SITE
+    : site === viewerSite
       ? "tagline_client"
       : "tagline_competitor";
   return { icon: look.icon, iconColor: look.iconColor, taglineKey };
@@ -95,7 +99,10 @@ export default function SitePage() {
     notFound();
   }
   const site = siteParam as SiteName;
-  const meta = siteMeta(site);
+  // «Свой» сайт — выбранный в настройках (lib/viewer-site.ts): у него блок
+  // рекомендаций и подпись клиента.
+  const viewerSite = useViewerSite();
+  const meta = siteMeta(site, viewerSite);
   const Icon = meta.icon;
   const competitors = competitorsOf(site);
 
@@ -114,7 +121,7 @@ export default function SitePage() {
   const recommendationsQ = useQuery({
     queryKey: ["site", site, "roi-recommendations", locale],
     queryFn: () => api.roiRecommendations(site, locale),
-    enabled: site === CLIENT_SITE,
+    enabled: site === viewerSite,
   });
   const roiWaitingForVerifiedScan = isVerifiedScanPendingError(recommendationsQ.error);
   const pageDataError = summaryQ.error ?? facetsQ.error ?? brandsQ.error;
@@ -187,7 +194,7 @@ export default function SitePage() {
         />
       </section>
 
-      {site === CLIENT_SITE ? <section>
+      {site === viewerSite ? <section>
         <h2 className="text-lg font-semibold mb-3">{t("roi_title")}</h2>
         <p className="text-xs text-muted-foreground mb-3">
           {t("roi_subtitle", { site, competitors: competitors.join("/") })}
