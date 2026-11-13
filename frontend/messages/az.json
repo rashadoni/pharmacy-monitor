@@ -696,7 +696,9 @@
     "integration_decodo_ok": "Bu saytlar üçün bağlıdır: {sites} · port hovuzu: {pool}",
     "integration_decodo_not_ok": "Qurulmayıb · proksi tələb edən saytların skanı əlçatan olmayacaq",
     "telegram_not_configured_title": "⚠️ Telegram botu serverdə qurulmayıb",
-    "telegram_not_configured_hint": "Telegram-ı bağlamaq üçün əvvəlcə TELEGRAM_BOT_TOKEN-i /etc/pharmacy-monitor/env-ə əlavə edin. Çalışdırın:"
+    "telegram_not_configured_hint": "Telegram-ı bağlamaq üçün əvvəlcə TELEGRAM_BOT_TOKEN-i /etc/pharmacy-monitor/env-ə əlavə edin. Çalışdırın:",
+    "viewer_site_title": "Öz mağaza",
+    "viewer_site_hint": "Qiymətlər kimin gözü ilə göstərilsin: seçilmiş mağaza «öz», qalanları rəqibdir. Bu brauzerdə müqayisəyə, kateqoriyalara, icmala və Excel-ə təsir edir. Səhər məktubu və xəbərdarlıqlar əvvəlki kimi əsas müştəri üçün hesablanır."
   },
   "severity": {
     "critical": "Kritik",

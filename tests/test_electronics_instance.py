@@ -76,6 +76,20 @@ def test_three_sites_are_scanned_verified_and_priced(tmp_path):
     last_output = outcome["runs"][-1]["output_tail"]
     assert "roi_cache_refreshed" in last_output
     assert "roi_cache_refresh_deferred_unverified_inputs" in outcome["runs"][0]["output_tail"]
+    # «Свой магазин»: любой из трёх видит все три пары, свою колонку первой и
+    # свои рекомендации — показ продукта Irshad или Baku Electronics.
+    for viewer, title in (
+        ("kontakt", "Kontakt Home"),
+        ("irshad", "Irshad"),
+        ("bakuelectronics", "Baku Electronics"),
+    ):
+        seen = outcome["viewers"][viewer]
+        assert seen["rows"] == 3, (viewer, seen)
+        assert title in seen["first_price_column"], (viewer, seen)
+        assert seen["roi_cached"] == 1, (viewer, seen)
+    # Телевизор: дешевле всех Baku Electronics (1199.99) — его глазами он
+    # «самый дешёвый», глазами остальных — «конкурент дешевле».
+    assert outcome["viewers"]["bakuelectronics"]["counts"]["client_cheapest"] >= 1
 
 
 def test_site_without_synced_sections_fails_loudly(tmp_path):

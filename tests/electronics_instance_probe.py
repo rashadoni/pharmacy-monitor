@@ -149,6 +149,36 @@ def main_probe() -> None:
             (tenant.slug, tenant.client_site)
             for tenant in session.scalars(select(storage.Tenant)).all()
         ]
+        # «Свой магазин»: сравнение и Excel глазами каждого из трёх сайтов.
+        import io
+
+        from openpyxl import load_workbook
+
+        from src import comparison_export, comparison_rows
+
+        outcome["viewers"] = {}
+        for viewer in site_profile.SITES:
+            rows = comparison_rows.comparison_rows(session, tenant_id=1, client_site=viewer)
+            workbook = load_workbook(
+                io.BytesIO(
+                    comparison_export.build_workbook(
+                        rows,
+                        locale="ru",
+                        generated_at=storage.utcnow(),
+                        client_site=viewer,
+                    )
+                )
+            )
+            outcome["viewers"][viewer] = {
+                "rows": len(rows),
+                "counts": comparison_export.difference_counts(rows, viewer),
+                "first_price_column": workbook.worksheets[1].cell(row=1, column=3).value,
+                "roi_cached": session.scalar(
+                    select(func.count())
+                    .select_from(storage.RoiActionsCache)
+                    .where(storage.RoiActionsCache.client_site == viewer)
+                ),
+            }
     print("RESULT=" + json.dumps(outcome, ensure_ascii=False, default=str))
 
 

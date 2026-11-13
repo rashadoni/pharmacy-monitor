@@ -148,6 +148,7 @@ def _comparison_spread(
 # Клиент — первым: это порядок колонок на странице и приоритет при равных ценах.
 _SITE_ORDER = {site: position for position, site in enumerate(site_profile.SITES)}
 
+
 # Колонки товара, которые читает сборка строк сравнения. Грузим ровно их и
 # без ORM-объектов: в `products` лежат тяжёлые `description`/`normalized_attrs`,
 # а строк в полном списке — тысячи на каждый запрос. Поля, нужные политике
@@ -217,8 +218,12 @@ def _comparison_rows(
     min_confidence: float = 0.70,
     category: str | None = None,
     match_ids: set[int] | None = None,
+    client_site: str | None = None,
 ) -> list[dict[str, Any]]:
     """Строки таблицы сравнения (формат `ComparisonRowOut`), по spread убыв.
+
+    `client_site` — чьими глазами строки: его товар решает фильтр категории и
+    «мёртвый клиент», он первый при равных ценах. None — клиент профиля.
 
     `match_ids` ограничивает выборку конкретными кластерами (поиск); `None` —
     все кластеры арендатора.
@@ -230,6 +235,10 @@ def _comparison_rows(
     человеком) показываются всегда, независимо от confidence.
     """
     from src.product_policy import policy_identity_eligibility, policy_offer_eligibility
+
+    sites_in_order = site_profile.viewer_sites(client_site)
+    client = sites_in_order[0]
+    site_order = {site: position for position, site in enumerate(sites_in_order)}
 
     # Bug fix 2026-05-29: `limit` нельзя ставить на запрос кластеров — сначала
     # фильтр по min_sites и свежести цен, потом сортировка, и только потом срез
@@ -257,7 +266,7 @@ def _comparison_rows(
         select(*_COMPARISON_PRODUCT_COLUMNS)
         .where(storage.Product.tenant_id == tenant_id)
         .order_by(
-            case(_SITE_ORDER, value=storage.Product.site, else_=len(_SITE_ORDER)),
+            case(site_order, value=storage.Product.site, else_=len(site_order)),
             storage.Product.id,
         )
     )
@@ -311,9 +320,9 @@ def _comparison_rows(
     def _canonical_key_for(raw_category: str | None) -> str | None:
         cache_key = raw_category or ""
         if cache_key not in _canonical_cache:
-            label_ru, label_az = source_labels.get(("pharmonline", cache_key), (None, None))
+            label_ru, label_az = source_labels.get((client, cache_key), (None, None))
             resolved = classify_source_category(
-                "pharmonline", raw_category, label_ru=label_ru, label_az=label_az
+                client, raw_category, label_ru=label_ru, label_az=label_az
             )
             _canonical_cache[cache_key] = resolved.key if resolved else None
         return _canonical_cache[cache_key]
@@ -326,7 +335,7 @@ def _comparison_rows(
         # Drill-down из /category-comparison: фильтр по категории товара-клиента
         # (pharmonline). None → без фильтра (обычный режим страницы сравнения).
         if category is not None:
-            client_p = next((p for p in products if p.site == site_profile.CLIENT_SITE), None)
+            client_p = next((p for p in products if p.site == client), None)
             if client_p is None:
                 continue
             # Классифицируем ровно так же, как сводка /category-comparison —
@@ -343,7 +352,7 @@ def _comparison_rows(
         # Если товар-КЛИЕНТ (pharmonline) мёртв (404) — матч бесполезен (нечего
         # сравнивать с ценой клиента), дропаем целиком, а не показываем competitor-only
         # строку (аудит M1; зеркалит analytics._iter_matched_prices).
-        if any(p.site == site_profile.CLIENT_SITE and p.url_dead_at is not None for p in products):
+        if any(p.site == client and p.url_dead_at is not None for p in products):
             continue
         prices: dict[str, dict[str, Any]] = {}
         for p in products:

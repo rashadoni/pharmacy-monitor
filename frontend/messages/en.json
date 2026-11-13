@@ -696,7 +696,9 @@
     "integration_decodo_ok": "Connected for: {sites} · port pool: {pool}",
     "integration_decodo_not_ok": "Not configured · scans that require a proxy will be unavailable",
     "telegram_not_configured_title": "⚠️ Telegram bot not configured on server",
-    "telegram_not_configured_hint": "To connect Telegram, first add TELEGRAM_BOT_TOKEN to /etc/pharmacy-monitor/env. Run:"
+    "telegram_not_configured_hint": "To connect Telegram, first add TELEGRAM_BOT_TOKEN to /etc/pharmacy-monitor/env. Run:",
+    "viewer_site_title": "Own store",
+    "viewer_site_hint": "Whose eyes to show prices through: the selected store is “own”, the others are competitors. Applies to comparison, categories, overview and Excel in this browser. The morning letter and alerts are still computed for the instance’s client."
   },
   "severity": {
     "critical": "Critical",

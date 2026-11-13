@@ -1022,6 +1022,7 @@ export const api = {
       site_filter?: string;
       limit?: number;
       category?: string;
+      client_site?: string;
     } = {},
   ) => {
     const q = new URLSearchParams();
@@ -1030,6 +1031,7 @@ export const api = {
     if (params.site_filter) q.set("site_filter", params.site_filter);
     if (params.limit) q.set("limit", String(params.limit));
     if (params.category) q.set("category", params.category);
+    if (params.client_site) q.set("client_site", params.client_site);
     return request<ComparisonRow[]>(`/api/v1/dash/comparison?${q}`);
   },
   /** Поиск по всему каталогу: строки сравнения + товары без пары. */
@@ -1037,10 +1039,12 @@ export const api = {
     q: string;
     min_sites?: number;
     category?: string;
+    client_site?: string;
   }) => {
     const q = new URLSearchParams({ q: params.q });
     if (params.min_sites != null) q.set("min_sites", String(params.min_sites));
     if (params.category) q.set("category", params.category);
+    if (params.client_site) q.set("client_site", params.client_site);
     return request<ComparisonSearchResult>(
       `/api/v1/dash/comparison/search?${q}`,
     );
@@ -1057,6 +1061,7 @@ export const api = {
     with_aloe?: boolean;
     diff_only?: boolean;
     locale: string;
+    client_site?: string;
   }): Promise<{ blob: Blob; filename: string }> => {
     const q = new URLSearchParams({ locale: params.locale });
     if (params.search) q.set("search", params.search);
@@ -1064,6 +1069,7 @@ export const api = {
     if (params.category) q.set("category", params.category);
     if (params.with_aloe) q.set("with_aloe", "true");
     if (params.diff_only) q.set("diff_only", "true");
+    if (params.client_site) q.set("client_site", params.client_site);
     const res = await fetch(`${BASE}/api/v1/dash/comparison/export.xlsx?${q}`, {
       credentials: "include",
     });

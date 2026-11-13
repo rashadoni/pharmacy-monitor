@@ -2442,10 +2442,16 @@ def dash_comparison(
     limit: int = 5000,
     min_confidence: float = 0.70,
     category: str | None = None,
+    client_site: str | None = None,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """Cross-site comparison rows. Filtered by tenant_id automatically."""
+    """Cross-site comparison rows. Filtered by tenant_id automatically.
+
+    `client_site` — чьими глазами строки (см. `site_profile.viewer_sites`).
+    """
+    if client_site is not None:
+        _require_site(client_site)
     _require_financial_policy_ready(db, tenant_id=user.tenant_id)
     if not _has_ok_run(db, tenant_id=user.tenant_id):
         return []
@@ -2463,6 +2469,7 @@ def dash_comparison(
         min_confidence=min_confidence,
         category=category,
         match_ids=match_ids,
+        client_site=client_site,
     )
     return _fast_json(rows[:limit])
 
@@ -2473,6 +2480,7 @@ def dash_comparison_search(
     min_sites: int = 2,
     min_confidence: float = 0.70,
     category: str | None = None,
+    client_site: str | None = None,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
@@ -2483,6 +2491,8 @@ def dash_comparison_search(
     нет: без пары на другом сайте либо с парой, не прошедшей фильтры страницы.
     Без `others` товар, который есть на сайте, для пользователя «не находится».
     """
+    if client_site is not None:
+        _require_site(client_site)
     _require_financial_policy_ready(db, tenant_id=user.tenant_id)
     query = q.strip()
     empty = {"rows": [], "others": [], "others_total": 0}
@@ -2500,6 +2510,7 @@ def dash_comparison_search(
         min_confidence=min_confidence,
         category=category,
         match_ids=match_ids,
+        client_site=client_site,
     )
     shown_match_ids = {row["canonical_id"] for row in rows}
 
@@ -2565,6 +2576,7 @@ def dash_comparison_export(
     with_aloe: bool = False,
     diff_only: bool = False,
     locale: str = "ru",
+    client_site: str | None = None,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
@@ -2576,6 +2588,8 @@ def dash_comparison_export(
     """
     from src import comparison_export
 
+    if client_site is not None:
+        _require_site(client_site)
     _require_financial_policy_ready(db, tenant_id=user.tenant_id)
     locale = _normalize_locale(locale)
     query = (search or "").strip()
@@ -2593,6 +2607,7 @@ def dash_comparison_export(
             min_confidence=min_confidence,
             category=category,
             match_ids=match_ids,
+            client_site=client_site,
         )
     if with_aloe:
         rows = [row for row in rows if "aloe" in row["prices"]]
@@ -2609,6 +2624,7 @@ def dash_comparison_export(
         min_sites=min_sites,
         with_aloe=with_aloe,
         diff_only=diff_only,
+        client_site=client_site,
     )
     log.info(
         "comparison_export",

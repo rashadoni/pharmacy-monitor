@@ -121,3 +121,16 @@ IMPORTED_SITES: tuple[str, ...] = PROFILE.imported_sites
 
 def is_pharmacy() -> bool:
     return PROFILE.name == PHARMACY.name
+
+
+def viewer_sites(client_site: str | None = None) -> tuple[str, ...]:
+    """Сайты экземпляра, «свой» — первым, остальные в порядке профиля.
+
+    `client_site` — чьими глазами смотрит страница. У экземпляра электроники
+    им бывает любой из трёх магазинов (показ продукта каждому из них);
+    аптечный интерфейс его не меняет. None — клиент профиля.
+    """
+    client = client_site or CLIENT_SITE
+    if client not in SITES:
+        raise ValueError(f"unknown client_site: {client!r}")
+    return (client, *(site for site in SITES if site != client))
