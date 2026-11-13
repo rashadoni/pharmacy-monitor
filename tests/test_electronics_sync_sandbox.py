@@ -50,8 +50,13 @@ class Sandbox:
         (front / "package.json").write_text("{}\n", encoding="utf-8")
         # То, что из аптечного каталога интерфейса переходить не должно.
         (front / ".env.production").write_text("NEXT_PUBLIC_TELEGRAM_BOT_USERNAME=pharmacy\n")
-        (front / ".next").mkdir()
-        (front / ".next" / "BUILD_ID").write_text("pharmacy-build\n")
+        # Как на сервере: `.next` живого аптечного каталога — ссылка с полным
+        # путём на его действующую сборку.
+        self.pharmacy_build = tmp_path / "pharmacy-releases" / "abc" / ".next"
+        self.pharmacy_build.mkdir(parents=True)
+        (self.pharmacy_build / "BUILD_ID").write_text("pharmacy-build\n")
+        (self.pharmacy_build / "static.js").write_text("pharmacy static\n")
+        (front / ".next").symlink_to(self.pharmacy_build)
         (front / "node_modules").mkdir()
         (front / "node_modules" / "stale.js").write_text("old\n")
         # Файл окружения, негодный для оболочки: его обязан читать не bash.
@@ -90,9 +95,13 @@ exit 0
         _stub(
             self.bin / "systemctl",
             f'''echo "systemctl $*" >> "{log}"
-case "$1 $2" in
-  "is-active --quiet") unit=${{3//\\*/STAR}}; [[ -f "{self.state}/active-$unit" ]] ;;
-  "restart "*) touch "{self.state}/active-$2" ;;
+case "$1" in
+  is-active) [[ -f "{self.state}/active-$3" ]] ;;
+  restart) touch "{self.state}/active-$2" ;;
+  show)
+    # Юнит сбора — oneshot: пока сбор идёт, он «activating», а не «active».
+    unit=${{@: -1}}
+    if [[ -f "{self.state}/scraping-$unit" ]]; then echo activating; else echo inactive; fi ;;
 esac
 ''',
         )
@@ -102,12 +111,14 @@ esac
             f'''echo "pnpm $* (profile=$NEXT_PUBLIC_PM_PROFILE cwd=$(basename "$PWD"))" >> "{log}"
 if [[ $1 == build ]]; then
   [[ -f "{self.state}/build-fails" ]] && exit 1
-  mkdir -p .next/standalone .next/static
+  mkdir -p .next/standalone .next/static .next/cache
+  echo cached > .next/cache/big
   date +%s%N > .next/BUILD_ID; echo ok > .next/standalone/server.js
 fi
 ''',
         )
         _stub(self.bin / "sleep", "exit 0\n")
+        _stub(self.bin / "pgrep", f'[[ -f "{self.state}/manual-command" ]]\n')
 
         script = SYNC.read_text(encoding="utf-8")
         for original, replacement in (
@@ -166,9 +177,16 @@ def test_first_run_migrates_builds_and_starts_everything(box):
     assert not (box.dst / "frontend-src" / ".env.production").exists()
     assert not (box.dst / "frontend-src" / "node_modules").exists()
     assert (box.dst / "frontend" / ".next" / "BUILD_ID").read_text() != "pharmacy-build\n"
-    # Аптечный каталог не тронут.
-    assert (box.src / "frontend" / ".next" / "BUILD_ID").read_text() == "pharmacy-build\n"
+    # Сборка экземпляра — свой каталог, а не ссылка на аптечную.
+    assert not (box.dst / "frontend-src" / ".next").is_symlink()
+    assert not (box.dst / "frontend" / ".next").is_symlink()
+    # Действующая аптечная сборка не тронута: ни файла не добавлено, не убрано.
+    assert (box.src / "frontend" / ".next").is_symlink()
+    assert sorted(path.name for path in box.pharmacy_build.iterdir()) == ["BUILD_ID", "static.js"]
+    assert (box.pharmacy_build / "BUILD_ID").read_text() == "pharmacy-build\n"
     assert (box.src / "frontend" / "node_modules" / "stale.js").exists()
+    # Кэш сборки в рабочий каталог не копируется.
+    assert not (box.dst / "frontend" / ".next" / "cache").exists()
 
 
 def test_second_run_without_changes_restarts_and_builds_nothing(box):
@@ -234,13 +252,29 @@ def test_failed_build_leaves_the_running_site_as_it_was(box):
     assert box.did("pnpm build")
 
 
-def test_running_scrape_postpones_the_sync(box):
-    (box.state / "active-electro-monitor-scrape@STAR.service").touch()
+@pytest.mark.parametrize(
+    "marker", ["scraping-electro-monitor-scrape@irshad.service", "manual-command"]
+)
+def test_running_scrape_or_manual_command_postpones_the_sync(box, marker):
+    # Ночной сбор (oneshot-юнит в состоянии «activating») и команда, запущенная
+    # руками во временном юните.
+    (box.state / marker).touch()
     done = box.run()
     assert done.returncode == 0
-    assert "идёт сбор" in done.stdout
+    assert "пропуск" in done.stdout
     assert not (box.dst / "src" / "main.py").exists()
     assert not box.did("alembic")
+
+
+def test_build_directory_that_is_a_link_is_refused(box):
+    # Остаток прежней ошибки или чужая рука: каталог сборки — ссылка. Сборка
+    # сквозь неё ушла бы в чужое место.
+    (box.dst / "frontend-src" / ".next").symlink_to(box.pharmacy_build)
+    done = box.run()
+    assert done.returncode != 0
+    assert "ссылка" in done.stderr
+    assert not box.did("pnpm")
+    assert sorted(path.name for path in box.pharmacy_build.iterdir()) == ["BUILD_ID", "static.js"]
 
 
 def test_unhealthy_api_fails_the_sync(box):

@@ -1,9 +1,12 @@
 """Файл окружения экземпляра электроники — из аптечного, по белому списку.
 
-Запускает install.sh от root: `python make-env.py <аптечный файл> <новый файл>
-<база> <адрес сайта>`. Значения секретов никуда не печатаются; единственное,
-что уходит в вывод, — новый пароль входа (последней строкой, для владельца) и
-имя роли PostgreSQL (первой, для `createdb`).
+Запускает install.sh от root системным интерпретатором в изолированном режиме
+(`/usr/bin/python3 -I`): только стандартная библиотека, ничего из каталогов
+учётки pm. Вызов: `make-env.py <аптечный файл> <новый файл> <база> <адрес сайта>`.
+
+Значения секретов никуда не печатаются. В вывод уходят две строки: имя роли
+PostgreSQL (для `createdb`) и новый пароль входа (его install.sh показывает
+владельцу один раз).
 
 Переносится только то, что экземпляру нужно и что у экземпляров общее: почта
 для отправки и учётка прокси. Всё остальное — в том числе `EMAIL_TO` (список
@@ -15,25 +18,23 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import sys
 from urllib.parse import urlsplit, urlunsplit
-
-import bcrypt
-from sqlalchemy.engine import make_url
 
 CARRIED = (
     "SMTP_HOST",
     "SMTP_PORT",
     "SMTP_USER",
     "SMTP_PASSWORD",
-    "SMTP_FROM",
     "DECODO_USERNAME",
     "DECODO_PASSWORD",
     "DECODO_HOST",
     "DECODO_PORTS",
     "DECODO_PAGE_ATTEMPTS",
 )
+APP_NAME = "Price Monitor"
 
 
 def read_env(path: str) -> dict[str, str]:
@@ -52,6 +53,22 @@ def read_env(path: str) -> dict[str, str]:
     return values
 
 
+def password_hash(password: str) -> str:
+    """bcrypt-хеш пароля — тот же вид, что проверяет вход (`$2b$…`)."""
+    try:
+        import bcrypt
+    except ImportError:
+        # Системный интерпретатор сервера без пакета bcrypt: тот же алгоритм
+        # через libxcrypt.
+        import crypt
+
+        hashed = crypt.crypt(password, crypt.mksalt(crypt.METHOD_BLOWFISH))
+        if not hashed or not hashed.startswith("$2"):
+            raise RuntimeError("системная библиотека не умеет bcrypt") from None
+        return hashed
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
 def main() -> int:
     source_path, target_path, database, site_url = sys.argv[1:5]
     source = read_env(source_path)
@@ -60,12 +77,22 @@ def main() -> int:
     if not raw_url:
         print("в аптечном файле окружения нет DATABASE_URL", file=sys.stderr)
         return 1
-    url = make_url(raw_url)
-    if not url.database or url.database == database:
+    parts = urlsplit(raw_url)
+    current = parts.path.lstrip("/")
+    if not current or "/" in current or current == database:
         print("адрес аптечной базы не содержит имени базы или уже называет новую", file=sys.stderr)
         return 1
-    # Та же учётка и тот же сервер, другая база; параметры адреса сохраняются.
-    new_url = url.set(database=database).render_as_string(hide_password=False)
+    if not parts.username:
+        print("в адресе аптечной базы нет имени роли PostgreSQL", file=sys.stderr)
+        return 1
+    # Та же учётка и тот же сервер, другая база. Меняется только имя базы:
+    # остальное остаётся буква в букву, как в аптечном файле. Пересборка адреса
+    # закодировала бы знаки пароля через «%», а на «%» в адресе спотыкается
+    # файл настроек миграций — и печатает адрес целиком.
+    new_url = urlunsplit(parts._replace(path=f"/{database}"))
+    if new_url.count("%") != raw_url.count("%"):
+        print("адрес базы после замены имени изменился не только в имени — отказ", file=sys.stderr)
+        return 1
 
     lines = [
         "# Экземпляр электроники. Создан install.sh; аптечный файл — образец, не источник правды.",
@@ -74,24 +101,34 @@ def main() -> int:
     ]
     redis = source.get("REDIS_URL", "")
     if redis:
-        parts = urlsplit(redis)
-        current = parts.path.strip("/")
-        if parts.scheme in {"redis", "rediss"} and (current.isdigit() or current == ""):
+        redis_parts = urlsplit(redis)
+        index = redis_parts.path.strip("/")
+        plain = redis_parts.scheme in {"redis", "rediss"} and not redis_parts.query
+        if plain and (index.isdigit() or index == ""):
             # Своя база Redis: счётчики запросов и замки не делятся с аптеками.
-            mine = (int(current) if current else 0) + 1
-            lines.append(f"REDIS_URL={urlunsplit(parts._replace(path=f'/{mine}'))}")
+            mine = (int(index) if index else 0) + 1
+            lines.append(f"REDIS_URL={urlunsplit(redis_parts._replace(path=f'/{mine}'))}")
         # Адрес другого вида (сокет, параметры) не переписывается: без REDIS_URL
         # счётчики живут в памяти процесса, это безопаснее общей базы.
     for key in CARRIED:
         if source.get(key):
             lines.append(f"{key}={source[key]}")
+    sender = source.get("SMTP_FROM", "")
+    if sender:
+        # Адрес отправителя общий, имя — своё: письма экземпляра не подписаны аптечным.
+        address = re.search(r"<([^<>]+)>", sender)
+        lines.append(
+            f"SMTP_FROM={APP_NAME} <{address.group(1)}>" if address else f"SMTP_FROM={sender}"
+        )
 
     password = secrets.token_urlsafe(15)
     lines += [
         f"JWT_SECRET={secrets.token_hex(32)}",
         f"PHARMACY_API_KEY={secrets.token_hex(24)}",
-        "ADMIN_PASSWORD_HASH=" + bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
+        f"ADMIN_PASSWORD_HASH={password_hash(password)}",
         f"PHARMACY_PUBLIC_URL={site_url}",
+        # Сайт открывается только по HTTPS: кука сессии — с признаком Secure.
+        "PHARMACY_COOKIE_SECURE=true",
         # Через прокси ходит только Baku Electronics; Irshad открывается напрямую.
         "DECODO_SITES=bakuelectronics",
         "SCRAPE_REPORT_EMAIL=0",
@@ -101,7 +138,7 @@ def main() -> int:
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
 
-    print(url.username or "")
+    print(parts.username)
     print(password)
     return 0
 

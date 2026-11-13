@@ -101,14 +101,21 @@ def test_sync_refuses_a_foreign_environment_and_builds_with_the_profile():
     assert 'EnvironmentFile="$ENV_FILE"' in sync
     assert not re.search(r"(^|\s)(\.|source)\s+\"?\$ENV_FILE", sync, re.M)
     # Приватные файлы сборки аптечного интерфейса и его сборка сюда не переходят.
-    for excluded in ("'.env*'", "'.next/'", "'node_modules/'"):
+    # Исключения — БЕЗ косой черты: с ней rsync ловит только каталоги, а
+    # `.next` живого аптечного каталога — ссылка на его действующую сборку.
+    for excluded in ("'.env*'", "'.next'", "'node_modules'"):
         assert f"--exclude {excluded}" in sync, excluded
+    assert "--exclude '.next/'" not in sync and "--exclude 'node_modules/'" not in sync
+    for line in sync.splitlines():
+        if "as_pm rsync" in line and "$SRC/" in line:
+            assert "--safe-links" in line or line.rstrip().endswith("\\"), line
     # Миграции и метка базы — каждый раз, а не «если код изменился».
     body_before_restart = sync[: sync.index("перезапуск API")]
     assert "-m alembic upgrade head" in body_before_restart
     assert "-m src.main init-db" in body_before_restart
     # Под идущим сбором код не меняют.
-    assert "electro-monitor-scrape@*.service" in sync
+    assert "systemctl show -p ActiveState" in sync
+    assert "is-active --quiet 'electro-monitor-scrape" not in sync
 
 
 def test_root_never_executes_or_writes_what_pm_can_replace():
@@ -128,6 +135,19 @@ def test_root_never_executes_or_writes_what_pm_can_replace():
         assert "chown" not in line, line
     front = (INFRA / "systemd" / "electro-monitor-frontend.service").read_text("utf-8")
     assert "ExecStartPre=+" not in front
+    # Сам сценарий установки исполняет от root только системный интерпретатор
+    # в изолированном режиме: venv аптечного экземпляра принадлежит pm.
+    assert 'SYSPY="/usr/bin/python3 -I"' in install
+    # Тело обёртки `electro-monitor` — не команды установки: её строка с
+    # интерпретатором исполняется уже от pm, внутри временного юнита.
+    body = re.sub(r"<<WRAP\n.*?\nWRAP\n", "\n", install, flags=re.S)
+    for line in body.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        # Интерпретатор из venv — в начале команды или сразу после «$(».
+        assert not re.search(r'(^\s*|\$\(\s*)"?\$PY"?\s', line), line
+    # Повторный запуск идёт из каталога установки: файл в самого себя не копируется.
+    assert "if [[ ! $HERE -ef $LIB ]]; then" in install
 
 
 def test_units_and_scripts_never_call_the_venv_console_scripts():
@@ -174,13 +194,18 @@ def test_caddy_is_changed_only_through_a_validated_copy():
     assert install.index("CADDYFILE=/etc/caddy/Caddyfile") < install.index("for arg in")
 
 
-def _make_env(tmp_path, source_text):
+# На сервере помощник исполняет системный интерпретатор в изолированном режиме,
+# без пакетов проекта; здесь — он же, если есть, и интерпретатор тестов.
+SYSTEM_PYTHON = ["/usr/bin/python3", "-I"] if Path("/usr/bin/python3").exists() else None
+
+
+def _make_env(tmp_path, source_text, interpreter=(sys.executable,)):
     source = tmp_path / "pharmacy.env"
     source.write_text(source_text, encoding="utf-8")
     target = tmp_path / "electro.env"
     done = subprocess.run(
         [
-            sys.executable,
+            *interpreter,
             str(INFRA / "make-env.py"),
             str(source),
             str(target),
@@ -200,7 +225,7 @@ def _make_env(tmp_path, source_text):
 
 
 PHARMACY_ENV = """# старый секрет в комментарии: JWT_SECRET=old-commented-secret
-DATABASE_URL="postgresql+psycopg://pm:p%40ss$word@127.0.0.1:5432/pharmacy_monitor?sslmode=require&application_name=pm/api"
+DATABASE_URL="postgresql+psycopg://pm:p%40ss$word!x=y@127.0.0.1:5432/pharmacy_monitor?sslmode=require&application_name=pm/api"
 REDIS_URL=redis://127.0.0.1:6379/0
 JWT_SECRET=pharmacy-jwt-secret
 PHARMACY_API_KEY=pharmacy-api-key
@@ -225,24 +250,19 @@ def test_environment_is_built_from_a_whitelist(tmp_path):
     assert done.returncode == 0, done.stderr
     assert values["PM_PROFILE"] == "electronics"
     # Та же учётка и сервер, другая база; параметры адреса и «/» внутри них целы.
-    from sqlalchemy.engine import make_url
-
-    url = make_url(values["DATABASE_URL"])
-    assert (url.drivername, url.username, url.password, url.host, url.port, url.database) == (
-        "postgresql+psycopg",
-        "pm",
-        "p@ss$word",
-        "127.0.0.1",
-        5432,
-        "electro_monitor",
+    # Та же учётка и сервер, другая база. Меняется только имя базы: остальное —
+    # буква в букву, без перекодирования («%» в адресе роняет миграции).
+    assert values["DATABASE_URL"] == (
+        "postgresql+psycopg://pm:p%40ss$word!x=y@127.0.0.1:5432/electro_monitor"
+        "?sslmode=require&application_name=pm/api"
     )
-    assert dict(url.query) == {"sslmode": "require", "application_name": "pm/api"}
-    assert "pharmacy_monitor" not in values["DATABASE_URL"]
     # Своя база Redis.
     assert values["REDIS_URL"] == "redis://127.0.0.1:6379/1"
     # Почта для отправки и учётка прокси переносятся как есть, с пробелами и «$».
     assert values["SMTP_PASSWORD"] == "smtp secret with spaces"
-    assert values["SMTP_FROM"] == "Pharmacy Monitor <digest@example>"
+    # Адрес отправителя общий, имя — своё.
+    assert values["SMTP_FROM"] == "Price Monitor <digest@example>"
+    assert values["PHARMACY_COOKIE_SECURE"] == "true"
     assert values["DECODO_PASSWORD"] == "dec$odo=pass"
     assert values["DECODO_SITES"] == "bakuelectronics"
     assert values["PHARMACY_PUBLIC_URL"] == "https://electro.example"
@@ -270,8 +290,24 @@ def test_environment_is_built_from_a_whitelist(tmp_path):
     import bcrypt
 
     assert bcrypt.checkpw(password.encode(), values["ADMIN_PASSWORD_HASH"].encode())
-    for secret in ("p%40ss", "p@ss", "smtp secret", "dec$odo", values["JWT_SECRET"]):
+    for secret in ("p%40ss", "word!x", "smtp secret", "dec$odo", values["JWT_SECRET"]):
         assert secret not in done.stdout + done.stderr
+
+
+@pytest.mark.skipif(SYSTEM_PYTHON is None, reason="нет системного интерпретатора")
+def test_environment_helper_runs_on_the_bare_system_interpreter(tmp_path):
+    # Без пакетов проекта: только стандартная библиотека, хеш пароля — bcrypt.
+    done, _, values = _make_env(tmp_path, PHARMACY_ENV, interpreter=SYSTEM_PYTHON)
+    assert done.returncode == 0, done.stderr
+    import bcrypt
+
+    role, password = done.stdout.splitlines()
+    assert role == "pm"
+    assert values["ADMIN_PASSWORD_HASH"].startswith("$2")
+    assert bcrypt.checkpw(password.encode(), values["ADMIN_PASSWORD_HASH"].encode())
+    assert values["DATABASE_URL"].endswith(
+        "/electro_monitor?sslmode=require&application_name=pm/api"
+    )
 
 
 def test_environment_helper_refuses_instead_of_guessing(tmp_path):
@@ -279,6 +315,17 @@ def test_environment_helper_refuses_instead_of_guessing(tmp_path):
     done, target, _ = _make_env(tmp_path, "SMTP_HOST=smtp.example\n")
     assert done.returncode != 0 and not target.exists()
     assert "DATABASE_URL" in done.stderr
+
+    # Адрес без имени роли (сокет) или без имени базы — отказ ДО создания файла:
+    # иначе пароль входа был бы выдан, а установка не прошла бы никогда.
+    for url in (
+        "postgresql:///pharmacy_monitor",
+        "postgresql://pm:x@h/",
+        "postgresql://pm:x@h/electro_monitor",
+    ):
+        done, target, _ = _make_env(tmp_path, f"DATABASE_URL={url}\n")
+        assert done.returncode != 0 and not target.exists(), url
+        assert "x@h" not in done.stderr
 
     # Существующий файл не перезаписывается: пароль входа в нём уже выдан.
     done, target, values = _make_env(tmp_path, PHARMACY_ENV)

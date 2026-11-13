@@ -30,9 +30,20 @@ grep -qx "PM_PROFILE=$PROFILE" "$ENV_FILE" || {
 grep -q '^DATABASE_URL=' "$ENV_FILE" || { echo "sync: в $ENV_FILE нет DATABASE_URL — отказ" >&2; exit 1; }
 
 # Под идущим сбором код не меняют: сбор Irshad длится часами и дочитал бы
-# половину модулей новыми.
-if systemctl is-active --quiet 'electro-monitor-scrape@*.service'; then
-    echo "sync: идёт сбор — пропуск, повторить после него"
+# половину модулей новыми. Юнит сбора — oneshot: пока сбор идёт, его состояние
+# «activating», и `is-active` ответил бы «нет» — поэтому состояние читается явно.
+for site in bakuelectronics irshad; do
+    state=$(systemctl show -p ActiveState --value "electro-monitor-scrape@$site.service" 2>/dev/null || true)
+    case $state in
+        activating|active|deactivating|reloading)
+            echo "sync: идёт сбор $site — пропуск, повторить после него"
+            exit 0 ;;
+    esac
+done
+# Сбор или загрузка каталога, запущенные руками командой electro-monitor,
+# идут во временном юните; их видно только по процессу.
+if pgrep -u pm -f 'python -m src\.main (run|scrape|catalog|rematch)' >/dev/null 2>&1; then
+    echo "sync: идёт ручная команда экземпляра (run / scrape / catalog / rematch) — пропуск"
     exit 0
 fi
 
@@ -58,17 +69,22 @@ fingerprint() {  # отпечаток дерева файлов относите
 # --- код ---------------------------------------------------------------------
 # Сверка по содержимому (--checksum), как в выкладке: правку, не изменившую
 # размер файла в ту же секунду, сверка по времени пропустила бы.
-as_pm rsync -a --checksum --delete --exclude '__pycache__/' --exclude '*.pyc' "$SRC/src/" "$DST/src/"
+as_pm rsync -a --checksum --delete --safe-links --exclude '__pycache__/' --exclude '*.pyc' "$SRC/src/" "$DST/src/"
 # env.py и alembic.ini — те, что лежат в живом аптечном каталоге: выкладка их
 # там намеренно не обновляет, и миграции обоих экземпляров идут на одном и том же.
-as_pm rsync -a --checksum --delete --exclude '__pycache__/' --exclude '*.pyc' "$SRC/migrations/" "$DST/migrations/"
-as_pm rsync -a --checksum "$SRC/alembic.ini" "$DST/alembic.ini"
-if [[ -d $SRC/templates ]]; then as_pm rsync -a --checksum --delete "$SRC/templates/" "$DST/templates/"; fi
+as_pm rsync -a --checksum --delete --safe-links --exclude '__pycache__/' --exclude '*.pyc' "$SRC/migrations/" "$DST/migrations/"
+as_pm rsync -a --checksum --safe-links "$SRC/alembic.ini" "$DST/alembic.ini"
+if [[ -d $SRC/templates ]]; then as_pm rsync -a --checksum --delete --safe-links "$SRC/templates/" "$DST/templates/"; fi
 # Исходники интерфейса; сборка, зависимости и приватные файлы сборки аптечного
 # экземпляра (.env*) сюда не переходят.
-as_pm rsync -a --checksum --delete \
-    --exclude 'node_modules/' --exclude '.next/' --exclude '.next.*/' --exclude '*.tsbuildinfo' \
-    --exclude 'test-results/' --exclude '.env*' --exclude '.electro-*' \
+# ⚠️ Исключения — без косой черты на конце: с ней правило rsync ловит только
+# каталоги, а `.next` в живом аптечном каталоге — ссылка на его действующую
+# сборку. Скопированная ссылка означала бы сборку интерфейса электроники прямо
+# поверх работающего аптечного сайта. --safe-links не переносит ни одну ссылку,
+# ведущую за пределы каталога.
+as_pm rsync -a --checksum --delete --safe-links \
+    --exclude 'node_modules' --exclude '.next' --exclude '.next.*' --exclude '*.tsbuildinfo' \
+    --exclude 'test-results' --exclude '.env*' --exclude '.electro-*' \
     "$SRC/frontend/" "$DST/frontend-src/"
 
 # --- база: каждый раз --------------------------------------------------------
@@ -92,6 +108,13 @@ front_was=$(cat "$DST/frontend/.electro-build-fingerprint" 2>/dev/null || true)
 if [[ $front_now != "$front_was" || ! -f $DST/frontend/.next/standalone/server.js ]]; then
     echo "sync: сборка интерфейса (в стороне, работающий сайт не трогается)"
     # Собирается в frontend-src; в рабочий каталог переносится готовая сборка.
+    # Каталог сборки обязан быть своим, а не ссылкой куда-то ещё.
+    for own in "$DST/frontend-src/.next" "$DST/frontend-src/node_modules" "$DST/frontend/.next"; do
+        if as_pm test -L "$own"; then
+            echo "sync: $own — ссылка, а не каталог; отказ (сборка ушла бы в чужое место)" >&2
+            exit 1
+        fi
+    done
     as_pm bash -lc "cd '$DST/frontend-src' \
         && NODE_OPTIONS=--max-old-space-size=3072 pnpm install --frozen-lockfile </dev/null \
         && NEXT_PUBLIC_PM_PROFILE=$PROFILE NEXT_PUBLIC_API_URL=http://127.0.0.1:$API_PORT \
@@ -100,6 +123,7 @@ if [[ $front_now != "$front_was" || ! -f $DST/frontend/.next/standalone/server.j
     as_pm bash -c 'set -e; cd "$1"
         rm -rf frontend/.next.new frontend/.next.old
         cp -a frontend-src/.next frontend/.next.new
+        rm -rf frontend/.next.new/cache
         rm -rf frontend/public && { [ ! -d frontend-src/public ] || cp -a frontend-src/public frontend/public; }
         [ ! -d frontend/.next ] || mv frontend/.next frontend/.next.old
         mv frontend/.next.new frontend/.next

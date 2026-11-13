@@ -39,6 +39,9 @@ LIB=/usr/local/lib/electro-monitor
 WRAPPER=/usr/local/bin/electro-monitor
 CADDYFILE=/etc/caddy/Caddyfile
 PY="$SRC/.venv/bin/python"
+# Сам сценарий исполняет от root только системный интерпретатор в изолированном
+# режиме: venv аптечного экземпляра принадлежит pm.
+SYSPY="/usr/bin/python3 -I"
 API_PORT=8090
 WEB_PORT=3010
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -80,16 +83,25 @@ if (( CHECK )); then
     echo "    [проверка] скопировать sync.sh, install.sh, make-env.py, Caddyfile.block, systemd/"
 else
     install -d -o root -g root -m 755 "$LIB" "$LIB/systemd"
-    install -o root -g root -m 755 "$HERE/install.sh" "$HERE/sync.sh" "$LIB/"
-    install -o root -g root -m 644 "$HERE/make-env.py" "$HERE/Caddyfile.block" "$LIB/"
-    install -o root -g root -m 644 "$HERE"/systemd/electro-monitor-* "$LIB/systemd/"
+    # Повторный запуск идёт уже из $LIB: копировать файл в самого себя нельзя.
+    if [[ ! $HERE -ef $LIB ]]; then
+        install -o root -g root -m 755 "$HERE/install.sh" "$HERE/sync.sh" "$LIB/"
+        install -o root -g root -m 644 "$HERE/make-env.py" "$HERE/Caddyfile.block" "$LIB/"
+        install -o root -g root -m 644 "$HERE"/systemd/electro-monitor-* "$LIB/systemd/"
+    fi
     cat > "$WRAPPER" <<WRAP
 #!/usr/bin/env bash
 # Команда экземпляра электроники: его окружение, его каталог, его код.
 # \`pharmacy-monitor …\` из venv исполнил бы аптечный код — для этого экземпляра
-# всегда эта команда. Файл для \`catalog import\` должен читаться учёткой pm.
+# всегда эта команда.
+#
+# Команда идёт во временном юните от учётки pm, в каталоге экземпляра:
+#   * путь к файлу для \`catalog import\` — полный, и файл должен читаться pm
+#     (из /root она его не прочтёт; положите, например, в /tmp);
+#   * Ctrl-C останавливает ожидание, но не саму команду: её юнит видно в
+#     \`systemctl list-units 'run-*'\`, остановить — \`systemctl stop <юнит>\`.
 [[ \$EUID -eq 0 ]] || { echo "electro-monitor: запускать от root" >&2; exit 1; }
-exec systemd-run --quiet --wait --pipe --collect \\
+exec systemd-run --quiet --wait --pipe --collect --expand-environment=no \\
     -p User=pm -p Group=pm \\
     -p EnvironmentFile=$ENV_FILE -p WorkingDirectory=$DST \\
     $PY -m src.main "\$@"
@@ -102,18 +114,18 @@ say "файл окружения $ENV_FILE"
 do_or_show install -d -o root -g pm -m 750 "$ENV_DIR"
 if [[ -f $ENV_FILE ]]; then
     echo "    уже есть — не меняю (пароль входа был показан при создании)"
-    db_role=$("$PY" -c 'import sys
-from sqlalchemy.engine import make_url
+    db_role=$($SYSPY -c 'import sys
+from urllib.parse import urlsplit
 for line in open(sys.argv[1], encoding="utf-8"):
     if line.startswith("DATABASE_URL="):
-        print(make_url(line.split("=", 1)[1].strip().strip(chr(34)).strip(chr(39))).username or "")
+        print(urlsplit(line.split("=", 1)[1].strip().strip(chr(34)).strip(chr(39))).username or "")
         break' "$ENV_FILE")
 elif (( CHECK )); then
     echo "    [проверка] создать: своя база, свои JWT_SECRET, ключ API и пароль входа;"
     echo "    [проверка] из аптечного — только почта для отправки и учётка прокси"
     db_role=pm
 else
-    made=$(umask 077; "$PY" "$LIB/make-env.py" "$SRC_ENV" "$ENV_FILE" "$DB" "https://$DOMAIN")
+    made=$(umask 077; $SYSPY "$LIB/make-env.py" "$SRC_ENV" "$ENV_FILE" "$DB" "https://$DOMAIN")
     chown root:pm "$ENV_FILE"; chmod 640 "$ENV_FILE"
     db_role=$(sed -n 1p <<<"$made")
     echo "    создан (значения не печатаются)"
@@ -143,7 +155,12 @@ else
     install -o root -g root -m 644 "$LIB"/systemd/electro-monitor-* /etc/systemd/system/
     systemctl daemon-reload
     systemctl enable electro-monitor-api.service electro-monitor-frontend.service >/dev/null
-    "$LIB/sync.sh"
+    if ! "$LIB/sync.sh"; then
+        echo >&2
+        echo "Шаг не завершён: синхронизация кода упала (причина — выше)." >&2
+        echo "После исправления повторите: bash $LIB/install.sh" >&2
+        exit 1
+    fi
     systemctl enable --now electro-monitor-sync.timer >/dev/null
     systemctl is-active electro-monitor-api.service electro-monitor-frontend.service | sed 's/^/    /'
 fi
