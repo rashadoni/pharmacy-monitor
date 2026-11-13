@@ -1017,6 +1017,36 @@ def test_bakuelectronics_card_without_a_name_is_still_a_product():
     assert build_be_product({**item, "slug": "198095"}, "c") is None
 
 
+@pytest.mark.parametrize(("nameless", "complete"), [(5, True), (6, False)])
+async def test_bakuelectronics_many_cards_without_names_make_the_section_incomplete(
+    nameless, complete
+):
+    # Одна-две карточки без названия — битые карточки сайта. Больше пяти в
+    # разделе — сайт сменил формат: принять такой раздел значило бы заменить
+    # названия адресами страниц.
+    items = []
+    for number in range(12):
+        item = be_item(code=1000 + number)
+        item["slug"] = f"tovar-{1000 + number}"
+        if number < nameless:
+            item["name"] = None
+        items.append(item)
+    scraper = fast(BakuElectronicsScraper)
+
+    def site(request):
+        if urlsplit(str(request.url)).path == "/":
+            return httpx.Response(200, text=be_home())
+        return httpx.Response(200, json=be_page(items, len(items)))
+
+    serve(scraper, site)
+    products = [product async for product in scraper.scrape_category("c")]
+    status = scraper._route_statuses["c"]
+    assert status.complete is complete
+    assert len(products) == 12
+    if not complete:
+        assert status.abort_reason == "too_many_items_without_name"
+
+
 def test_bakuelectronics_product_fields():
     product = build_be_product(be_item(), "telefonlar-qadcetler/smartfonlar-mobil-telefonlar")
     assert product.site == "bakuelectronics"
