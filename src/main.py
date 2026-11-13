@@ -3060,6 +3060,18 @@ def _scraper_classes() -> dict[str, type[BaseScraper]]:
 
 
 SCRAPER_CLASSES: dict[str, type[BaseScraper]] = _scraper_classes()
+if set(SCRAPER_CLASSES) != set(site_profile.SITES):
+    # Профиль без своих сборщиков — или сборщики чужого профиля: прогон
+    # собирал бы не те сайты, что ждут все остальные реестры.
+    raise RuntimeError(
+        f"profile {site_profile.PROFILE.name!r} lists sites {sorted(site_profile.SITES)}, "
+        f"scrapers exist for {sorted(SCRAPER_CLASSES)}"
+    )
+
+
+def _default_scrape_sites() -> list[str]:
+    """Сайты команды без `--site`: все, кроме тех, чей каталог приходит файлом."""
+    return [site for site in SCRAPER_CLASSES if site not in site_profile.IMPORTED_SITES]
 
 # Phase 1.4 (2026-05-27) — AI crawler fallback orchestration.
 #
@@ -6363,7 +6375,7 @@ def run_cmd(
     request_id: int | None,
 ) -> None:
     """Полный прогон: scrape → match → analyze → report."""
-    sites = list(site) if site else list(SCRAPER_CLASSES.keys())
+    sites = list(site) if site else _default_scrape_sites()
     # Как режим задал вызывающий — до того, как его перепишут маркер ниже и
     # разбор режима. Нужен гварду ритма: явный public_api идёт мимо него.
     requested_mode = mode
@@ -7111,7 +7123,7 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
 
     Возвращает id прогона (для `ctx.invoke`), None если сбор не состоялся.
     """
-    sites = list(site) if site else list(SCRAPER_CLASSES.keys())
+    sites = list(site) if site else _default_scrape_sites()
     if _pharmonline_public_api_enabled():
         raise click.ClickException(
             "PHARMONLINE_PUBLIC_API is recovery-only; use run --site pharmonline --mode public_api"

@@ -1,11 +1,18 @@
 """Общие фикстуры для тестов: shared in-memory SQLite через StaticPool."""
 
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+import os
 
-from src.storage import Base
+# Набор тестов аптечный: профиль читается при импорте `src`, поэтому переменная
+# из оболочки разработчика (экземпляр электроники) снимается до первого импорта.
+# Другой профиль тесты проверяют отдельным процессом (tests/test_site_profile.py).
+os.environ.pop("PM_PROFILE", None)
+
+import pytest  # noqa: E402
+from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+from sqlalchemy.pool import StaticPool  # noqa: E402
+
+from src.storage import Base  # noqa: E402
 
 
 @pytest.fixture

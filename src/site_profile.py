@@ -38,7 +38,8 @@ class SiteProfile:
     cadence_hours: dict[str, int]
     # Сайты, которые частичный тик вправе собирать между полными сборами.
     intraday_sites: tuple[str, ...] = ()
-    # Сайты, чей каталог приходит файлом, а не сборщиком по расписанию.
+    # Сайты, чей каталог приходит файлом, а не сборщиком по расписанию: `run`
+    # и `scrape` без `--site` их не собирают.
     imported_sites: tuple[str, ...] = field(default=())
 
     @property
@@ -70,9 +71,11 @@ PHARMACY = SiteProfile(
 )
 
 # Kontakt Home сборщиком с сервера не читается (проверка Cloudflare), его
-# каталог приходит файлом — отсюда длинный ритм: «устарел» он не через сутки,
-# а когда файл давно не обновляли. Срок можно задать переменной
-# ``KONTAKT_CATALOG_MAX_AGE_DAYS`` (читает src/cadence.py).
+# каталог придёт файлом — отсюда длинный ритм: «устарел» он не через сутки.
+# ⚠️ Ритм — это сетка окон, а не возраст файла (`cadence.cadence_window_start`):
+# файл, загруженный накануне границы двухнедельного окна, наутро считается
+# просроченным. Загрузке из файла (шаг 2в в docs/ELECTRONICS.md) нужно своё
+# правило — по возрасту последней загрузки; до тех пор число здесь условное.
 ELECTRONICS = SiteProfile(
     name="electronics",
     sites=("kontakt", "irshad", "bakuelectronics"),
@@ -118,8 +121,3 @@ IMPORTED_SITES: tuple[str, ...] = PROFILE.imported_sites
 
 def is_pharmacy() -> bool:
     return PROFILE.name == PHARMACY.name
-
-
-def site_title(site: str) -> str:
-    """Подпись сайта для человека; незнакомый сайт подписывается своим именем."""
-    return SITE_TITLES.get(site, site)

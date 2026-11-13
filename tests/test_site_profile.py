@@ -46,6 +46,7 @@ print("REGISTRIES=" + json.dumps({
     "health_max_age_hours": health._SITE_MAX_AGE_HOURS,
     "scrapers": {site: cls.__name__ for site, cls in main.SCRAPER_CLASSES.items()},
     "validate_links_client": main._VALIDATE_CLIENT_SITE,
+    "sites_scraped_without_site_option": main._default_scrape_sites(),
 }))
 """
 
@@ -55,7 +56,9 @@ def _registries(profile: str | None, tmp_path: Path) -> dict:
     if profile is not None:
         env[site_profile.PROFILE_ENV] = profile
     env["DATABASE_URL"] = f"sqlite:///{tmp_path / 'profile.db'}"
-    env.pop("SENTRY_DSN", None)
+    # Переменные, которые меняют сборщик pharmonline, тест не проверяет.
+    for name in ("SENTRY_DSN", "PHARMONLINE_PUBLIC_API", "PHARMONLINE_USE_DDP"):
+        env.pop(name, None)
     env["PYTHONPATH"] = str(ROOT)
     done = subprocess.run(
         [sys.executable, "-c", _REGISTRY_DUMP],
@@ -105,6 +108,7 @@ def test_pharmacy_instance_keeps_every_registry_it_had(profile, tmp_path):
             "aloe": "AloeScraper",
         },
         "validate_links_client": "pharmonline",
+        "sites_scraped_without_site_option": PHARMACY_SITES,
     }
 
 
@@ -137,6 +141,8 @@ def test_electronics_instance_sees_only_its_own_sites(tmp_path):
         "bakuelectronics": "BakuElectronicsScraper",
     }
     assert registries["validate_links_client"] == "kontakt"
+    # Kontakt Home приходит файлом: команда без --site его не собирает.
+    assert registries["sites_scraped_without_site_option"] == ["irshad", "bakuelectronics"]
     # Ни один аптечный сайт не просочился ни в один реестр.
     assert not re.search(r"pharmonline|aptekonline|aloe", json.dumps(registries))
 
