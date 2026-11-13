@@ -7824,6 +7824,108 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
 # ============================================================================
 
 
+@cli.group("routes")
+def routes_group() -> None:
+    """Разделы сайта для полного сбора (сайты без колонки в categories)."""
+
+
+def _route_sync_sites() -> list[str]:
+    """Сайты, чьи разделы находит сам сборщик и хранит `site_routes`."""
+    return [
+        site
+        for site, scraper in SCRAPER_CLASSES.items()
+        if site not in watchlist.CATEGORY_SLUG_FIELDS and hasattr(scraper, "discover_categories")
+    ]
+
+
+@routes_group.command("sync")
+@click.option("--site", "site", required=True, type=click.Choice(_route_sync_sites()))
+@click.option("--dry-run", is_flag=True, help="Показать, что изменится, и ничего не записать.")
+@click.option(
+    "--allow-shrink",
+    is_flag=True,
+    help="Записать, даже если с сайта разом исчезла заметная часть разделов.",
+)
+def routes_sync(site: str, dry_run: bool, allow_shrink: bool) -> None:
+    """Сверить список разделов сайта с самим сайтом и записать изменения.
+
+    Обход разделов идёт по живому сайту. Он либо полон, либо отказывает:
+    раздел, который не удалось прочитать, — ошибка, список при этом не меняется.
+    """
+    from src import site_routes
+
+    async def discover() -> list[str]:
+        async with SCRAPER_CLASSES[site]() as scraper:
+            return await scraper.discover_categories()
+
+    try:
+        discovered = asyncio.run(discover())
+    except Exception as exc:
+        from src.logging_setup import mask_addresses
+
+        raise click.ClickException(
+            f"routes sync: обход разделов {site} не удался, список не менялся: "
+            f"{type(exc).__name__}: {mask_addresses(str(exc))}"
+        ) from exc
+
+    storage.init_db()
+    Session = storage.make_session()
+    with Session() as session:
+        plan = site_routes.plan_route_sync(session, site, discovered)
+        click.echo(
+            f"{site}: на сайте {len(plan.discovered)} разделов; новых {len(plan.added)}, "
+            f"вернулись {len(plan.returned)}, пропали {len(plan.missing)}, "
+            f"без изменений {len(plan.unchanged)}"
+        )
+        for label, slugs in (("+", plan.added), ("↺", plan.returned), ("−", plan.missing)):
+            for slug in slugs:
+                click.echo(f"  {label} {slug}")
+        refusal = plan.refusal()
+        if refusal is not None:
+            click.echo(f"⚠ {refusal}")
+        if dry_run:
+            click.echo("dry-run: ничего не записано")
+            return
+        try:
+            site_routes.apply_route_sync(session, plan, allow_shrink=allow_shrink)
+        except site_routes.RouteSyncRefused as exc:
+            session.rollback()
+            raise click.ClickException(
+                f"routes sync: отказ, список не менялся — {exc}. Если разделы и правда "
+                "исчезли с сайта, повторить с --allow-shrink"
+            ) from exc
+        session.commit()
+        log.info(
+            "site_routes_synced",
+            site=site,
+            discovered=len(plan.discovered),
+            added=len(plan.added),
+            returned=len(plan.returned),
+            missing=len(plan.missing),
+        )
+        click.echo("записано" if plan.changes else "изменений нет")
+
+
+@routes_group.command("list")
+@click.option("--site", "site", default=None, help="Только этот сайт.")
+@click.option("--all", "show_all", is_flag=True, help="Показать и выключенные.")
+def routes_list(site: str | None, show_all: bool) -> None:
+    """Разделы, которые обходит полный сбор."""
+    storage.init_db()
+    Session = storage.make_session()
+    with Session() as session:
+        stmt = select(storage.SiteRoute).order_by(storage.SiteRoute.site, storage.SiteRoute.id)
+        if site:
+            stmt = stmt.where(storage.SiteRoute.site == site)
+        if not show_all:
+            stmt = stmt.where(storage.SiteRoute.is_active.is_(True))
+        rows = session.scalars(stmt).all()
+        for row in rows:
+            mark = " " if row.is_active else "×"
+            click.echo(f"{mark} {row.site}  {row.slug}  (виден {row.last_seen_at:%Y-%m-%d})")
+        click.echo(f"всего: {len(rows)}")
+
+
 @cli.group("category")
 def category_group() -> None:
     """Управление категориями (для category-режима скрейпинга)."""

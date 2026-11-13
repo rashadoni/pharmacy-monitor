@@ -882,6 +882,33 @@ class Category(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class SiteRoute(Base):
+    """Раздел сайта, который обходит полный сбор.
+
+    У аптечных сайтов разделы живут в ``categories`` — по колонке на сайт, с
+    ручной связкой между сайтами. Сайтам другого профиля это не подходит:
+    разделов много, между сайтами они не совпадают и находит их сам сборщик
+    (``discover_categories``). Здесь — список разделов одного сайта, как его
+    записала команда ``routes sync``.
+
+    Список меняет только эта команда, а не каждый прогон: проверка полноты
+    сбора сверяет прогон с запрошенными разделами, и знаменатель, который
+    менялся бы от ночи к ночи, ничего бы не проверял. Раздел, пропавший с
+    сайта, не удаляется, а выключается — видно, что и когда исчезло.
+    """
+
+    __tablename__ = "site_routes"
+    __table_args__ = (UniqueConstraint("site", "slug", name="uq_site_routes_site_slug"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site: Mapped[str] = mapped_column(String(40), index=True)
+    slug: Mapped[str] = mapped_column(String(500))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Когда обход разделов последний раз видел этот раздел на сайте.
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class Recipient(Base):
     """Получатели email-рассылки + Telegram-подписки. CRUD через CLI и дашборд."""
 
@@ -1381,6 +1408,52 @@ def init_db(database_url: str | None = None) -> None:
     Base.metadata.create_all(engine)
     _apply_lightweight_migrations(engine)
     _ensure_default_tenant(engine)
+    refuse_database_of_another_profile(sessionmaker(engine, expire_on_commit=False))
+
+
+class DatabaseOfAnotherProfile(RuntimeError):
+    """База принадлежит экземпляру другого профиля (см. src/site_profile.py)."""
+
+
+def refuse_database_of_another_profile(session_factory) -> None:
+    """Не дать команде одного профиля работать в базе другого.
+
+    Экземпляры разных профилей живут на одном сервере, и профиль процесса
+    задаёт одна переменная окружения. Команда, запущенная без неё в каталоге
+    экземпляра электроники, — аптечная: она начала бы собирать аптечные сайты
+    в чужую базу и закрыла бы ей рекомендации. Метка «чья база» — сайт клиента
+    у арендатора по умолчанию: его заводит первый же `init_db` из профиля.
+
+    Отказ — только когда метка называет сайт ДРУГОГО известного профиля.
+    Пустая метка, незнакомый сайт и недоступная база отказом не считаются:
+    проверка не должна останавливать экземпляр, чья база просто старше её.
+    """
+    from sqlalchemy import select as _select
+
+    try:
+        with session_factory() as session:
+            client_site = session.scalar(
+                _select(Tenant.client_site).where(Tenant.slug == "default")
+            )
+    except Exception:
+        return
+    if not client_site or client_site in site_profile.SITES:
+        return
+    owner = next(
+        (
+            profile.name
+            for profile in site_profile.PROFILES.values()
+            if client_site in profile.sites
+        ),
+        None,
+    )
+    if owner is None:
+        return
+    raise DatabaseOfAnotherProfile(
+        f"this database belongs to a {owner!r} instance (its client site is {client_site!r}), "
+        f"but the process runs with the {site_profile.PROFILE.name!r} profile: "
+        f"set {site_profile.PROFILE_ENV}={owner} or point DATABASE_URL at the right database"
+    )
 
 
 def _ensure_default_tenant(engine) -> None:

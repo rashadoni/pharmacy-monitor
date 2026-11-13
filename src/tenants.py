@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from datetime import timedelta
+from src import site_profile
 from src._time import utcnow
 
 import structlog
@@ -58,10 +59,13 @@ def get_or_create_default(session: Session) -> Tenant:
     t = session.scalar(select(Tenant).where(Tenant.slug == DEFAULT_TENANT_SLUG))
     if t:
         return t
+    # Клиент — из профиля экземпляра. Эта же запись — метка «чья это база»:
+    # по ней `storage.refuse_database_of_another_profile` не даёт команде
+    # одного профиля работать в базе другого.
     t = Tenant(
         slug=DEFAULT_TENANT_SLUG,
-        name="Default (pharmonline)",
-        client_site="pharmonline",
+        name=f"Default ({site_profile.CLIENT_SITE})",
+        client_site=site_profile.CLIENT_SITE,
         plan="basic",
     )
     session.add(t)

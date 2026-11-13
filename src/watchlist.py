@@ -16,12 +16,19 @@ from src.storage import (
     Category,
     Recipient,
     SavedView,
+    SiteRoute,
     TrackedCategory,
     TrackedProduct,
     TrackedProductLink,
 )
 
 SITES = site_profile.SITES
+# Сайты, чьи разделы лежат колонкой в `categories` (аптечные).
+CATEGORY_SLUG_FIELDS = {
+    "pharmonline": Category.pharmonline_slug,
+    "aptekonline": Category.aptekonline_slug,
+    "aloe": Category.aloe_slug,
+}
 ALOE_BROAD_CATEGORY_SLUGS = {
     "dermanlar",
     "bad",
@@ -171,12 +178,20 @@ def categories_for_site(
     """
     if site not in SITES:
         return []
-    field_map = {
-        "pharmonline": Category.pharmonline_slug,
-        "aptekonline": Category.aptekonline_slug,
-        "aloe": Category.aloe_slug,
-    }
-    field = field_map[site]
+    field = CATEGORY_SLUG_FIELDS.get(site)
+    if field is None:
+        # Сайт без колонки в `categories`: его разделы записала `routes sync`.
+        # Связки с категориями других сайтов у такого раздела нет, поэтому
+        # прогон «только этой категории» его не касается.
+        if only_category_id is not None:
+            return []
+        return list(
+            session.scalars(
+                select(SiteRoute.slug)
+                .where(SiteRoute.site == site, SiteRoute.is_active.is_(True))
+                .order_by(SiteRoute.id)
+            ).all()
+        )
     stmt = select(field).where(Category.is_active.is_(True), field.is_not(None))
     if only_category_id is not None:
         stmt = stmt.where(Category.id == only_category_id)
