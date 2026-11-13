@@ -960,13 +960,39 @@ def be_page(items, total, page=1, size=18):
     }
 
 
-def be_home(build_id="BUILD-1", links=()):
-    anchors = "".join(f'<a href="/catalog/{link}">x</a>' for link in links)
+def be_home(build_id="BUILD-1"):
+    # Ссылок на разделы в вёрстке главной нет: меню приходит отдельным запросом.
     data = json.dumps({"props": {"pageProps": {}}, "page": "/", "buildId": build_id})
     return (
-        f"<html><body>{anchors}"
+        '<html><body><a href="/catalog/muqayise-et">x</a>'
         f'<script id="__NEXT_DATA__" type="application/json">{data}</script></body></html>'
     )
+
+
+def be_menu(links):
+    """Меню сайта в форме ответа ``/megamenu``: группы, пункты, вложенные пункты."""
+    return [
+        {
+            "id": 1,
+            "title": "Группа",
+            "slug": "ne-razdel-kataloga",
+            "items": [
+                {
+                    "id": number,
+                    "title": link,
+                    "link": f"catalog/{link}",
+                    "childrens": [
+                        {"id": 500 + number, "name": "Apple", "link": f"catalog/{link}?brand=apple"}
+                    ],
+                    "products": [],
+                }
+                for number, link in enumerate(links)
+            ],
+            "images": [
+                {"link": "https://www.bakuelectronics.az/mehsul/hediyye-kart-1", "image": "x"}
+            ],
+        }
+    ]
 
 
 def test_bakuelectronics_product_fields():
@@ -1092,8 +1118,11 @@ async def test_bakuelectronics_discovery_replaces_a_broken_section_with_its_chil
 
     def site(request):
         path = urlsplit(str(request.url)).path
+        if path == "/megamenu":
+            assert request.headers["lang"] == "az"
+            return httpx.Response(200, json=be_menu(links))
         if path == "/":
-            return httpx.Response(200, text=be_home(links=links))
+            return httpx.Response(200, text=be_home())
         if path.endswith("/catalog/telefonlar-qadcetler.json"):
             return httpx.Response(200, text="<html>502</html>")
         return httpx.Response(200, json=be_page([be_item()], 1))
@@ -1170,8 +1199,10 @@ async def test_bakuelectronics_discovery_fails_when_a_section_cannot_be_replaced
 
     def site(request):
         path = urlsplit(str(request.url)).path
+        if path == "/megamenu":
+            return httpx.Response(200, json=be_menu(["tv-audio-video", "qizdiricilar"]))
         if path == "/":
-            return httpx.Response(200, text=be_home(links=["tv-audio-video", "qizdiricilar"]))
+            return httpx.Response(200, text=be_home())
         if path.endswith("/qizdiricilar.json"):
             return httpx.Response(502)
         return httpx.Response(200, json=be_page([be_item()], 1))
@@ -1180,6 +1211,23 @@ async def test_bakuelectronics_discovery_fails_when_a_section_cannot_be_replaced
     with pytest.raises(PageFetchError) as error:
         await scraper.discover_categories()
     assert "qizdiricilar" in error.value.reason
+
+
+async def test_bakuelectronics_discovery_fails_without_a_readable_menu():
+    # Главная читается, а меню — нет или в нём нет разделов: обход отказывает,
+    # пустой список разделов выглядел бы как пустой каталог.
+    for menu in (httpx.Response(200, text="<html>oops</html>"), httpx.Response(200, json=[])):
+        scraper = fast(BakuElectronicsScraper)
+
+        def site(request, menu=menu):
+            path = urlsplit(str(request.url)).path
+            if path == "/megamenu":
+                return menu
+            return httpx.Response(200, text=be_home())
+
+        serve(scraper, site)
+        with pytest.raises(PageFetchError):
+            await scraper.discover_categories()
 
 
 async def test_bakuelectronics_block_page_is_a_blocked_category():

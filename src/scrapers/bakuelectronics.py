@@ -17,6 +17,13 @@
 502): ``discover_categories`` проверяет каждый раздел и вместо нерабочего берёт
 его подразделы.
 
+Дерево разделов в вёрстке главной не лежит: браузер получает меню отдельным
+запросом к API сайта (``/megamenu`` на служебном имени, заголовок ``lang``), и
+ссылки ``catalog/<раздел>/<подраздел>`` стоят в нём на всех уровнях (замер
+через прокси 2026-11-13: 770 ссылок, 447 разных разделов, 22 верхних). Часть
+ссылок меню ведёт на тот же раздел с фильтром (``?brand=apple``) — фильтр
+отбрасывается.
+
 Товар узнаётся по ``product_code`` — коду товара на сайте (им же кончается
 адрес страницы товара). Обычная цена — ``price``, цена со скидкой —
 ``discounted_price``, остаток — числом (``quantity``).
@@ -49,7 +56,7 @@ log = structlog.get_logger()
 
 _MAX_PAGES = 600
 _NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
-_CATALOG_LINK_RE = re.compile(r'href="/catalog/([^"?#]+)"')
+_MENU_CATALOG_LINK_RE = re.compile(r"(?:^|/)catalog/([^?#]+)")
 # Страницы под /catalog/, которые не разделы каталога.
 _NOT_CATEGORIES = {"muqayise-et"}
 
@@ -103,13 +110,15 @@ def listing_from_payload(payload: object) -> dict | None:
 class BakuElectronicsScraper(HttpCatalogScraper):
     site_name = "bakuelectronics"
     base_url = "https://www.bakuelectronics.az"
+    # Откуда витрина берёт меню разделов. Имя служебное и может смениться с
+    # выкладкой сайта: тогда обход разделов отказывает, а не возвращает пусто.
+    menu_url = "https://5vyra9x.bakuelectronics.az/megamenu"
     # ``total: 0`` — явный ответ сайта «в разделе нет товаров».
     allow_verified_empty_categories = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._build_id: str | None = None
-        self._home_html: str | None = None
 
     async def _load_home(self) -> str:
         response = await self.fetch(f"{self.base_url}/")
@@ -124,8 +133,38 @@ class BakuElectronicsScraper(HttpCatalogScraper):
         if not build_id or not isinstance(build_id, str):
             raise PageFetchError("home page data has no build id")
         self._build_id = build_id
-        self._home_html = html
         return html
+
+    async def _menu_sections(self) -> list[str]:
+        """Разделы каталога из меню сайта, в порядке меню, без повторов."""
+        response = await self.fetch(
+            self.menu_url, headers={"Accept": "application/json", "lang": "az"}
+        )
+        try:
+            menu = response.json()
+        except ValueError as exc:
+            raise PageFetchError("catalog menu is not readable") from exc
+
+        sections: list[str] = []
+        seen: set[str] = set()
+
+        def walk(node: object) -> None:
+            if isinstance(node, dict):
+                link = node.get("link")
+                if isinstance(link, str):
+                    match = _MENU_CATALOG_LINK_RE.search(link)
+                    slug = match.group(1).strip("/") if match else ""
+                    if slug and slug.split("/")[0] not in _NOT_CATEGORIES and slug not in seen:
+                        seen.add(slug)
+                        sections.append(slug)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(menu)
+        return sections
 
     async def _listing_page(self, category_slug: str, page: int) -> dict:
         """Одна страница списка раздела; ``PageFetchError``, если списка нет."""
@@ -214,16 +253,11 @@ class BakuElectronicsScraper(HttpCatalogScraper):
     async def discover_categories(self) -> list[str]:
         """Разделы, обход которых даёт полный каталог.
 
-        Берутся разделы верхнего уровня из ссылок главной. Раздел, чья
+        Берутся разделы верхнего уровня из меню сайта. Раздел, чья
         собственная страница списка не отвечает, заменяется своими
-        подразделами — и так вниз по дереву ссылок.
+        подразделами — и так вниз по дереву ссылок меню.
         """
-        html = self._home_html or await self._load_home()
-        links: list[str] = []
-        for raw in _CATALOG_LINK_RE.findall(html):
-            slug = raw.strip("/")
-            if slug and slug.split("/")[0] not in _NOT_CATEGORIES and slug not in links:
-                links.append(slug)
+        links = await self._menu_sections()
 
         roots: list[str] = []
         for slug in links:
@@ -240,7 +274,7 @@ class BakuElectronicsScraper(HttpCatalogScraper):
             ]
 
         if not roots:
-            raise PageFetchError("home page has no catalog sections")
+            raise PageFetchError("catalog menu has no sections")
 
         routes: list[str] = []
         queue = list(roots)
