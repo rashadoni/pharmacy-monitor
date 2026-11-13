@@ -103,13 +103,31 @@ def section_from_menu_link(link: str) -> str | None:
     return "/".join(segments[1:])
 
 
+def _name_from_slug(slug: str, code: str) -> str:
+    """Название для карточки без названия: адрес страницы без кода товара."""
+    words = [word for word in slug.split("-") if word]
+    if words and words[-1] == code:
+        words = words[:-1]
+    return " ".join(words)
+
+
 def build_product(item: dict, category_slug: str) -> ScrapedProduct | None:
     """Товар из записи ``items``; ``None``, если его не опознать."""
     code = item.get("product_code")
     name = " ".join(str(item.get("name") or "").split())
     slug = str(item.get("slug") or "").strip().strip("/")
-    if code in (None, "") or isinstance(code, bool) or not name or not slug:
+    if code in (None, "") or isinstance(code, bool) or not slug:
         return None
+    if not name:
+        # На сайте встречается карточка без названия (код, цена и адрес есть,
+        # `name: null` — замер 2026-11-13, раздел посуды). Это товар сайта, а не
+        # сбой разбора: отвергнуть запись значило бы каждую ночь объявлять
+        # неполным весь каталог из-за одной битой карточки. Название берётся из
+        # адреса страницы — другого у сайта нет.
+        name = _name_from_slug(slug, str(code).strip())
+        if not name:
+            return None
+        log.warning("bakuelectronics_item_without_name", product_code=str(code), slug=slug[:120])
 
     regular = price_or_none(item.get("price"))
     final = price_or_none(item.get("discounted_price"))
