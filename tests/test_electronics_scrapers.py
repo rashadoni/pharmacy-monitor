@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from structlog.testing import capture_logs
+
 import httpx
 import pytest
 
@@ -1244,6 +1246,9 @@ async def test_bakuelectronics_discovery_fails_without_a_readable_menu():
         ("catalog/tv/televizorlar?706=290779%2C640216", "tv/televizorlar"),
         ("https://www.bakuelectronics.az/catalog/tv/televizorlar", "tv/televizorlar"),
         ("/az/catalog/tv/", "tv"),
+        ("/ru/catalog/tv", "tv"),
+        ("https://www.bakuelectronics.az:443/catalog/tv", "tv"),
+        ("https://m.bakuelectronics.az/catalog/tv", "tv"),
         ("catalog//tv", "tv"),
         (" catalog/tv", "tv"),
         ("catalog/Kitablar", "Kitablar"),
@@ -1253,6 +1258,8 @@ async def test_bakuelectronics_discovery_fails_without_a_readable_menu():
         # Не разделы: чужой адрес, слово catalog не в начале пути, товар,
         # служебная страница, голое слово, другой регистр.
         ("https://promo.example/catalog/x", None),
+        ("https://notbakuelectronics.az/catalog/x", None),
+        ("http://[catalog/x", None),
         ("campaign/catalog/sale", None),
         ("mehsul/x?back=/catalog/abc", None),
         ("mehsul/hediyye-kart-30-azn-162286", None),
@@ -1328,8 +1335,14 @@ BE_MENU = [
 ]
 
 
-def be_menu_site(broken=(), seen=None):
-    """Сайт с меню ``BE_MENU``; разделы из ``broken`` списка не отдают."""
+def be_menu_site(broken=(), seen=None, menu=None, listings=None, totals=None):
+    """Сайт с меню ``BE_MENU``; разделы из ``broken`` списка не отдают.
+
+    ``listings`` — коды товаров раздела; по умолчанию у каждого раздела свой
+    товар, а ``dogs-cats`` отдаёт тот же список, что ``pets/dogs-cats``.
+    """
+    same = {"dogs-cats": [501, 502], "pets/dogs-cats": [501, 502]}
+    same.update(listings or {})
 
     def site(request):
         url = urlsplit(str(request.url))
@@ -1337,13 +1350,15 @@ def be_menu_site(broken=(), seen=None):
             seen.append(request)
         if url.path == "/megamenu":
             assert url.netloc == "5vyra9x.bakuelectronics.az"
-            return httpx.Response(200, json=BE_MENU)
+            return httpx.Response(200, json=BE_MENU if menu is None else menu)
         if url.path == "/":
             return httpx.Response(200, text=be_home())
         section = unquote(url.path.split("/az/catalog/")[1].removesuffix(".json"))
         if section in broken:
             return httpx.Response(502)
-        return httpx.Response(200, json=be_page([be_item()], 1))
+        codes = same.get(section, [abs(hash(section)) % 100000 + 1000])
+        total = (totals or {}).get(section, len(codes))
+        return httpx.Response(200, json=be_page([be_item(code=code) for code in codes], total))
 
     return site
 
@@ -1366,10 +1381,63 @@ async def test_bakuelectronics_discovery_refuses_a_menu_of_another_shape():
 
 async def test_bakuelectronics_discovery_reads_the_whole_menu():
     # Все группы, пункты и вложенные пункты; баннер с адресом сайта — раздел,
-    # чужой адрес — нет; «dogs-cats» с потерянным родителем не верхний раздел.
+    # чужой адрес — нет; «dogs-cats» отдаёт тот же список, что подраздел
+    # «pets/dogs-cats», — это ссылка с потерянным родителем, не верхний раздел.
     scraper = fast(BakuElectronicsScraper)
     serve(scraper, be_menu_site())
-    assert await scraper.discover_categories() == ["tv", "Kitablar", "pets", "sport"]
+    with capture_logs() as logs:
+        routes = await scraper.discover_categories()
+    assert routes == ["tv", "Kitablar", "pets", "sport"]
+
+    # Меню сверить не с чем: журнал — единственное место, где видно пропущенное.
+    menu_read = next(entry for entry in logs if entry["event"] == "bakuelectronics_menu_read")
+    assert menu_read["groups"] == 3
+    assert menu_read["groups_without_sections"] == ["kartlar"]
+    assert menu_read["links_not_to_sections"] == 2
+    assert menu_read["links_not_to_sections_sample"] == [
+        "https://promo.example/catalog/aksiya",
+        "mehsul/kart-30-azn-162286",
+    ]
+    assert menu_read["top_level_named_like_a_subsection"] == ["dogs-cats"]
+    dropped = [e for e in logs if e["event"] == "bakuelectronics_menu_link_is_a_subsection"]
+    assert [(e["link"], e["same_listing_as"]) for e in dropped] == [("dogs-cats", "pets/dogs-cats")]
+
+
+async def test_bakuelectronics_discovery_keeps_a_top_section_that_only_shares_a_name():
+    # Имена в меню не уникальны. Одноимённый подраздел с другим списком,
+    # нечитаемый подраздел, нечитаемый сам раздел — раздел остаётся верхним:
+    # повтор товаров лучше потери раздела.
+    scraper = fast(BakuElectronicsScraper)
+    serve(scraper, be_menu_site(listings={"dogs-cats": [501, 777]}))
+    assert await scraper.discover_categories() == ["tv", "Kitablar", "pets", "dogs-cats", "sport"]
+
+    # Первая страница та же, а товаров в разделе больше, чем в подразделе.
+    scraper = fast(BakuElectronicsScraper)
+    serve(scraper, be_menu_site(totals={"dogs-cats": 40}))
+    assert "dogs-cats" in await scraper.discover_categories()
+
+    scraper = fast(BakuElectronicsScraper)
+    serve(scraper, be_menu_site(broken={"pets/dogs-cats"}))
+    assert "dogs-cats" in await scraper.discover_categories()
+
+    scraper = fast(BakuElectronicsScraper)
+    serve(scraper, be_menu_site(broken={"dogs-cats"}))
+    with pytest.raises(PageFetchError) as error:
+        await scraper.discover_categories()
+    assert "dogs-cats" in error.value.reason
+
+
+async def test_bakuelectronics_discovery_does_not_question_a_section_with_its_own_subsections():
+    # У «dogs-cats» есть свои подразделы — это верхний раздел, сайт о нём не
+    # спрашивают, даже если его список совпал с одноимённым подразделом.
+    menu = [*BE_MENU, {"id": 4, "items": [{"id": 40, "link": "catalog/dogs-cats/leashes"}]}]
+    scraper = fast(BakuElectronicsScraper)
+    serve(scraper, be_menu_site(menu=menu))
+    with capture_logs() as logs:
+        routes = await scraper.discover_categories()
+    assert routes == ["tv", "Kitablar", "pets", "dogs-cats", "sport"]
+    menu_read = next(entry for entry in logs if entry["event"] == "bakuelectronics_menu_read")
+    assert menu_read["top_level_named_like_a_subsection"] == []
 
 
 async def test_bakuelectronics_discovery_descends_through_a_level_without_its_own_link():
@@ -1386,10 +1454,13 @@ async def test_bakuelectronics_discovery_descends_through_a_level_without_its_ow
     ]
 
     scraper = fast(BakuElectronicsScraper)
+    # Сломан и промежуточный уровень: обход спускается глубже. Одноимённую
+    # ссылку «dogs-cats» сверить теперь не с чем — она остаётся разделом.
     serve(scraper, be_menu_site(broken={"pets", "pets/dogs-cats"}))
     assert await scraper.discover_categories() == [
         "tv",
         "Kitablar",
+        "dogs-cats",
         "sport",
         "pets/birds",
         "pets/dogs-cats/food",

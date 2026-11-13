@@ -28,8 +28,10 @@
 - у промежуточного уровня своей ссылки может не быть, есть только ссылки
   глубже (так у 18 узлов) — дерево строится из начал всех путей;
 - у ссылки бывает потерян родитель: ``catalog/itler-ve-pishikler-ucun`` при
-  ``catalog/ev-heyvanlari-ucun/itler-ve-pishikler-ucun/...`` — такой путь не
-  верхний раздел, иначе те же товары читались бы дважды;
+  ``catalog/ev-heyvanlari-ucun/itler-ve-pishikler-ucun/...``. По одному имени
+  это не решается (одинаковые имена стоят в меню под разными родителями):
+  обход спрашивает сайт и убирает такой путь из верхних разделов, только если
+  его список совпал со списком одноимённого подраздела;
 - часть путей уже закодирована (``turizm-v%C9%99-kempinq``) — путь хранится
   раскодированным и кодируется один раз, при запросе;
 - баннеры дают полные адреса сайта; ссылки на товары и чужие адреса —
@@ -72,7 +74,8 @@ _MAX_PAGES = 600
 _NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
 # Страницы под /catalog/, которые не разделы каталога.
 _NOT_CATEGORIES = {"muqayise-et"}
-_OWN_HOSTS = {"bakuelectronics.az", "www.bakuelectronics.az"}
+_OWN_DOMAIN = "bakuelectronics.az"
+_LANGUAGE_PREFIXES = {"az", "ru", "en"}
 
 
 def section_from_menu_link(link: str) -> str | None:
@@ -82,12 +85,16 @@ def section_from_menu_link(link: str) -> str | None:
     ``catalog`` внутри другого пути, в строке запроса или на чужом адресе —
     не раздел.
     """
-    parts = urlsplit(link.strip())
-    if parts.netloc and parts.netloc.lower() not in _OWN_HOSTS:
+    try:
+        parts = urlsplit(link.strip())
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return None
+    if host and host != _OWN_DOMAIN and not host.endswith(f".{_OWN_DOMAIN}"):
         return None
     segments = [unquote(segment).strip() for segment in parts.path.split("/")]
     segments = [segment for segment in segments if segment]
-    if segments[:1] == ["az"]:
+    if segments[:1] and segments[0] in _LANGUAGE_PREFIXES:
         segments = segments[1:]
     if len(segments) < 2 or segments[0] != "catalog":
         return None
@@ -170,12 +177,18 @@ class BakuElectronicsScraper(HttpCatalogScraper):
         self._build_id = build_id
         return html
 
-    async def _menu_sections(self) -> list[str]:
-        """Дерево разделов из меню сайта: каждый путь и все его начала.
+    async def _menu_sections(self) -> tuple[list[str], dict[str, list[str]]]:
+        """Дерево разделов из меню сайта и ссылки, похожие на подразделы.
 
-        Порядок — как в меню, без повторов. Уровень, на который в меню нет
-        собственной ссылки, но есть ссылки глубже, в дерево входит: иначе
-        замена нерабочего раздела подразделами теряла бы целые ветки.
+        Дерево — каждый путь и все его начала, в порядке меню, без повторов.
+        Уровень, на который в меню нет собственной ссылки, но есть ссылки
+        глубже, в дерево входит: иначе замена нерабочего раздела подразделами
+        теряла бы целые ветки.
+
+        Второе значение — пути из одного сегмента без собственных подпутей,
+        чьё имя стоит глубже в другом пути, и эти глубокие пути. Кто из них
+        верхний раздел, а кто ссылка с потерянным родителем, по меню не
+        решить: это решает ``discover_categories``, спросив сайт.
         """
         response = await self.fetch(
             self.menu_url, headers={"Accept": "application/json", "lang": "az"}
@@ -216,20 +229,23 @@ class BakuElectronicsScraper(HttpCatalogScraper):
             if section_links == before and isinstance(group, dict):
                 empty_groups.append(str(group.get("slug") or group.get("title") or "?"))
 
-        # Ссылка с потерянным родителем: «x» при «a/x/...» и без своих «x/...».
-        nested = {segment for path in paths for segment in path.split("/")[1:]}
-        own_branches = {path.split("/")[0] for path in paths if "/" in path}
-        misplaced = [path for path in paths if "/" not in path and path in nested - own_branches]
-
         sections: list[str] = []
         for path in paths:
-            if path in misplaced:
-                continue
             segments = path.split("/")
             for depth in range(1, len(segments) + 1):
                 node = "/".join(segments[:depth])
                 if node not in sections:
                     sections.append(node)
+
+        # «x» при «a/x/...» и без своих «x/...»: возможно, потерян родитель.
+        own_branches = {path.split("/")[0] for path in paths if "/" in path}
+        namesakes: dict[str, list[str]] = {}
+        for path in paths:
+            if "/" in path or path in own_branches:
+                continue
+            twins = [node for node in sections if "/" in node and node.rsplit("/", 1)[1] == path]
+            if twins:
+                namesakes[path] = twins
 
         # Меню сверить не с чем: что пропущено, видно только здесь.
         log.info(
@@ -240,9 +256,30 @@ class BakuElectronicsScraper(HttpCatalogScraper):
             groups_without_sections=empty_groups,
             links_not_to_sections=len(not_sections),
             links_not_to_sections_sample=not_sections[:10],
-            links_with_lost_parent=misplaced,
+            top_level_named_like_a_subsection=sorted(namesakes),
         )
-        return sections
+        return sections, namesakes
+
+    async def _same_listing(self, first: str, second: str) -> bool:
+        """Отдаёт ли сайт по двум путям один и тот же список товаров.
+
+        Сравниваются число товаров и коды на первой странице. Не прочиталось
+        хоть одно — «не тот же»: лишний раздел даёт повтор товаров, а
+        выброшенный — потерю.
+        """
+        try:
+            one = await self._listing_page(first, 1)
+            two = await self._listing_page(second, 1)
+        except PageFetchError:
+            return False
+
+        def codes(listing: dict) -> list[object]:
+            return [item.get("product_code") for item in listing["items"] if isinstance(item, dict)]
+
+        total = one.get("total")
+        if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
+            return False
+        return total == two.get("total") and codes(one) == codes(two)
 
     async def _listing_page(self, category_slug: str, page: int) -> dict:
         """Одна страница списка раздела; ``PageFetchError``, если списка нет."""
@@ -339,7 +376,21 @@ class BakuElectronicsScraper(HttpCatalogScraper):
         попадёт, и отказа не будет. Что в меню не разобрано, пишет в журнал
         ``bakuelectronics_menu_read``.
         """
-        links = await self._menu_sections()
+        links, namesakes = await self._menu_sections()
+
+        # Ссылка с потерянным родителем — не верхний раздел, а второй адрес
+        # подраздела: оставить её значило бы читать те же товары дважды.
+        # Убирается, только когда сайт сам подтвердил, что список тот же.
+        for name, twins in namesakes.items():
+            for twin in twins:
+                if await self._same_listing(name, twin):
+                    log.warning(
+                        "bakuelectronics_menu_link_is_a_subsection",
+                        link=name,
+                        same_listing_as=twin,
+                    )
+                    links.remove(name)
+                    break
 
         roots: list[str] = []
         for slug in links:
