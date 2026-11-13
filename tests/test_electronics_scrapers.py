@@ -1708,9 +1708,58 @@ def irshad_renumbered(page_html: str, mapping: dict[str, str]) -> str:
     return page_html
 
 
-async def test_irshad_card_seen_on_two_pages_means_the_listing_shifted():
-    # Товар переехал выше, пока шёл обход: его карточка пришла второй раз, а
-    # какой-то другой товар мог не попасть ни на одну страницу.
+async def test_irshad_card_shown_again_on_a_later_page_is_not_a_break():
+    # Товар с несколькими цветами сайт ставит в список не один раз: на живом
+    # сайте карточка 65715 стоит на 7-й и на 16-й страницах раздела (замер
+    # 2026-11-13). Раньше повтор обрывал раздел при каждой попытке.
+    scraper = fast(IrshadScraper)
+    first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
+    # Вторая страница: два новых товара и та же многоцветная карточка 85759.
+    second = irshad_renumbered(IRSHAD_LAST_PAGE, {"108753": "200001", "108751": "200002"})
+    seen = serve(scraper, irshad_site({"1": first, "2": second}))
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    ids = [p.external_id for p in products]
+    assert ids == ["108753", "108751", "85759", "108719", "200001", "200002"]
+    assert status.complete and status.abort_reason is None
+    assert (status.raw_items, status.parsed_items, status.item_failures) == (6, 6, 0)
+    assert len(seen) == 3  # две страницы и подтверждение конца, без повтора прохода
+
+
+async def test_irshad_repeated_card_with_a_new_colour_gives_that_colour():
+    # Вторая встреча карточки несёт цвет, которого в первой не было: карточку
+    # разбирают снова, новый товар не теряется.
+    scraper = fast(IrshadScraper)
+    first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
+    second = irshad_renumbered(IRSHAD_LAST_PAGE, {"108753": "200001", "108751": "200002"})
+    second = second.replace('value="108719"', 'value="200004"').replace(
+        'data-selected-id="108719"', 'data-selected-id="200004"'
+    )
+    serve(scraper, irshad_site({"1": first, "2": second}))
+    products = await collect(scraper, "c")
+    ids = [p.external_id for p in products]
+    assert "200004" in ids and ids.count("85759") == 1
+    assert scraper._route_statuses["c"].complete
+
+
+async def test_irshad_last_page_holding_only_a_repeated_card_ends_the_list():
+    # Новый цвет старой модели получает старший номер: её карточка встаёт в
+    # самый хвост списка, одна на последней странице. Это не сломанное листание.
+    scraper = fast(IrshadScraper)
+    first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
+    # Из страницы без ссылки «показать ещё»: карточка — кусок вёрстки до конца.
+    (repeat,) = [card for card_id, card in split_cards(IRSHAD_LAST_PAGE) if card_id == "85759"]
+    last = f'<div class="pjax-container"><div id="productGridItems">{repeat}</div></div>'
+    assert [card_id for card_id, _ in split_cards(last)] == ["85759"]
+    serve(scraper, irshad_site({"1": first, "2": last}))
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert len(products) == 4
+    assert status.complete and status.abort_reason is None
+
+
+async def test_irshad_same_page_served_twice_is_a_break():
+    # Тот же набор карточек второй раз — листание сломано; это не повтор цвета.
     scraper = fast(IrshadScraper)
     first = IRSHAD_PAGE.replace('data-page="3"', 'data-page="2"')
     seen = serve(scraper, irshad_site({"1": first, "2": IRSHAD_LAST_PAGE}))
@@ -1718,7 +1767,7 @@ async def test_irshad_card_seen_on_two_pages_means_the_listing_shifted():
     status = scraper._route_statuses["c"]
     assert len(products) == 4
     assert not status.complete
-    assert status.abort_reason == "listing_shifted_between_pages"
+    assert status.abort_reason == "listing_page_repeated"
     assert len(seen) == 2 * IrshadScraper.category_attempts
 
 
@@ -1795,6 +1844,88 @@ async def test_irshad_unreadable_offer_makes_the_pass_incomplete():
     assert not status.complete
     assert status.abort_reason == "item_parse_failures"
     assert (status.item_failures, status.raw_items, status.parsed_items) == (1, 4, 3)
+
+
+def _irshad_card_without_colour_choice() -> tuple[str, str]:
+    """Многоцветная карточка, у которой сайт не показал выбор цвета."""
+    import re
+
+    (card,) = [card for card_id, card in split_cards(IRSHAD_LAST_PAGE) if card_id == "85759"]
+    emptied, count = re.subn(
+        r'<ul class="product__colors">.*?</ul>',
+        '<ul class="product__colors"> </ul>',
+        card,
+        flags=re.DOTALL,
+    )
+    assert count >= 1
+    return "85759", emptied
+
+
+def test_irshad_price_block_of_a_colour_the_site_does_not_offer_is_skipped():
+    # Список цветов у карточки есть, но пуст, а блоков с ценой два: скрытый —
+    # цвет, которого сайт не показывает. На живом сайте так у MacBook в разделе
+    # ноутбуков, и раздел из-за этого был неполон при каждом сборе.
+    product_id, card = _irshad_card_without_colour_choice()
+    unlisted: list[str] = []
+    products, failures = build_products(product_id, card, "c", unlisted)
+    assert [p.external_id for p in products] == ["85759"]
+    assert (failures, unlisted) == (0, ["108719"])
+
+
+def test_irshad_card_title_belongs_to_the_block_the_site_shows():
+    # Живой случай 2026-11-13: у карточки 108447 виден блок 108435, а блок с
+    # номером самой карточки скрыт. Название и адрес из шапки — товара видимого
+    # блока, и цена берётся из него же, а не из скрытого.
+    product_id, card = _irshad_card_without_colour_choice()
+    card = card.replace(
+        'class="product__flex-right " data-selected-id="85759"',
+        'class="product__flex-right  d-none " data-selected-id="85759"',
+    ).replace(
+        'class="product__flex-right  d-none " data-selected-id="108719"',
+        'class="product__flex-right " data-selected-id="108719"',
+    )
+    shown_block = card[card.index('data-selected-id="108719"') :]
+    shown_price = price_or_none(_text_of(shown_block, "new-price"))
+    unlisted: list[str] = []
+    (product,), failures = build_products(product_id, card, "c", unlisted)
+    assert product.external_id == "108719"
+    assert (failures, unlisted) == (0, ["85759"])
+    assert (product.discount_price or product.price) == shown_price
+
+
+def test_irshad_shown_block_without_a_title_is_still_a_failure():
+    # Пустой список цветов не извиняет карточку без названия видимого товара.
+    product_id, card = _irshad_card_without_colour_choice()
+    card = card.replace('class="product__name product-link"', 'class="product__name"')
+    unlisted: list[str] = []
+    products, failures = build_products(product_id, card, "c", unlisted)
+    assert products == []
+    assert (failures, unlisted) == (1, ["108719"])
+
+
+async def test_irshad_many_untitled_hidden_blocks_make_the_pass_incomplete(monkeypatch):
+    # Редкий «призрак» — сбой сайта; много — скорее сменилась вёрстка
+    # переключателей цвета, и цвета пропадают молча.
+    from src.scrapers import irshad as irshad_module
+
+    monkeypatch.setattr(irshad_module, "_MIN_UNLISTED_OFFERS_ALLOWED", 0)
+    scraper = fast(IrshadScraper)
+    _, ghost_card = _irshad_card_without_colour_choice()
+    page = f'<div class="pjax-container"><div id="productGridItems">{ghost_card}</div></div>'
+    serve(scraper, irshad_site({"1": page}))
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert [p.external_id for p in products] == ["85759"]
+    assert not status.complete
+    assert status.abort_reason == "too_many_unlisted_offers"
+
+
+def _text_of(block_html: str, css_class: str) -> str:
+    import re
+
+    match = re.search(rf'class="{css_class}">(.*?)</', block_html, re.DOTALL)
+    assert match, css_class
+    return re.sub(r"<[^>]+>", "", match.group(1)).strip()
 
 
 def test_irshad_unreadable_current_price_next_to_a_struck_out_one_is_a_failure():

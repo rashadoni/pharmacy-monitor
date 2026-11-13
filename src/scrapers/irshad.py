@@ -15,8 +15,12 @@
 оборвался так в четырёх больших разделах из четырнадцати, и повтор прохода не
 помог. При возрастании новый товар встаёт в конец и страниц не сдвигает.
 
-Сдвиг списка посреди обхода виден по карточке, пришедшей второй раз: такой
-проход неполон и повторяется. Не виден один случай: товар, снятый с сайта посреди обхода, сдвигает список вверх
+Карточка, пришедшая второй раз, проход не обрывает: товар с несколькими цветами
+сайт ставит в список не один раз, на местах разных своих цветов, и до правки
+2026-11-13 раздел мелкой техники обрывался на 16-й странице при каждой попытке
+(``listing_shifted_between_pages``). Повторная карточка разбирается снова —
+уже взятые товары отсеиваются, новый цвет берётся. Обрыв — только страница с
+тем же набором карточек, что уже читали. Не виден один случай сдвига: товар, снятый с сайта посреди обхода, сдвигает список вверх
 без повтора, и один из следующих товаров может не попасть ни на одну страницу.
 Без числа товаров от сайта этого не обнаружить.
 
@@ -58,6 +62,9 @@ _MAX_PAGES = 1500
 # Порядок списка, в котором добавленный посреди обхода товар не сдвигает
 # страницы: по номеру товара, старые первыми.
 _STABLE_SORT = "id"
+# Сколько скрытых безымянных блоков цены терпим в разделе: это число либо 5%
+# товаров раздела, что больше (в ноутбуках 2026-11-13 их восемь на ~600).
+_MIN_UNLISTED_OFFERS_ALLOWED = 10
 _CARD_OPEN_RE = re.compile(r'<div class="product (?:first )?product-(\d+)_[0-9a-f-]+[^"]*">')
 _NAME_LINK_RE = re.compile(
     r'<a\s+href="(https://irshad\.az/az/mehsullar/[^"]+)"[^>]*'
@@ -69,6 +76,7 @@ _OLD_PRICE_RE = re.compile(r'class="old-price">(.*?)</span>', re.DOTALL)
 _NEW_PRICE_RE = re.compile(r'class="new-price">(.*?)</p>', re.DOTALL)
 _LABEL_RE = re.compile(r'class="product__label[^"]*">(.*?)</div>', re.DOTALL)
 _IMAGE_RE = re.compile(r'class="product__img".*?<img\s+src="([^"]+)"', re.DOTALL)
+_COLORS_LIST_RE = re.compile(r'<ul class="product__colors">(.*?)</ul>', re.DOTALL)
 _LOAD_MORE_RE = re.compile(r'id="loadMore"[^>]*data-page="(\d+)"')
 _HOME_LINK_RE = re.compile(r'href="https://irshad\.az/az/([a-z0-9-]+(?:/[a-z0-9-]+)*)"')
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -109,7 +117,7 @@ def split_cards(page_html: str) -> list[tuple[str, str]]:
     return cards
 
 
-_OFFER_BLOCK_RE = re.compile(r'<div class="product__flex-right[^"]*"\s+data-selected-id="(\d+)"')
+_OFFER_BLOCK_RE = re.compile(r'<div class="product__flex-right([^"]*)"\s+data-selected-id="(\d+)"')
 _COLOR_INPUT_RE = re.compile(r'<input\s+type="radio"[^>]*>', re.DOTALL)
 _ATTR_RE = re.compile(r'([a-zA-Z-]+)="([^"]*)"')
 
@@ -125,20 +133,43 @@ def _availability(block_html: str) -> str:
 
 
 def build_products(
-    product_id: str, card_html: str, category_slug: str
+    product_id: str,
+    card_html: str,
+    category_slug: str,
+    unlisted: list[str] | None = None,
 ) -> tuple[list[ScrapedProduct], int]:
     """Товары одной карточки и число предложений, которые не удалось опознать.
 
     У обычной карточки товар один. У карточки с выбором цвета их столько,
     сколько цветов: название и адрес цвета стоят у его переключателя, цена и
     наличие — в блоке предложения с тем же номером.
+
+    Название и адрес в шапке карточки принадлежат ВИДИМОМУ блоку предложения
+    (без ``d-none``), а не номеру из класса карточки: у карточки 108451 виден
+    блок 108455, и ссылка ведёт на него. У карточки с одним блоком это одно и
+    то же.
+
+    Предложение-«призрак» отказом не считается: у карточки список цветов есть,
+    но пуст (``<ul class="product__colors"> </ul>``), а блоков с ценой
+    несколько. Скрытый блок без названия — цвет, которого сайт не показывает:
+    переключателя у него нет, открыть его покупателю нечем (замер 2026-11-13,
+    MacBook в разделе ноутбуков: у карточки 108447 виден блок 108435 с
+    названием из шапки, блок 108447 скрыт и безымянен). Номера пропущенных
+    блоков складываются в ``unlisted``. Видимый блок и предложение при
+    непустом списке цветов по-прежнему обязаны опознаться.
     """
     # Кто есть кто: номер товара -> (адрес, название, картинка).
     identities: dict[str, tuple[str, str, str | None]] = {}
     link = _NAME_LINK_RE.search(card_html)
     image = _IMAGE_RE.search(card_html)
+    opens = list(_OFFER_BLOCK_RE.finditer(card_html))
+    # Чей товар назван в шапке: видимый блок; без блоков — сама карточка.
+    shown_id = next(
+        (match.group(2) for match in opens if "d-none" not in match.group(1).split()),
+        product_id,
+    )
     if link:
-        identities[product_id] = (
+        identities[shown_id] = (
             html_lib.unescape(link.group(1)).strip(),
             _text(link.group(2)),
             html_lib.unescape(image.group(1)) if image else None,
@@ -152,10 +183,9 @@ def build_products(
             identities[variant_id] = (url, title, attrs.get("data-img-src") or None)
 
     # Блоки предложений: у каждого своя цена и своё наличие.
-    opens = list(_OFFER_BLOCK_RE.finditer(card_html))
     blocks = [
         (
-            match.group(1),
+            match.group(2),
             card_html[
                 match.start() : opens[i + 1].start() if i + 1 < len(opens) else len(card_html)
             ],
@@ -164,11 +194,17 @@ def build_products(
     ] or [(product_id, card_html)]
 
     product_type = _text((_TYPE_RE.search(card_html) or [None, None])[1])
+    color_lists = _COLORS_LIST_RE.findall(card_html)
+    no_colors_offered = bool(color_lists) and not any(body.strip() for body in color_lists)
     products: list[ScrapedProduct] = []
     failures = 0
     for offer_id, block_html in blocks:
         identity = identities.get(offer_id)
         if identity is None or not identity[0] or not identity[1]:
+            if identity is None and offer_id != shown_id and no_colors_offered:
+                if unlisted is not None:
+                    unlisted.append(offer_id)
+                continue
             failures += 1
             continue
         url, name, image_url = identity
@@ -224,6 +260,9 @@ class IrshadScraper(HttpCatalogScraper):
         result = CategoryPass()
         seen: set[str] = set()
         seen_cards: set[str] = set()
+        seen_pages: set[tuple[str, ...]] = set()
+        # Скрытые блоки без названия («призраки», см. build_products).
+        unlisted: list[str] = []
         page = 1
         # Позвал ли сайт на эту страницу ссылкой «показать ещё» с предыдущей.
         announced = True
@@ -252,15 +291,32 @@ class IrshadScraper(HttpCatalogScraper):
                 # конца списка пропал из вёрстки, верить ему больше нельзя.
                 result.abort_reason = "load_more_marker_missing"
                 return result
-            if any(product_id in seen_cards for product_id, _ in cards):
-                # Карточка, которую уже видели: список сдвинулся между
-                # страницами (товар переехал выше или добавился новый), и
-                # какой-то другой товар мог не попасть ни на одну.
-                result.abort_reason = "listing_shifted_between_pages"
+            page_cards = tuple(product_id for product_id, _ in cards)
+            if page_cards in seen_pages:
+                # Та же страница второй раз: листание сломано.
+                result.abort_reason = "listing_page_repeated"
                 return result
-            seen_cards.update(product_id for product_id, _ in cards)
+            seen_pages.add(page_cards)
+            repeated = [product_id for product_id in page_cards if product_id in seen_cards]
+            if repeated:
+                # Карточка, которую уже видели, — не обрыв. Товар с несколькими
+                # цветами сайт ставит в список не один раз — на местах разных
+                # своих цветов (замер 2026-11-13: карточка 65715 — на 7-й
+                # странице раздела, на месте цвета 38401, и на 16-й). Такая
+                # карточка разбирается снова: товары, взятые с первой встречи,
+                # отсеет `seen`, а цвет, которого в первой не было, не
+                # потеряется. При порядке по возрастанию номера повтор не
+                # прячет другой товар и при сдвиге списка: вставленный посреди
+                # товар сдвигает следующие вниз, на ещё не читанные страницы.
+                log.info(
+                    "irshad_repeated_cards",
+                    category=category_slug,
+                    page=page,
+                    cards=repeated,
+                )
+            seen_cards.update(page_cards)
             for product_id, card_html in cards:
-                products, failures = build_products(product_id, card_html, category_slug)
+                products, failures = build_products(product_id, card_html, category_slug, unlisted)
                 if failures:
                     # Раздел из-за такой карточки неполон; без номера карточки
                     # причину потом не найти — список длиной в сотни страниц.
@@ -301,6 +357,20 @@ class IrshadScraper(HttpCatalogScraper):
         if result.item_failures:
             result.abort_reason = "item_parse_failures"
             return result
+        if unlisted:
+            # Редкий сбой самого сайта — терпим; много — скорее сменилась
+            # вёрстка переключателей цвета, и цвета пропадают молча.
+            allowed = max(_MIN_UNLISTED_OFFERS_ALLOWED, len(result.products) // 20)
+            log.warning(
+                "irshad_unlisted_offers_skipped",
+                category=category_slug,
+                offers=sorted(set(unlisted))[:50],
+                count=len(set(unlisted)),
+                allowed=allowed,
+            )
+            if len(set(unlisted)) > allowed:
+                result.abort_reason = "too_many_unlisted_offers"
+                return result
         result.complete = True
         return result
 
