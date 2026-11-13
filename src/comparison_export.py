@@ -57,6 +57,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         "note_unit": "Qablaşdırma fərqlidir — 1 ədədin qiyməti müqayisə olunur: {parts}",
         "note_unit_part": "{site} {price} ({count} əd.)",
         "note_stale": "{site}: qiymət {days} gün əvvəlkidir, fərqə daxil edilməyib",
+        "note_out_of_stock": "{site}: stokda yoxdur, fərqə daxil edilməyib",
+        "out_of_stock": "stokda yoxdur",
         "note_review": "Fərq çox böyükdür — məhsulların eyni olduğunu yoxlayın",
         "info_title": "Qiymət müqayisəsi",
         "info_generated": "Fayl hazırlanıb",
@@ -93,6 +95,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         "note_unit": "Фасовка разная — сравнивается цена за 1 шт.: {parts}",
         "note_unit_part": "{site} {price} ({count} шт.)",
         "note_stale": "{site}: цене {days} дн., в разницу не входит",
+        "note_out_of_stock": "{site}: нет в наличии, в разницу не входит",
+        "out_of_stock": "нет в наличии",
         "note_review": "Разница очень большая — проверьте, что товары одинаковые",
         "info_title": "Сравнение цен",
         "info_generated": "Файл сформирован",
@@ -129,6 +133,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         "note_unit": "Pack sizes differ — price per unit is compared: {parts}",
         "note_unit_part": "{site} {price} ({count} pcs)",
         "note_stale": "{site}: price is {days} days old, not counted in the difference",
+        "note_out_of_stock": "{site}: out of stock, not counted in the difference",
+        "out_of_stock": "out of stock",
         "note_review": "The difference is very large — check that the products are the same",
         "info_title": "Price comparison",
         "info_generated": "Generated",
@@ -153,6 +159,7 @@ _HEADER_ALIGN = Alignment(vertical="center", wrap_text=True)
 _LOW_FONT = Font(color="15803D", bold=True)
 _HIGH_FONT = Font(color="B91C1C")
 _STALE_FONT = Font(color="9CA3AF", strike=True)
+_MUTED_FONT = Font(color="9CA3AF")
 _LINK_FONT = Font(color="1D4ED8", underline="single")
 _MONEY = "0.00"
 _PERCENT = "0.0%"
@@ -200,6 +207,15 @@ def _write_text(cell: Any, value: Any) -> None:
         cell.data_type = "s"
 
 
+def _comparable(entry: dict[str, Any]) -> bool:
+    """Цена записи входит в минимум, максимум и разницу строки.
+
+    Не входят устаревшая цена и товар, которого на сайте нет в наличии
+    (`out_of_stock`): запись остаётся в строке, чтобы это было видно.
+    """
+    return not entry.get("stale") and not entry.get("out_of_stock")
+
+
 def _compared_value(row: dict[str, Any], entry: dict[str, Any]) -> float:
     if row.get("spread_basis") == "unit" and entry.get("unit_price") is not None:
         return entry["unit_price"]
@@ -217,7 +233,7 @@ def client_position(row: dict[str, Any], client_site: str = CLIENT_SITE) -> str 
     «Позиция» и считаются числа утреннего письма (`difference_counts`).
     """
     entry = row["prices"].get(client_site)
-    if entry is None or entry.get("stale") or row.get("min_price") is None:
+    if entry is None or not _comparable(entry) or row.get("min_price") is None:
         return None
     if row["min_price"] == row["max_price"]:
         return "equal"
@@ -299,7 +315,7 @@ def _cheapest_sites(row: dict[str, Any], sites: tuple[str, ...] = SITES) -> str:
         SITE_TITLES[site]
         for site in sites
         if (entry := row["prices"].get(site)) is not None
-        and not entry.get("stale")
+        and _comparable(entry)
         and _compared_value(row, entry) == row["min_price"]
     )
 
@@ -314,13 +330,15 @@ def _note(row: dict[str, Any], t: dict[str, str]) -> str:
                 count=entry.get("pack_count") or 1,
             )
             for site in SITES
-            if (entry := row["prices"].get(site)) is not None and not entry.get("stale")
+            if (entry := row["prices"].get(site)) is not None and _comparable(entry)
         ]
         notes.append(t["note_unit"].format(parts="; ".join(parts)))
     for site in SITES:
         entry = row["prices"].get(site)
         if entry is not None and entry.get("stale") and entry.get("age_days") is not None:
             notes.append(t["note_stale"].format(site=SITE_TITLES[site], days=entry["age_days"]))
+        if entry is not None and entry.get("out_of_stock"):
+            notes.append(t["note_out_of_stock"].format(site=SITE_TITLES[site]))
     if row.get("needs_review"):
         notes.append(t["note_review"])
     return ". ".join(notes)
@@ -363,9 +381,17 @@ def _write_sheet(
             entry = row["prices"].get(site)
             if entry is None:
                 continue
-            cell = ws.cell(row=index, column=price_col[site], value=round(entry["price"], 2))
-            cell.number_format = _MONEY
-            if entry.get("stale"):
+            if entry.get("price") is None:
+                # Нет в наличии, и цену сайт не называл: в ячейке — словами.
+                cell = ws.cell(row=index, column=price_col[site])
+                _write_text(cell, t["out_of_stock"])
+                cell.font = _MUTED_FONT
+            else:
+                cell = ws.cell(row=index, column=price_col[site], value=round(entry["price"], 2))
+                cell.number_format = _MONEY
+            if entry.get("price") is None:
+                pass
+            elif not _comparable(entry):
                 cell.font = _STALE_FONT
             elif differs:
                 value = _compared_value(row, entry)

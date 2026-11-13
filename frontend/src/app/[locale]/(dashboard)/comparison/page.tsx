@@ -96,6 +96,11 @@ export default function ComparisonPage() {
   const searching = query.length >= MIN_SEARCH_CHARS;
   const minSites = initialMinSites(searchParams.get("min_sites"));
   const diffOnly = searchParams.get("diff") === "1";
+  // Наличие: «rival» — у конкурента закончился, у своего магазина есть;
+  // «own» — закончился у своего, у конкурента есть.
+  const stockParam = searchParams.get("stock");
+  const stockFilter: "rival" | "own" | null =
+    stockParam === "rival" || stockParam === "own" ? stockParam : null;
   const withAloe = IS_PHARMACY && searchParams.get("aloe") === "1";
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const { key: sortKey, dir: sortDir } = initialSort(searchParams.get("sort"));
@@ -173,6 +178,19 @@ export default function ComparisonPage() {
       )
         return false;
       if (withAloe && !r.prices["aloe"]) return false;
+      if (stockFilter) {
+        const own = r.prices[viewerSite];
+        const rivals = viewerSites.slice(1).map((s) => r.prices[s]).filter(Boolean);
+        if (stockFilter === "rival") {
+          // У меня есть, у кого-то из конкурентов закончился.
+          if (!own || own.out_of_stock) return false;
+          if (!rivals.some((p) => p.out_of_stock)) return false;
+        } else {
+          // У меня закончился, у кого-то из конкурентов есть.
+          if (!own?.out_of_stock) return false;
+          if (!rivals.some((p) => !p.out_of_stock)) return false;
+        }
+      }
       return true;
     });
     const dir = sortDir === "asc" ? 1 : -1;
@@ -193,14 +211,14 @@ export default function ComparisonPage() {
       if (bv == null) return -1;
       return (av - bv) * dir;
     });
-  }, [data, diffOnly, withAloe, sortKey, sortDir]);
+  }, [data, diffOnly, withAloe, stockFilter, viewerSite, viewerSites, sortKey, sortDir]);
 
   // Рисуем первые PAGE_SIZE строк и добавляем по мере прокрутки. Сортировка и
   // фильтры при этом работают по всему набору — он целиком в памяти.
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   useEffect(() => {
     setVisibleCount(PAGE_SIZE);
-  }, [query, searching, minSites, category, diffOnly, withAloe, sortKey, sortDir]);
+  }, [query, searching, minSites, category, diffOnly, withAloe, stockFilter, sortKey, sortDir]);
   const total = filtered?.length ?? 0;
   const shown = useMemo(
     () => filtered?.slice(0, visibleCount),
@@ -418,6 +436,17 @@ export default function ComparisonPage() {
           />
           <span>{t("diff_only_filter")}</span>
         </label>
+        <select
+          value={stockFilter ?? ""}
+          onChange={(e) => updateQuery("stock", e.target.value || null)}
+          className="min-h-11 rounded-md border border-input bg-background px-3 py-2 text-sm md:min-h-9"
+          title={t("stock_filter_label")}
+          aria-label={t("stock_filter_label")}
+        >
+          <option value="">{t("stock_filter_all")}</option>
+          <option value="rival">{t("stock_filter_rival")}</option>
+          <option value="own">{t("stock_filter_own")}</option>
+        </select>
         {/* «Только с aloe» — фильтр аптечного экземпляра: у aloe каталог
             заметно меньше двух других. У другого профиля его нет. */}
         {IS_PHARMACY ? (
@@ -616,11 +645,14 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
   // У своего магазина в строке нет сравнимой цены — разница только между
   // конкурентами: ни «мы дешевле», ни «конкурент дешевле» тут сказать нельзя.
   const own = row.prices[viewerSite];
-  if (!own || own.stale) {
+  if (!own || own.stale || own.out_of_stock) {
     return (
       <span
         className="inline-flex items-center tabular-nums text-muted-foreground"
-        title={t("spread_no_own_price", { site: siteTitle(viewerSite), pct: abs.toFixed(1) })}
+        title={t(own?.out_of_stock ? "spread_own_out_of_stock" : "spread_no_own_price", {
+          site: siteTitle(viewerSite),
+          pct: abs.toFixed(1),
+        })}
       >
         {abs.toFixed(1)}%
       </span>
@@ -673,11 +705,14 @@ function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
   // Stale-цена (2026-05-29) НЕ участвует в spread → не подсвечиваем как min/max,
   // приглушаем и зачёркиваем, показываем бейдж «N дн. назад».
   const stale = p.stale === true;
-  const isMin = !stale && row.min_price === cmpVal;
+  // Нет в наличии: цена — последняя известная, в расчёт строки не входит.
+  const outOfStock = p.out_of_stock === true;
+  const counted = !stale && !outOfStock;
+  const isMin = counted && row.min_price === cmpVal;
   const isMax =
-    !stale && row.max_price === cmpVal && row.min_price !== row.max_price;
+    counted && row.max_price === cmpVal && row.min_price !== row.max_price;
   const showUnit =
-    !stale &&
+    counted &&
     isUnit &&
     p.pack_count != null &&
     p.pack_count > 1 &&
@@ -688,12 +723,14 @@ function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
       target="_blank"
       rel="noopener noreferrer"
       title={
-        stale && p.age_days != null
-          ? t("stale_note", { days: p.age_days })
-          : undefined
+        outOfStock
+          ? t("out_of_stock_note")
+          : stale && p.age_days != null
+            ? t("stale_note", { days: p.age_days })
+            : undefined
       }
       className={`inline-flex flex-col items-end tabular-nums hover:underline leading-tight ${
-        stale
+        !counted
           ? "text-muted-foreground/60"
           : isMin
             ? "text-success font-semibold"
@@ -702,11 +739,18 @@ function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
               : ""
       }`}
     >
-      <span
-        className={stale ? "line-through decoration-muted-foreground/40" : ""}
-      >
-        {formatPrice(p.price, locale)}
-      </span>
+      {p.price != null && (
+        <span
+          className={!counted ? "line-through decoration-muted-foreground/40" : ""}
+        >
+          {formatPrice(p.price, locale)}
+        </span>
+      )}
+      {outOfStock && (
+        <span className="text-[10px] font-normal text-amber-600 dark:text-amber-500 no-underline">
+          {t("out_of_stock_badge")}
+        </span>
+      )}
       {/* Страна — аптечное правило идентичности товара; у электроники её нет. */}
       {IS_PHARMACY && (
         <span

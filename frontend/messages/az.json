@@ -163,7 +163,14 @@
     "others_hint": "Bu məhsulların digər saytda təsdiqlənmiş cütü hələ yoxdur (və ya cüt seçilmiş filtrə görə gizlədilib), ona görə müqayisə cədvəlinə düşməyib. Qiymət saytdakı kimidir.",
     "others_truncated": "{total} nəticədən ilk {shown} göstərilir — sorğunu dəqiqləşdirin.",
     "out_of_stock": "stokda yoxdur",
-    "spread_no_own_price": "{site} üçün qiymət yoxdur — fərq {pct}% rəqiblər arasındadır"
+    "spread_no_own_price": "{site} üçün qiymət yoxdur — fərq {pct}% rəqiblər arasındadır",
+    "out_of_stock_badge": "stokda yoxdur",
+    "out_of_stock_note": "Məhsul stokda yoxdur — son məlum qiymətdir, fərqə daxil deyil",
+    "stock_filter_label": "Mövcudluq",
+    "stock_filter_all": "Mövcudluq: hamısı",
+    "stock_filter_rival": "Rəqibdə yoxdur, məndə var",
+    "stock_filter_own": "Məndə yoxdur, rəqibdə var",
+    "spread_own_out_of_stock": "{site}-də məhsul stokda yoxdur — fərq {pct}% rəqiblər arasındadır"
   },
   "overview": {
     "title": "Ümumi baxış",

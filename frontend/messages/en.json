@@ -163,7 +163,14 @@
     "others_hint": "These products have no confirmed pair on another site yet (or the pair is hidden by the selected filter), so they are not in the comparison table. The price is as shown on the site.",
     "others_truncated": "Showing the first {shown} of {total} — refine your search.",
     "out_of_stock": "out of stock",
-    "spread_no_own_price": "No {site} price — the {pct}% gap is between competitors"
+    "spread_no_own_price": "No {site} price — the {pct}% gap is between competitors",
+    "out_of_stock_badge": "out of stock",
+    "out_of_stock_note": "Out of stock — last known price, not counted in the difference",
+    "stock_filter_label": "Availability",
+    "stock_filter_all": "Availability: all",
+    "stock_filter_rival": "Competitor is out, I have it",
+    "stock_filter_own": "I am out, competitor has it",
+    "spread_own_out_of_stock": "{site} is out of stock — the {pct}% gap is between competitors"
   },
   "overview": {
     "title": "Overview",

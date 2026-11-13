@@ -220,11 +220,19 @@ def _comparison_rows(
     category: str | None = None,
     match_ids: set[int] | None = None,
     client_site: str | None = None,
+    include_unavailable: bool = False,
 ) -> list[dict[str, Any]]:
     """Строки таблицы сравнения (формат `ComparisonRowOut`), по spread убыв.
 
     `client_site` — чьими глазами строки: его товар решает фильтр категории и
     «мёртвый клиент», он первый при равных ценах. None — клиент профиля.
+
+    `include_unavailable` — оставлять в строке товар, которого на сайте нет в
+    наличии: запись с `out_of_stock=True` и последней известной ценой. В
+    минимум, максимум и разницу она не входит (как устаревшая цена), но строку
+    держит: «у конкурента закончился» и «закончился у меня» — то, что страница
+    показывает. Без флага такой товар из строки выпадает, как раньше, — так
+    строки берёт утреннее письмо, его числа не меняются.
 
     `match_ids` ограничивает выборку конкретными кластерами (поиск); `None` —
     все кластеры арендатора.
@@ -356,12 +364,33 @@ def _comparison_rows(
         if any(p.site == client and p.url_dead_at is not None for p in products):
             continue
         prices: dict[str, dict[str, Any]] = {}
+        # Нет в наличии: в расчёт не идут, в строку возвращаются после него.
+        unavailable: dict[str, dict[str, Any]] = {}
         for p in products:
             # «Фантомные» товары (страница 404, помечены validate-links) — скрываем,
             # чтобы не показывать матч с мёртвой ссылкой на конкурента.
             if p.url_dead_at is not None:
                 continue
-            if not policy_offer_eligibility(p, now=now).eligible:
+            offer = policy_offer_eligibility(p, now=now)
+            if not offer.eligible:
+                if include_unavailable and offer.reason == "out_of_stock":
+                    latest = prices_by_pid.get(p.id)
+                    last_price = (latest[1] or latest[0]) if latest else None
+                    unavailable[p.site] = {
+                        # Последняя известная цена; None — сайт её не называл.
+                        "price": last_price if last_price is not None and last_price > 0 else None,
+                        "is_on_sale": False,
+                        "url": p.url,
+                        "product_id": p.id,
+                        "country_code": p.manufacturer_country_code,
+                        "country_resolution_status": p.country_resolution_status,
+                        "availability_status": p.offer_availability_status,
+                        "availability_observed_at": p.availability_observed_at,
+                        "pack_size": p.pack_size,
+                        "age_days": _price_age_days(now, p.last_seen_at),
+                        "stale": False,
+                        "out_of_stock": True,
+                    }
                 continue
             latest = prices_by_pid.get(p.id)
             price = (latest[1] or latest[0]) if latest else None
@@ -394,7 +423,13 @@ def _comparison_rows(
         basis, min_p, max_p, cheapest, spread = _comparison_spread(prices)
 
         sites_with_price = len(prices)
-        if sites_with_price < min_sites:
+        # Сайт, где товар есть в продаже, главнее записи «нет в наличии» того
+        # же сайта (старый дубль в кластере).
+        for site, entry in unavailable.items():
+            prices.setdefault(site, entry)
+        # Строку держат и сайты, где товар закончился: иначе «у конкурента нет
+        # в наличии» пропадало бы со страницы вместе с товаром.
+        if len(prices) < min_sites:
             continue
         if site_filter and site_filter not in prices:
             continue

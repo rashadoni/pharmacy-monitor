@@ -1850,7 +1850,13 @@ def test_comparison_excludes_only_explicit_oos_offer(client, tenant_user, setup_
     client.get(f"/auth/verify?token={token}")
     rows = client.get("/api/v1/dash/comparison?min_sites=2").json()
     row = next(item for item in rows if item["name"] == "Three offers")
-    assert set(row["prices"]) == {"pharmonline", "aptekonline"}
+    # С 2026-11-13 товар, которого нет в наличии, из строки не выпадает (его
+    # показывают с пометкой), но в цены сравнения по-прежнему не входит:
+    # самая низкая цена — 9.0 у aptekonline, а не 8.0 у aloe.
+    comparable = {site for site, entry in row["prices"].items() if not entry.get("out_of_stock")}
+    assert comparable == {"pharmonline", "aptekonline"}
+    assert row["prices"]["aloe"]["out_of_stock"] is True
+    assert (row["min_price"], row["cheapest_site"]) == (9.0, "aptekonline")
 
 
 def _make_match_with_packs(db, run, *, canonical, prods, tenant_id=1):
@@ -6610,3 +6616,91 @@ def test_comparison_refuses_an_unknown_viewer_site(client, tenant_user, setup_db
     response = client.get(path)
     assert response.status_code == 400, response.text
     assert "nowhere" in response.json()["detail"]
+
+
+# ── «Нет в наличии» остаётся в строке сравнения ─────────────────────────────
+
+
+def _mark_out_of_stock(db, canonical: str, site: str) -> None:
+    product = db.scalars(
+        select(storage.Product).where(
+            storage.Product.external_id == f"{site}-{canonical}", storage.Product.site == site
+        )
+    ).one()
+    product.offer_availability_status = "out_of_stock"
+    product.availability_observed_at = utcnow()
+    db.commit()
+
+
+def test_comparison_shows_out_of_stock_offer_outside_the_price_math(
+    client, tenant_user, setup_db
+):
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_prices(
+        s,
+        run,
+        canonical="Ended at aloe",
+        prices={"pharmonline": 10.0, "aptekonline": 8.0, "aloe": 5.0},
+    )
+    _mark_out_of_stock(s, "Ended at aloe", "aloe")
+    _login(client, tenant_user, s)
+
+    (row,) = client.get("/api/v1/dash/comparison").json()
+
+    # Товар aloe в строке виден, с последней ценой и пометкой, но самым
+    # дешёвым не считается: купить его нельзя.
+    assert row["prices"]["aloe"]["out_of_stock"] is True
+    assert row["prices"]["aloe"]["price"] == 5.0
+    assert (row["min_price"], row["max_price"], row["cheapest_site"]) == (8.0, 10.0, "aptekonline")
+    assert row["sites_with_price"] == 2
+    assert "out_of_stock" not in row["prices"]["pharmonline"]
+
+
+def test_comparison_keeps_the_row_when_the_only_competitor_ran_out(
+    client, tenant_user, setup_db
+):
+    from src import comparison_rows
+
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_prices(
+        s, run, canonical="Competitor ran out", prices={"pharmonline": 10.0, "aptekonline": 8.0}
+    )
+    _mark_out_of_stock(s, "Competitor ran out", "aptekonline")
+    _login(client, tenant_user, s)
+
+    (row,) = client.get("/api/v1/dash/comparison").json()
+    found = client.get("/api/v1/dash/comparison/search?q=Competitor").json()
+
+    # Сравнивать не с чем — разницы нет, но строка на странице остаётся:
+    # «у конкурента закончился» и есть то, что надо показать.
+    assert row["prices"]["aptekonline"]["out_of_stock"] is True
+    assert (row["min_price"], row["spread_pct"], row["cheapest_site"]) == (None, None, None)
+    assert [r["name"] for r in found["rows"]] == ["Competitor ran out"]
+    # Утреннее письмо берёт строки без таких товаров — его числа прежние.
+    assert comparison_rows.comparison_rows(s, tenant_id=1) == []
+
+
+def test_comparison_export_marks_out_of_stock(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_prices(
+        s,
+        run,
+        canonical="Own ran out",
+        prices={"pharmonline": 5.0, "aptekonline": 8.0, "aloe": 9.0},
+    )
+    _mark_out_of_stock(s, "Own ran out", "pharmonline")
+    _login(client, tenant_user, s)
+
+    sheet = _load_export(client.get("/api/v1/dash/comparison/export.xlsx")).worksheets[0]
+    row = [cell.value for cell in sheet[2]]
+
+    # Цена клиента 5.00 в файле есть, но самым дешёвым назван Aptekonline,
+    # «Позиция» пуста, а в примечании сказано, почему.
+    assert row[2:5] == [5.0, 8.0, 9.0]
+    assert row[5] == "Aptekonline"
+    assert row[8] is None
+    assert "Pharmonline: нет в наличии" in row[9]
+    assert sheet.cell(row=2, column=3).font.strike

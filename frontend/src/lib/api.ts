@@ -281,10 +281,14 @@ export interface ComparisonRow {
   prices: Record<
     string,
     {
-      price: number;
+      // null — только у записи «нет в наличии», если цену сайт не называл.
+      price: number | null;
       is_on_sale: boolean;
       url: string;
       product_id: number;
+      // Товара на сайте нет в наличии: запись показывают с пометкой, в
+      // min/max/разницу строки она не входит (comparison_rows.py).
+      out_of_stock?: boolean;
       country_code?: string | null;
       country_resolution_status?:
         | "resolved"

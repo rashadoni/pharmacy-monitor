@@ -2470,6 +2470,7 @@ def dash_comparison(
         category=category,
         match_ids=match_ids,
         client_site=client_site,
+        include_unavailable=True,
     )
     return _fast_json(rows[:limit])
 
@@ -2511,6 +2512,7 @@ def dash_comparison_search(
         category=category,
         match_ids=match_ids,
         client_site=client_site,
+        include_unavailable=True,
     )
     shown_match_ids = {row["canonical_id"] for row in rows}
 
@@ -2612,6 +2614,7 @@ def dash_comparison_export(
             category=category,
             match_ids=match_ids,
             client_site=client_site,
+            include_unavailable=True,
         )
     if with_aloe:
         rows = [row for row in rows if "aloe" in row["prices"]]
