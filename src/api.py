@@ -2711,7 +2711,7 @@ def _category_label_priority(
 
 @app.get("/api/v1/dash/roi/actions")
 def dash_roi_actions(
-    client_site: str = "pharmonline",
+    client_site: str = site_profile.CLIENT_SITE,
     locale: str = "ru",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
@@ -2746,7 +2746,7 @@ def dash_roi_actions(
 
 @app.get("/api/v1/dash/roi/recommendations", response_model=RoiRecommendationsOut)
 def dash_roi_recommendations(
-    client_site: str = "pharmonline",
+    client_site: str = site_profile.CLIENT_SITE,
     locale: str = "ru",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
@@ -2785,7 +2785,7 @@ def dash_roi_recommendations(
 
 @app.get("/api/v1/dash/roi/status", response_model=RoiStatusOut)
 def dash_roi_status(
-    client_site: str = "pharmonline",
+    client_site: str = site_profile.CLIENT_SITE,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
@@ -2937,7 +2937,7 @@ def _alert_events_out(events: list[storage.AlertEvent], db: Session) -> list[dic
         if destination is None and isinstance(match_id, int):
             site = payload.get("site")
             if site not in _VALID_SITES:
-                site = "pharmonline"
+                site = site_profile.CLIENT_SITE
             destination = by_match_site.get((event.tenant_id, match_id, site))
         rows.append(_alert_event_out(event, destination_url=destination))
     return rows
@@ -3037,11 +3037,14 @@ def dash_alerts_page(
     if sort == "oldest":
         order_by = (storage.AlertEvent.created_at, storage.AlertEvent.id)
     elif sort == "site":
+        # Конкуренты первыми, сайт клиента последним — как было у аптек:
+        # aloe, aptekonline, pharmonline.
         site_order = case(
-            (site_expr == "aloe", 0),
-            (site_expr == "aptekonline", 1),
-            (site_expr == "pharmonline", 2),
-            else_=3,
+            *(
+                (site_expr == site, position)
+                for position, site in enumerate(reversed(site_profile.SITES))
+            ),
+            else_=len(site_profile.SITES),
         )
         order_by = (
             site_order,
@@ -3365,7 +3368,7 @@ def dash_brand_share(
 
 @app.get("/api/v1/dash/price-index")
 def dash_price_index(
-    client_site: str = "pharmonline",
+    client_site: str = site_profile.CLIENT_SITE,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
@@ -3387,7 +3390,7 @@ def dash_price_index(
 
 @app.get("/api/v1/dash/category-comparison", response_model=list[CategoryComparisonOut])
 def dash_category_comparison(
-    client_site: str = "pharmonline",
+    client_site: str = site_profile.CLIENT_SITE,
     locale: str = "ru",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
@@ -3462,7 +3465,7 @@ def dash_category_comparison(
     response_model=CategoryComparisonCoverageOut,
 )
 def dash_category_comparison_coverage(
-    client_site: str = "pharmonline",
+    client_site: str = site_profile.CLIENT_SITE,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
 ):
@@ -3509,7 +3512,7 @@ def dash_category_comparison_coverage(
 
 @app.get("/api/v1/dash/category-comparison/catalog")
 def dash_category_catalog(
-    client_site: str = "pharmonline",
+    client_site: str = site_profile.CLIENT_SITE,
     locale: str = "ru",
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
@@ -3604,7 +3607,7 @@ def dash_manual_category_options(
 @app.get("/api/v1/dash/category-comparison/product-suggestions")
 def dash_category_product_suggestions(
     q: str,
-    client_site: str = "pharmonline",
+    client_site: str = site_profile.CLIENT_SITE,
     limit: int = 12,
     user: storage.TenantUser = Depends(require_user),
     db: Session = Depends(get_db),
@@ -3656,7 +3659,7 @@ def dash_assign_product_category(
             select(storage.Product.category)
             .where(
                 storage.Product.tenant_id == user.tenant_id,
-                storage.Product.site == "pharmonline",
+                storage.Product.site == site_profile.CLIENT_SITE,
                 storage.Product.category.is_not(None),
                 storage.Product.category != "",
             )
@@ -3670,7 +3673,7 @@ def dash_assign_product_category(
         select(storage.Product).where(
             storage.Product.id == product_id,
             storage.Product.tenant_id == user.tenant_id,
-            storage.Product.site == "pharmonline",
+            storage.Product.site == site_profile.CLIENT_SITE,
         )
     )
     if product is None:
@@ -5399,7 +5402,7 @@ def _build_cost_import_plan(
         for product in db.scalars(
             select(storage.Product).where(
                 storage.Product.tenant_id == tenant_id,
-                storage.Product.site == "pharmonline",
+                storage.Product.site == site_profile.CLIENT_SITE,
             )
         ).all()
     }

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from src import site_profile
 from src._time import utcnow
 from typing import Literal
 
@@ -483,7 +484,7 @@ def predict_competitor_moves(
         if not policy_identity_eligibility(list(m.products)).eligible:
             continue
         for product in m.products:
-            if product.site == "pharmonline":
+            if product.site == site_profile.CLIENT_SITE:
                 continue
             if not policy_offer_eligibility(product).eligible:
                 continue

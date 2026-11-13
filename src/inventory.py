@@ -23,6 +23,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from src import site_profile
 from src._time import utcnow
 from pathlib import Path
 
@@ -134,7 +135,7 @@ def _find_product_by_sku_or_name(
         p = session.scalar(
             select(Product).where(
                 Product.tenant_id == tenant_id,
-                Product.site == "pharmonline",
+                Product.site == site_profile.CLIENT_SITE,
                 Product.external_id == sku.strip(),
             )
         )
@@ -144,7 +145,7 @@ def _find_product_by_sku_or_name(
         client_products = session.scalars(
             select(Product).where(
                 Product.tenant_id == tenant_id,
-                Product.site == "pharmonline",
+                Product.site == site_profile.CLIENT_SITE,
             )
         ).all()
         if not client_products:
@@ -325,7 +326,7 @@ def margin_report(session: Session, *, run_id: int | None = None) -> list[Margin
     ]
     # Берём все клиентские Products со снимком цены
     products = session.scalars(
-        select(Product).where(Product.site == "pharmonline", Product.tenant_id == run.tenant_id)
+        select(Product).where(Product.site == site_profile.CLIENT_SITE, Product.tenant_id == run.tenant_id)
     ).all()
     # Diff-only runs may confirm an unchanged historical snapshot instead of
     # writing one. Keep the requested run's trust boundary, including explicit
