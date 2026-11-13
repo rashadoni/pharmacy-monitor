@@ -3,6 +3,7 @@
 import { useLocale, useTranslations } from "next-intl";
 import type { ComparisonOther } from "@/lib/api";
 import { formatPrice } from "@/lib/utils";
+import { IS_PHARMACY, siteTitle } from "@/lib/site-profile";
 import { useViewerSites } from "@/lib/viewer-site";
 
 /**
@@ -55,7 +56,7 @@ export function OthersSection({
               <th className="px-3 py-2 text-left font-medium">{t("th_name")}</th>
               {SITES.map((s) => (
                 <th key={s} className="px-3 py-2 text-right font-medium">
-                  {s}
+                  {siteTitle(s)}
                 </th>
               ))}
             </tr>
@@ -112,20 +113,22 @@ function OtherPrice({ other }: { other: ComparisonOther }) {
       }`}
     >
       <span>{formatPrice(other.price, locale)}</span>
-      <span
-        className={`mt-0.5 rounded-sm border px-1 py-px text-[9px] font-medium leading-none ${
-          verifiedCountry
-            ? "border-border text-muted-foreground"
-            : "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-400"
-        }`}
-        title={
-          verifiedCountry
-            ? t("country_verified", { code: verifiedCountry })
-            : t("country_unverified")
-        }
-      >
-        {verifiedCountry ?? t("country_unknown_short")}
-      </span>
+      {IS_PHARMACY && (
+        <span
+          className={`mt-0.5 rounded-sm border px-1 py-px text-[9px] font-medium leading-none ${
+            verifiedCountry
+              ? "border-border text-muted-foreground"
+              : "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-400"
+          }`}
+          title={
+            verifiedCountry
+              ? t("country_verified", { code: verifiedCountry })
+              : t("country_unverified")
+          }
+        >
+          {verifiedCountry ?? t("country_unknown_short")}
+        </span>
+      )}
       {outOfStock && (
         <span className="text-[10px] font-normal text-amber-600 dark:text-amber-500">
           {t("out_of_stock")}

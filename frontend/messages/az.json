@@ -162,7 +162,8 @@
     "others_title": "Saytlarda tapılıb, amma müqayisədə yoxdur — {count}",
     "others_hint": "Bu məhsulların digər saytda təsdiqlənmiş cütü hələ yoxdur (və ya cüt seçilmiş filtrə görə gizlədilib), ona görə müqayisə cədvəlinə düşməyib. Qiymət saytdakı kimidir.",
     "others_truncated": "{total} nəticədən ilk {shown} göstərilir — sorğunu dəqiqləşdirin.",
-    "out_of_stock": "stokda yoxdur"
+    "out_of_stock": "stokda yoxdur",
+    "spread_no_own_price": "{site} üçün qiymət yoxdur — fərq {pct}% rəqiblər arasındadır"
   },
   "overview": {
     "title": "Ümumi baxış",

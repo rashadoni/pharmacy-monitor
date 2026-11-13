@@ -402,10 +402,10 @@ export default function ComparisonPage() {
             <option value="brand:desc">{t("th_brand")} ↓</option>
             {viewerSites.flatMap((site) => [
               <option key={`${site}:asc`} value={`${site}:asc`}>
-                {site} ↑
+                {siteTitle(site)} ↑
               </option>,
               <option key={`${site}:desc`} value={`${site}:desc`}>
-                {site} ↓
+                {siteTitle(site)} ↓
               </option>,
             ])}
           </optgroup>
@@ -528,7 +528,7 @@ export default function ComparisonPage() {
                 {visibleSites.map((s) => (
                   <SortableTh
                     key={s}
-                    label={s}
+                    label={siteTitle(s)}
                     col={s}
                     active={sort}
                     onClick={() => toggleSort(s)}
@@ -613,6 +613,19 @@ function SpreadCell({ row }: { row: ComparisonRow }) {
     return <span className="text-muted-foreground/70">—</span>;
   }
   const abs = Math.abs(row.spread_pct);
+  // У своего магазина в строке нет сравнимой цены — разница только между
+  // конкурентами: ни «мы дешевле», ни «конкурент дешевле» тут сказать нельзя.
+  const own = row.prices[viewerSite];
+  if (!own || own.stale) {
+    return (
+      <span
+        className="inline-flex items-center tabular-nums text-muted-foreground"
+        title={t("spread_no_own_price", { site: siteTitle(viewerSite), pct: abs.toFixed(1) })}
+      >
+        {abs.toFixed(1)}%
+      </span>
+    );
+  }
   // «Свой» сайт — выбранный в настройках (по умолчанию клиент профиля). Если
   // он cheapest → зелёный ▼; если cheapest другой → красный ▲ (конкурент бьёт
   // нас по цене). При равных ценах сервер ставит «свой» первым.
@@ -694,22 +707,25 @@ function PriceCell({ row, site }: { row: ComparisonRow; site: string }) {
       >
         {formatPrice(p.price, locale)}
       </span>
-      <span
-        className={`mt-0.5 rounded-sm border px-1 py-px text-[9px] font-medium leading-none no-underline ${
-          p.country_resolution_status === "resolved" && p.country_code
-            ? "border-border text-muted-foreground"
-            : "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-400"
-        }`}
-        title={
-          p.country_resolution_status === "resolved" && p.country_code
-            ? t("country_verified", { code: p.country_code.toUpperCase() })
-            : t("country_unverified")
-        }
-      >
-        {p.country_resolution_status === "resolved" && p.country_code
-          ? p.country_code.toUpperCase()
-          : t("country_unknown_short")}
-      </span>
+      {/* Страна — аптечное правило идентичности товара; у электроники её нет. */}
+      {IS_PHARMACY && (
+        <span
+          className={`mt-0.5 rounded-sm border px-1 py-px text-[9px] font-medium leading-none no-underline ${
+            p.country_resolution_status === "resolved" && p.country_code
+              ? "border-border text-muted-foreground"
+              : "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-400"
+          }`}
+          title={
+            p.country_resolution_status === "resolved" && p.country_code
+              ? t("country_verified", { code: p.country_code.toUpperCase() })
+              : t("country_unverified")
+          }
+        >
+          {p.country_resolution_status === "resolved" && p.country_code
+            ? p.country_code.toUpperCase()
+            : t("country_unknown_short")}
+        </span>
+      )}
       {stale && p.age_days != null && (
         <span className="text-[10px] font-normal text-amber-600 dark:text-amber-500">
           {t("stale_badge", { days: p.age_days })}
@@ -872,7 +888,7 @@ function ComparisonCard({
         {viewerSites.map((s) => (
           <div key={s} className="text-center">
             <div className="text-[10px] text-muted-foreground uppercase">
-              {s}
+              {siteTitle(s)}
             </div>
             <div className="mt-0.5">
               <PriceCell row={row} site={s} />
@@ -913,7 +929,7 @@ function TrendPanel({ row }: { row: ComparisonRow }) {
         return (
           <div key={s} className="flex items-center gap-2 text-xs">
             <span className="text-[10px] uppercase tracking-wide text-muted-foreground w-20 shrink-0">
-              {s}
+              {siteTitle(s)}
             </span>
             {isLoading ? (
               <span className="text-muted-foreground">…</span>
