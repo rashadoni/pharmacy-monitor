@@ -3181,6 +3181,15 @@ def _run_matching_stage(
     которые текущие правила запрещают.
     """
     summary: dict[str, int | None] = {"refreshed": None, "relinked": None, "reseated": None}
+    if not site_profile.is_pharmacy():
+        # Аптечные правила (доза, форма, страна) товарам другого профиля не
+        # подходят: у электроники своё сопоставление — по модели.
+        from src import electronics_matcher
+
+        summary["clusters"] = electronics_matcher.match_products(session)
+        summary["revalidated"] = None
+        summary["flagged"] = None
+        return summary
     for key, prepare in (
         ("refreshed", matcher.refresh_derived_fields),
         ("relinked", matcher.relink_stale_members),

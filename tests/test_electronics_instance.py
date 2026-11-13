@@ -66,6 +66,10 @@ def test_three_sites_are_scanned_verified_and_priced(tmp_path):
     assert [row["sites"] for row in outcome["run_rows"]] == ["kontakt", "irshad", "bakuelectronics"]
     assert outcome["products_per_site"] == {"kontakt": 3, "irshad": 3, "bakuelectronics": 3}
     assert outcome["snapshots"] == 9
+    # Телефон, второй телефон и телевизор сведены между тремя сайтами — по
+    # модели, сопоставлением электроники, а не аптечным.
+    assert outcome["matches"] == 3
+    assert outcome["matched_products"] == 9
     # База помечена профилем: клиент арендатора по умолчанию — Kontakt Home.
     assert outcome["tenants"] == [["default", "kontakt"]]
     # Рекомендации считаются, только когда собраны все три сайта: после третьего.
