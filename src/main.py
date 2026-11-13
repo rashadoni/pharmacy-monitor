@@ -7679,7 +7679,9 @@ _VALIDATE_CLIENT_SITE = site_profile.CLIENT_SITE  # сайт-клиент — в
 
 @cli.command("validate-links")
 @click.option(
-    "--site", default="aptekonline", help="Сайт (default aptekonline); client только с --force"
+    "--site",
+    default=site_profile.COMPETITOR_SITES[0],
+    help=f"Сайт (по умолчанию {site_profile.COMPETITOR_SITES[0]}); сайт клиента только с --force",
 )
 @click.option("--limit", type=int, default=None, help="Макс. товаров (для smoke-теста)")
 @click.option("--concurrency", default=5, help="Параллельных HTTP-запросов")

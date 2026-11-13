@@ -23,12 +23,13 @@ import {
   type CategoryComparisonRow,
   type ForecastMover,
 } from "@/lib/api";
+import { SITES } from "@/lib/site-profile";
 
-const SITE_COLORS: Record<string, string> = {
-  pharmonline: "#3b82f6",
-  aptekonline: "#22c55e",
-  aloe: "#f59e0b",
-};
+// Цвет — по месту сайта в профиле: клиент первым (синий), дальше конкуренты.
+const SITE_PALETTE = ["#3b82f6", "#22c55e", "#f59e0b"] as const;
+const SITE_COLORS: Record<string, string> = Object.fromEntries(
+  SITES.map((site, position) => [site, SITE_PALETTE[position % SITE_PALETTE.length]]),
+);
 
 export default function AnalyticsPage() {
   const t = useTranslations("analytics");
@@ -87,9 +88,7 @@ function BrandShareSection() {
 
   const chartData = data?.map((b) => ({
     brand: b.brand,
-    pharmonline: b.counts.pharmonline ?? 0,
-    aptekonline: b.counts.aptekonline ?? 0,
-    aloe: b.counts.aloe ?? 0,
+    ...Object.fromEntries(SITES.map((site) => [site, b.counts[site] ?? 0])),
   }));
 
   return (
@@ -121,17 +120,9 @@ function BrandShareSection() {
             />
             <Tooltip formatter={(v: number, name: string) => [v, name]} />
             <Legend />
-            <Bar
-              dataKey="pharmonline"
-              stackId="a"
-              fill={SITE_COLORS.pharmonline}
-            />
-            <Bar
-              dataKey="aptekonline"
-              stackId="a"
-              fill={SITE_COLORS.aptekonline}
-            />
-            <Bar dataKey="aloe" stackId="a" fill={SITE_COLORS.aloe} />
+            {SITES.map((site) => (
+              <Bar key={site} dataKey={site} stackId="a" fill={SITE_COLORS[site]} />
+            ))}
           </BarChart>
         </ResponsiveContainer>
       )}

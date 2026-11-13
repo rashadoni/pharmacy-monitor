@@ -9,6 +9,8 @@
  * случаях возвращает в response header — мы пишем его в ApiError, чтобы
  * support мог сопоставить с server-side логом / Sentry трейсом.
  */
+import { CLIENT_SITE } from "./site-profile";
+
 const BASE = ""; // same origin
 
 /** Generate RFC4122-ish v4 UUID — для трассировки запросов через стек. */
@@ -390,7 +392,9 @@ export interface RoiAction {
   competitor_site: string | null;
 }
 
-export type AlertSite = "pharmonline" | "aptekonline" | "aloe";
+// Сайт экземпляра (список — в site-profile.ts): у аптечного профиля это
+// pharmonline, aptekonline и aloe.
+export type AlertSite = string;
 export type AlertSort = "newest" | "oldest" | "site";
 
 export interface AlertEvent {
@@ -1329,7 +1333,7 @@ export const api = {
       `/api/v1/dash/category-comparison${qs ? `?${qs}` : ""}`,
     );
   },
-  categoryComparisonCoverage: (client_site = "pharmonline") =>
+  categoryComparisonCoverage: (client_site = CLIENT_SITE) =>
     request<CategoryComparisonCoverage>(
       `/api/v1/dash/category-comparison/coverage?client_site=${encodeURIComponent(client_site)}`,
     ),

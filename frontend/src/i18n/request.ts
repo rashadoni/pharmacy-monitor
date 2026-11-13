@@ -11,6 +11,7 @@
 import { getRequestConfig } from "next-intl/server";
 import { cookies } from "next/headers";
 import { defaultLocale, locales, type Locale } from "./config";
+import { messagesForProfile } from "../lib/site-profile";
 
 function isLocale(value: string | undefined): value is Locale {
   return value !== undefined && (locales as readonly string[]).includes(value);
@@ -37,7 +38,9 @@ export default getRequestConfig(async ({ requestLocale }) => {
 async function loadConfig(locale: Locale) {
   return {
     locale,
-    messages: (await import(`../../messages/${locale}.json`)).default,
+    // Тексты называют аптечные сайты прямо; у экземпляра другого профиля
+    // имена заменяются на его сайты. Аптечному возвращаются как есть.
+    messages: messagesForProfile((await import(`../../messages/${locale}.json`)).default),
     timeZone: "Asia/Baku",
     now: new Date(),
   };

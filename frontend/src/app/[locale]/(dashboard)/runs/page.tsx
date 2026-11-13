@@ -9,10 +9,11 @@ import { formatRelative } from "@/lib/utils";
 import { runStatusToneClass } from "@/lib/run-quality";
 import { runProductCount } from "@/lib/run-counts";
 import { ProductCountText } from "@/components/product-count";
+import { SITES as PROFILE_SITES } from "@/lib/site-profile";
 
 const PAGE_SIZE = 25;
 const STATUSES = ["", "running", "ok", "degraded", "failed"];
-const SITES = ["", "pharmonline", "aptekonline", "aloe"];
+const SITES = ["", ...PROFILE_SITES];
 
 export default function RunsPage() {
   const t = useTranslations("runs");

@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useTranslations } from "next-intl";
 import { useRouter } from "@/i18n/navigation";
 import { Lock, User } from "lucide-react";
+import { PROFILE } from "@/lib/site-profile";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -53,7 +54,7 @@ export default function LoginPage() {
             <div className="inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-primary/10 mb-4">
               <Lock className="h-7 w-7 text-primary" />
             </div>
-            <h1 className="text-2xl font-semibold tracking-tight">Pharmacy Monitor</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">{PROFILE.appName}</h1>
             <p className="text-sm text-muted-foreground mt-1.5">
               {t("password_subtitle")}
             </p>
@@ -126,7 +127,7 @@ export default function LoginPage() {
 
         {/* Footer */}
         <p className="text-center text-xs text-muted-foreground mt-6">
-          Pharmacy Monitor · Production
+          {PROFILE.appName} · Production
         </p>
       </div>
     </div>

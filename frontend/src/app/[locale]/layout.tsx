@@ -18,9 +18,10 @@ import type { Metadata, Viewport } from "next";
 import { Providers } from "@/components/providers";
 import { locales, type Locale } from "@/i18n/config";
 import "../globals.css";
+import { PROFILE } from "@/lib/site-profile";
 
 export const metadata: Metadata = {
-  title: "Pharmacy Monitor",
+  title: PROFILE.appName,
   description: "Daily competitive monitoring for AZ pharmacies",
 };
 

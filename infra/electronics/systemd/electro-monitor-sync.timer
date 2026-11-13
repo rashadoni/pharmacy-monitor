@@ -1,0 +1,10 @@
+[Unit]
+Description=Electro Monitor — ежедневно подтягивать код до ночных сборов
+
+[Timer]
+# До открытия окна ритма (22:00 UTC) и вне часов аптечных сборов и выкладок.
+OnCalendar=*-*-* 20:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

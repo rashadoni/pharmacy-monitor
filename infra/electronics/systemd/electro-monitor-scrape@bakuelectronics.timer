@@ -1,0 +1,14 @@
+[Unit]
+Description=Electro Monitor — ночной сбор bakuelectronics
+
+[Timer]
+# Время в UTC: окно ритма открывается в 22:00 UTC (02:00 Баку).
+OnCalendar=*-*-* 22:10:00 UTC
+# Повтор для ночи, когда первый сбор не удался; после удачного `run` выходит сам.
+OnCalendar=*-*-* 04:40:00 UTC
+RandomizedDelaySec=120
+Persistent=true
+Unit=electro-monitor-scrape@bakuelectronics.service
+
+[Install]
+WantedBy=timers.target

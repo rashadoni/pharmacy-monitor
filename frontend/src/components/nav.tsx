@@ -23,6 +23,7 @@ import {
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { LocaleSwitcher } from "@/components/locale-switcher";
+import { PROFILE, SITES, siteDomain } from "@/lib/site-profile";
 
 const NAV_OVERVIEW = [
   { href: "/overview", key: "overview", icon: TrendingUp },
@@ -32,23 +33,31 @@ const NAV_OVERVIEW = [
   { href: "/analytics", key: "analytics", icon: BarChart3 },
 ] as const;
 
-const NAV_SITES = [
-  { href: "/site/pharmonline", label: "pharmonline.az", icon: Pill },
-  { href: "/site/aptekonline", label: "aptekonline.az", icon: Building2 },
-  { href: "/site/aloe", label: "aloe.az", icon: Leaf },
-] as const;
+// Сайты экземпляра — из профиля; значки — по месту сайта в списке (клиент первым).
+const SITE_ICONS = [Pill, Building2, Leaf] as const;
+const NAV_SITES = SITES.map((site, position) => ({
+  href: `/site/${site}`,
+  label: siteDomain(site),
+  icon: SITE_ICONS[position % SITE_ICONS.length],
+}));
 
-const NAV_ACTIONS = [
-  { href: "/alerts", key: "alerts", icon: Bell },
-  { href: "/watchlist", key: "watchlist", icon: Star },
-  { href: "/matcher", key: "matcher", icon: Sparkles },
-  { href: "/matches/review", key: "matches_review", icon: Link2 },
-] as const;
+// Закреплённые ссылки, ручное сопоставление и связки категорий построены на
+// аптечной модели данных — у экземпляра другого профиля этих страниц в меню нет.
+const NAV_ACTIONS = (
+  [
+    { href: "/alerts", key: "alerts", icon: Bell, pharmacyOnly: false },
+    { href: "/watchlist", key: "watchlist", icon: Star, pharmacyOnly: true },
+    { href: "/matcher", key: "matcher", icon: Sparkles, pharmacyOnly: true },
+    { href: "/matches/review", key: "matches_review", icon: Link2, pharmacyOnly: true },
+  ] as const
+).filter((item) => PROFILE.pharmacyPages || !item.pharmacyOnly);
 
-const NAV_SETTINGS = [
-  { href: "/categories", key: "categories", icon: ListTree },
-  { href: "/settings", key: "settings", icon: Settings },
-] as const;
+const NAV_SETTINGS = (
+  [
+    { href: "/categories", key: "categories", icon: ListTree, pharmacyOnly: true },
+    { href: "/settings", key: "settings", icon: Settings, pharmacyOnly: false },
+  ] as const
+).filter((item) => PROFILE.pharmacyPages || !item.pharmacyOnly);
 
 function NavLink({ href, icon: Icon, label, pathname }: {
   href: string; icon: React.ElementType; label: string; pathname: string | null;
@@ -159,12 +168,14 @@ export function MobileHeader() {
 export function BottomNav() {
   const pathname = usePathname();
   const t = useTranslations("nav");
-  const visible = [
-    { href: "/overview", key: "overview", icon: TrendingUp },
-    { href: "/comparison", key: "comparison", icon: Search },
-    { href: "/matcher", key: "matcher_short", icon: Sparkles },
-    { href: "/alerts", key: "alerts", icon: Bell },
-  ] as const;
+  const visible = (
+    [
+      { href: "/overview", key: "overview", icon: TrendingUp, pharmacyOnly: false },
+      { href: "/comparison", key: "comparison", icon: Search, pharmacyOnly: false },
+      { href: "/matcher", key: "matcher_short", icon: Sparkles, pharmacyOnly: true },
+      { href: "/alerts", key: "alerts", icon: Bell, pharmacyOnly: false },
+    ] as const
+  ).filter((item) => PROFILE.pharmacyPages || !item.pharmacyOnly);
   const moreActive = !visible.some((item) => pathname?.startsWith(item.href));
   const moreGroups = [
     {
@@ -181,22 +192,32 @@ export function BottomNav() {
     },
     {
       label: t("section_actions"),
-      items: [
-        { href: "/watchlist", label: t("watchlist"), icon: Star },
-        { href: "/matches/review", label: t("matches_review"), icon: Link2 },
-      ],
+      items: PROFILE.pharmacyPages
+        ? [
+            { href: "/watchlist", label: t("watchlist"), icon: Star },
+            { href: "/matches/review", label: t("matches_review"), icon: Link2 },
+          ]
+        : [],
     },
     {
       label: t("section_settings"),
       items: [
-        { href: "/categories", label: t("categories"), icon: ListTree },
+        ...(PROFILE.pharmacyPages
+          ? [{ href: "/categories", label: t("categories"), icon: ListTree }]
+          : []),
         { href: "/settings", label: t("settings"), icon: Settings },
       ],
     },
-  ];
+  ].filter((group) => group.items.length > 0);
 
   return (
-    <nav className="fixed bottom-0 left-0 right-0 z-50 grid grid-cols-5 border-t border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 md:hidden">
+    <nav
+      className={cn(
+        "fixed bottom-0 left-0 right-0 z-50 grid border-t border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 md:hidden",
+        // Ячеек — видимые пункты и «Ещё»: у аптечного экземпляра пять.
+        visible.length === 4 ? "grid-cols-5" : "grid-cols-4",
+      )}
+    >
       {visible.map((item) => {
         const active = pathname?.startsWith(item.href);
         const Icon = item.icon;

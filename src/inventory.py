@@ -23,6 +23,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from src import site_profile
 from src._time import utcnow
 from pathlib import Path
 
@@ -134,7 +135,7 @@ def _find_product_by_sku_or_name(
         p = session.scalar(
             select(Product).where(
                 Product.tenant_id == tenant_id,
-                Product.site == "pharmonline",
+                Product.site == site_profile.CLIENT_SITE,
                 Product.external_id == sku.strip(),
             )
         )
@@ -144,7 +145,7 @@ def _find_product_by_sku_or_name(
         client_products = session.scalars(
             select(Product).where(
                 Product.tenant_id == tenant_id,
-                Product.site == "pharmonline",
+                Product.site == site_profile.CLIENT_SITE,
             )
         ).all()
         if not client_products:
@@ -304,16 +305,16 @@ def margin_report(session: Session, *, run_id: int | None = None) -> list[Margin
 
     current_catalog = run_id is None
     if run_id is None:
-        run_id = storage.latest_financial_run_ids_by_site(session, ("pharmonline",)).get(
-            "pharmonline"
-        )
+        run_id = storage.latest_financial_run_ids_by_site(
+            session, (site_profile.CLIENT_SITE,)
+        ).get(site_profile.CLIENT_SITE)
     run = session.get(Run, run_id) if run_id is not None else None
     if not storage.run_is_financially_eligible(run):
         return []
     if current_catalog:
         latest_attempt = storage.latest_full_catalog_attempts_by_site(
-            session, ("pharmonline",), tenant_id=run.tenant_id
-        ).get("pharmonline")
+            session, (site_profile.CLIENT_SITE,), tenant_id=run.tenant_id
+        ).get(site_profile.CLIENT_SITE)
         if latest_attempt is None or latest_attempt.id != run.id:
             return []
 
@@ -325,7 +326,7 @@ def margin_report(session: Session, *, run_id: int | None = None) -> list[Margin
     ]
     # Берём все клиентские Products со снимком цены
     products = session.scalars(
-        select(Product).where(Product.site == "pharmonline", Product.tenant_id == run.tenant_id)
+        select(Product).where(Product.site == site_profile.CLIENT_SITE, Product.tenant_id == run.tenant_id)
     ).all()
     # Diff-only runs may confirm an unchanged historical snapshot instead of
     # writing one. Keep the requested run's trust boundary, including explicit

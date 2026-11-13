@@ -1,0 +1,14 @@
+[Unit]
+Description=Electro Monitor — ночной сбор irshad
+
+[Timer]
+# После Baku Electronics: сборы одной базы идут по очереди под общим замком.
+OnCalendar=*-*-* 22:40:00 UTC
+# Повтор; если первый сбор ещё идёт, systemd второй не запустит.
+OnCalendar=*-*-* 05:10:00 UTC
+RandomizedDelaySec=120
+Persistent=true
+Unit=electro-monitor-scrape@irshad.service
+
+[Install]
+WantedBy=timers.target

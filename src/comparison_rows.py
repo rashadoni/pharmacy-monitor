@@ -326,7 +326,7 @@ def _comparison_rows(
         # Drill-down из /category-comparison: фильтр по категории товара-клиента
         # (pharmonline). None → без фильтра (обычный режим страницы сравнения).
         if category is not None:
-            client_p = next((p for p in products if p.site == "pharmonline"), None)
+            client_p = next((p for p in products if p.site == site_profile.CLIENT_SITE), None)
             if client_p is None:
                 continue
             # Классифицируем ровно так же, как сводка /category-comparison —
@@ -343,7 +343,7 @@ def _comparison_rows(
         # Если товар-КЛИЕНТ (pharmonline) мёртв (404) — матч бесполезен (нечего
         # сравнивать с ценой клиента), дропаем целиком, а не показываем competitor-only
         # строку (аудит M1; зеркалит analytics._iter_matched_prices).
-        if any(p.site == "pharmonline" and p.url_dead_at is not None for p in products):
+        if any(p.site == site_profile.CLIENT_SITE and p.url_dead_at is not None for p in products):
             continue
         prices: dict[str, dict[str, Any]] = {}
         for p in products:
