@@ -38,6 +38,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from src import storage
+from src import site_profile
 
 log = structlog.get_logger(__name__)
 
@@ -55,7 +56,7 @@ INTRADAY_PER_SITE_MIN_GAP_SEC = 2 * 3600  # 2 часа
 # 5–7 раз в день воспроизводил transient opening-handshake timeout. Его каталог
 # обновляет отдельный полный недельный timer с полноценной retry/verification
 # семантикой. Aptekonline также остаётся на отдельном полном расписании.
-INTRADAY_SITES = ("aloe",)
+INTRADAY_SITES = site_profile.INTRADAY_SITES
 
 # Окно для подсчёта volatility (count price changes per category per N days).
 VOLATILITY_WINDOW_DAYS = 7

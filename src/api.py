@@ -90,6 +90,7 @@ from sqlalchemy.orm import Session, aliased, defer, selectinload
 
 from src import analytics, catalog_search
 from src import inventory as inv_mod
+from src import site_profile
 from src import storage, tenants
 from src._time import utcnow
 
@@ -1494,7 +1495,7 @@ def dash_change_password(
 class ScrapeTriggerIn(BaseModel):
     mode: str = "all"  # 'all' | 'category'
     category_id: int | None = None
-    sites: list[str] | None = None  # ["pharmonline", "aptekonline", "aloe"] etc
+    sites: list[str] | None = None  # имена сайтов экземпляра, см. site_profile.SITES
 
 
 @app.post("/api/v1/dash/scrape/trigger", status_code=202)
@@ -2639,7 +2640,7 @@ def dash_comparison_suggest(
     return [{"text": s.text, "count": s.count} for s in suggestions]
 
 
-_VALID_SITES = ("pharmonline", "aptekonline", "aloe")
+_VALID_SITES = site_profile.SITES
 _VALID_LOCALES = ("ru", "az", "en")
 
 
@@ -5192,7 +5193,7 @@ def dash_match_relink(
         raise HTTPException(404, "Match not found")
 
     site = (body.site or "").strip().lower()
-    if site not in ("pharmonline", "aptekonline", "aloe"):
+    if site not in site_profile.SITES:
         raise HTTPException(400, f"Неизвестный сайт: {site!r}")
 
     ext = _external_id_from_url(body.url)

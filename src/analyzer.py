@@ -16,12 +16,13 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from src import storage
+from src import site_profile
 from src.storage import Match, PriceSnapshot, Product, Promo, Run
 
 log = structlog.get_logger()
 
-CLIENT_SITE = "pharmonline"
-COMPETITOR_SITES = ("aptekonline", "aloe")
+CLIENT_SITE = site_profile.CLIENT_SITE
+COMPETITOR_SITES = site_profile.COMPETITOR_SITES
 
 
 @dataclass

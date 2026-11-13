@@ -11,6 +11,7 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from src._time import utcnow
+from src import site_profile
 
 import structlog
 from sqlalchemy import desc, func, select
@@ -29,8 +30,8 @@ from src.storage import (
 
 log = structlog.get_logger()
 
-CLIENT_SITE = "pharmonline"
-COMPETITOR_SITES = ("aptekonline", "aloe")
+CLIENT_SITE = site_profile.CLIENT_SITE
+COMPETITOR_SITES = site_profile.COMPETITOR_SITES
 ALL_SITES = (CLIENT_SITE, *COMPETITOR_SITES)
 
 # Окно «активного» товара для brand_share под diff-only persist. 14 дней —

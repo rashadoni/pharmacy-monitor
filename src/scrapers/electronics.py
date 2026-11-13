@@ -1,9 +1,9 @@
 """Сборщики магазинов электроники и их проба с живого сайта.
 
-Реестр ``ELECTRONICS_SCRAPERS`` — три сборщика, которые составят профиль
-«электроника» (клиент — Kontakt Home, конкуренты — Irshad и Baku Electronics).
-В общий прогон (`src.main.SCRAPER_CLASSES`) они пока не включены: аптечный
-прогон о них не знает.
+Реестр ``ELECTRONICS_SCRAPERS`` — сборщики профиля «электроника» (клиент —
+Kontakt Home, конкуренты — Irshad и Baku Electronics). Экземпляр с
+``PM_PROFILE=electronics`` берёт их в общий прогон (`src.main.SCRAPER_CLASSES`);
+аптечный экземпляр о них не знает. Сам профиль — `src/site_profile.py`.
 
 Проба — посмотреть, что сборщик читает с сайта, ничего не записывая в базу:
 
@@ -21,12 +21,13 @@ import json
 
 import click
 
+from src import site_profile
 from src.scrapers.bakuelectronics import BakuElectronicsScraper
 from src.scrapers.http_catalog import HttpCatalogScraper
 from src.scrapers.irshad import IrshadScraper
 from src.scrapers.kontakt import KontaktScraper
 
-CLIENT_SITE = "kontakt"
+CLIENT_SITE = site_profile.ELECTRONICS.client_site
 ELECTRONICS_SCRAPERS: dict[str, type[HttpCatalogScraper]] = {
     "kontakt": KontaktScraper,
     "irshad": IrshadScraper,

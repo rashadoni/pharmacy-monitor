@@ -16,6 +16,7 @@ download etmək imkanı». До этого на странице была тол
 """
 
 from __future__ import annotations
+from src import site_profile
 
 import io
 from datetime import datetime, timedelta
@@ -26,9 +27,9 @@ from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-SITES = ("pharmonline", "aptekonline", "aloe")
-CLIENT_SITE = "pharmonline"
-SITE_TITLES = {"pharmonline": "Pharmonline", "aptekonline": "Aptekonline", "aloe": "Aloe"}
+SITES = site_profile.SITES
+CLIENT_SITE = site_profile.CLIENT_SITE
+SITE_TITLES = site_profile.SITE_TITLES
 XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 # Время в файле — бакинское: файл читает клиент, а не сервер. В Азербайджане

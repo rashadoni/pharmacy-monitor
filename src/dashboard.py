@@ -15,6 +15,7 @@ import os
 import subprocess
 from datetime import timedelta
 from src._time import utcnow
+from src import site_profile
 from pathlib import Path
 
 import pandas as pd
@@ -290,8 +291,8 @@ header[data-testid="stHeader"] {
     unsafe_allow_html=True,
 )
 
-CLIENT_SITE = "pharmonline"
-COMPETITOR_SITES = ("aptekonline", "aloe")
+CLIENT_SITE = site_profile.CLIENT_SITE
+COMPETITOR_SITES = site_profile.COMPETITOR_SITES
 SITES = (CLIENT_SITE, *COMPETITOR_SITES)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///data/db.sqlite")
 
@@ -995,7 +996,7 @@ def _render_manual_actions(row):
             with sc1:
                 site_choice = st.selectbox(
                     "Сайт",
-                    options=["pharmonline", "aptekonline", "aloe"],
+                    options=list(SITES),
                     key=f"swap_site_{cid}",
                 )
             with sc2:
@@ -1378,7 +1379,7 @@ with tab_compare:
         else:
             col_c.metric("Макс. спред", "—")
         if not view.empty:
-            undercut_n = int((view["cheapest_site"].isin(["aptekonline", "aloe"])).sum())
+            undercut_n = int((view["cheapest_site"].isin(list(COMPETITOR_SITES))).sum())
             col_d.metric("Конкурент дешевле", undercut_n)
 
         st.divider()

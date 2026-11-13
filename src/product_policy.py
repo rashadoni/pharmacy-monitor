@@ -22,6 +22,7 @@ from typing import Any
 from sqlalchemy import and_, desc, func, or_, select
 
 from src._time import utcnow
+from src import site_profile
 from src.cadence import SITE_SCRAPE_CADENCE_HOURS, site_max_age_hours
 from src.normalize import strip_accents
 
@@ -52,7 +53,7 @@ AVAILABILITY_POLICY_MODES = {"shadow", "enforce"}
 # «Tam kataloq: Təsdiqlənməyib — tövsiyələr bağlıdır».
 OFFER_MAX_AGE_HOURS = {site: site_max_age_hours(site) for site in SITE_SCRAPE_CADENCE_HOURS}
 
-REQUIRED_CATALOG_SITES = ("pharmonline", "aptekonline", "aloe")
+REQUIRED_CATALOG_SITES = site_profile.SITES
 _MIN_POLICY_COVERAGE_PCT = 98.0
 
 # A full-catalog producer must calculate its financial outputs before the Run

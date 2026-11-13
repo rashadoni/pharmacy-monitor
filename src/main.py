@@ -32,7 +32,7 @@ from sqlalchemy.orm.attributes import NO_VALUE
 
 load_dotenv(override=True)
 
-from src import analyzer, matcher, notifier, reporter, storage, watchlist  # noqa: E402
+from src import analyzer, matcher, notifier, reporter, site_profile, storage, watchlist  # noqa: E402
 from src import pharmonline_identity_recovery as identity_recovery  # noqa: E402
 from src import pharmonline_identity_resolution as identity_resolution  # noqa: E402
 from src.run_lock import SCRAPE_ADVISORY_LOCK_KEY  # noqa: E402
@@ -3046,11 +3046,32 @@ def _pharmonline_scraper_class() -> type[BaseScraper]:
     return PharmonlineScraper
 
 
-SCRAPER_CLASSES: dict[str, type[BaseScraper]] = {
-    "pharmonline": _pharmonline_scraper_class(),
-    "aptekonline": AptekonlineScraper,
-    "aloe": AloeScraper,
-}
+def _scraper_classes() -> dict[str, type[BaseScraper]]:
+    """Сборщики сайтов этого экземпляра — по его профилю (src/site_profile.py)."""
+    if site_profile.is_pharmacy():
+        return {
+            "pharmonline": _pharmonline_scraper_class(),
+            "aptekonline": AptekonlineScraper,
+            "aloe": AloeScraper,
+        }
+    from src.scrapers.electronics import ELECTRONICS_SCRAPERS
+
+    return dict(ELECTRONICS_SCRAPERS)
+
+
+SCRAPER_CLASSES: dict[str, type[BaseScraper]] = _scraper_classes()
+if set(SCRAPER_CLASSES) != set(site_profile.SITES):
+    # Профиль без своих сборщиков — или сборщики чужого профиля: прогон
+    # собирал бы не те сайты, что ждут все остальные реестры.
+    raise RuntimeError(
+        f"profile {site_profile.PROFILE.name!r} lists sites {sorted(site_profile.SITES)}, "
+        f"scrapers exist for {sorted(SCRAPER_CLASSES)}"
+    )
+
+
+def _default_scrape_sites() -> list[str]:
+    """Сайты команды без `--site`: все, кроме тех, чей каталог приходит файлом."""
+    return [site for site in SCRAPER_CLASSES if site not in site_profile.IMPORTED_SITES]
 
 # Phase 1.4 (2026-05-27) — AI crawler fallback orchestration.
 #
@@ -5640,7 +5661,7 @@ _RULE_TYPES = (
 @click.option("--min-pct", type=float, default=None, help="Порог % для threshold-правил")
 @click.option(
     "--site",
-    type=click.Choice(["pharmonline", "aptekonline", "aloe"]),
+    type=click.Choice(list(site_profile.SITES)),
     default=None,
     help="Ограничить правило одним сайтом",
 )
@@ -6023,7 +6044,9 @@ def notify_test(email_to: str | None, chat_id: str | None) -> None:
 @cli.command("ai-crawl")
 @click.option(
     "--site",
-    type=click.Choice(["aloe", "pharmonline", "aptekonline"]),
+    # Запасной обходчик написан только для аптечных сайтов: у экземпляра с
+    # другим профилем выбирать не из чего.
+    type=click.Choice([site for site in AI_CRAWLER_BY_SITE if site in site_profile.SITES]),
     required=True,
     help="Сайт для AI-обхода (sitemap + LLM extraction)",
 )
@@ -6352,7 +6375,7 @@ def run_cmd(
     request_id: int | None,
 ) -> None:
     """Полный прогон: scrape → match → analyze → report."""
-    sites = list(site) if site else list(SCRAPER_CLASSES.keys())
+    sites = list(site) if site else _default_scrape_sites()
     # Как режим задал вызывающий — до того, как его перепишут маркер ниже и
     # разбор режима. Нужен гварду ритма: явный public_api идёт мимо него.
     requested_mode = mode
@@ -7100,7 +7123,7 @@ def scrape_cmd(limit: int | None, site: tuple[str, ...], category_id: int | None
 
     Возвращает id прогона (для `ctx.invoke`), None если сбор не состоялся.
     """
-    sites = list(site) if site else list(SCRAPER_CLASSES.keys())
+    sites = list(site) if site else _default_scrape_sites()
     if _pharmonline_public_api_enabled():
         raise click.ClickException(
             "PHARMONLINE_PUBLIC_API is recovery-only; use run --site pharmonline --mode public_api"
@@ -7610,7 +7633,7 @@ def rematch_cmd(
             _release_matcher_lock(session)
 
 
-_VALIDATE_CLIENT_SITE = "pharmonline"  # сайт-клиент — валидировать только с --force
+_VALIDATE_CLIENT_SITE = site_profile.CLIENT_SITE  # сайт-клиент — валидировать только с --force
 
 
 @cli.command("validate-links")

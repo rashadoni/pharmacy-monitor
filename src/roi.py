@@ -46,6 +46,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from src._time import utcnow
+from src import site_profile
 from src.cadence import site_max_age_hours
 
 from src import storage  # for load_pricing_config + RoiActionsCache
@@ -60,8 +61,8 @@ from src.run_lock import try_shared_scrape_read_lock
 
 log = structlog.get_logger()
 
-CLIENT_SITE = "pharmonline"
-COMPETITOR_SITES = ("aptekonline", "aloe")
+CLIENT_SITE = site_profile.CLIENT_SITE
+COMPETITOR_SITES = site_profile.COMPETITOR_SITES
 ALL_SITES = (CLIENT_SITE, *COMPETITOR_SITES)
 
 ActionType = Literal[
