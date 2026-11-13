@@ -32,7 +32,13 @@ export function readViewerSite(cookieHeader: string | null = documentCookies()):
   if (cookieHeader === null) return CLIENT_SITE;
   for (const part of cookieHeader.split(";")) {
     const [name, ...rest] = part.trim().split("=");
-    if (name === VIEWER_SITE_COOKIE) return viewerSiteFromCookie(decodeURIComponent(rest.join("=")));
+    if (name !== VIEWER_SITE_COOKIE) continue;
+    try {
+      return viewerSiteFromCookie(decodeURIComponent(rest.join("=")));
+    } catch {
+      // Битое значение («%») — как нет выбора; страница не должна падать.
+      return CLIENT_SITE;
+    }
   }
   return CLIENT_SITE;
 }

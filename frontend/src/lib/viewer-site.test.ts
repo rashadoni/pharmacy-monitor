@@ -32,6 +32,7 @@ describe("«свой магазин» у экземпляра электрони
     expect(m.readViewerSite("other_pm_viewer_site=irshad")).toBe("kontakt");
     expect(m.readViewerSite(null)).toBe("kontakt");
     expect(m.viewerSiteFromCookie(undefined)).toBe("kontakt");
+    expect(m.readViewerSite("pm_viewer_site=%")).toBe("kontakt");
   });
 });
 
