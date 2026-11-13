@@ -267,6 +267,15 @@ def test_model_code_is_found_whatever_surrounds_it():
             "Smartfon Samsung Galaxy A55 SM-A556E/DS 8/256GB Navy",
             em.STRATEGY_CODE,
         ),
+        # Четвёртый проход: косая черта и «+» в обычных названиях.
+        ("Xiaomi Band 8 Bluetooth/NFC Black", "Xiaomi Band 8 Bluetooth Black", None),
+        ("HyperX Cloud Stinger HX-HSCS Black/Red", "HyperX Cloud Stinger HX-HSCS Black", None),
+        (
+            "Apple iPad 10.9 64GB Wi-Fi + Cellular Silver",
+            "Apple iPad 10.9 64GB Wi-Fi Cellular Silver",
+            em.STRATEGY_SERIES,
+        ),
+        ("Apple iPad 10.9 64GB Wi-Fi + Cellular Silver", "Apple iPad 10.9 64GB Wi-Fi Silver", None),
         # Прописная «İ» не ломает бренд.
         ("İndesit IWSC 51051", "Indesit IWSC 51051", None),
     ],

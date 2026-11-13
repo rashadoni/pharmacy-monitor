@@ -230,7 +230,9 @@ _PLUS_RE = re.compile(r"(?<=[0-9a-zа-яё])\+")
 _BUNDLE_RE = re.compile(r"(?:^|\s)\+(?=\s|$)")
 # Хвост заводского кода после косой черты («WW80T4020CE/LP», «55PUS8108/12»):
 # регион или цвет, который пишут не все сайты.
-_CODE_TAIL_RE = re.compile(r"(?<=[0-9a-z]{5})/[0-9a-z]{1,3}(?=\s|$)")
+_CODE_TAIL_RE = re.compile(r"(?<![0-9a-z-])([0-9a-z][0-9a-z-]{4,})/[0-9a-z]{1,3}(?=\s|$)")
+# «Wi-Fi + Cellular», «GPS + Cellular» — название модели, а не комплект.
+_NOT_BUNDLE_RE = re.compile(r"\+\s*(?=cellular|lte|4g|5g|gps)")
 _TOKEN_RE = re.compile(r"[0-9a-zа-яё]+(?:[-.][0-9a-zа-яё]+)*")
 _NETWORK = frozenset({"4g", "5g", "3g", "lte"})
 # Характеристика, а не заводской код: процессор, ёмкость, мощность, класс
@@ -340,8 +342,13 @@ def signature(name: str | None) -> Signature | None:
         text = _SCREEN_RE.sub(" ", text)
     # «S23+», «Pro+» — другая модель, чем «S23» и «Pro».
     text = _PLUS_RE.sub(" plus ", text)
+    text = _NOT_BUNDLE_RE.sub(" ", text)
     text = _BUNDLE_RE.sub(" bundle ", text)
-    text = _CODE_TAIL_RE.sub(" ", text)
+    # Хвост срезается только у заводского кода: «Black/Red» и «Bluetooth/NFC»
+    # — два слова, а не код с хвостом.
+    text = _CODE_TAIL_RE.sub(
+        lambda found: found.group(1) if _is_model_code(found.group(1)) else found.group(0), text
+    )
 
     tokens = [token.strip("-.") for token in _TOKEN_RE.findall(text)]
     tokens = [token for token in tokens if token]
