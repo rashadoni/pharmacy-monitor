@@ -3069,6 +3069,18 @@ if set(SCRAPER_CLASSES) != set(site_profile.SITES):
     )
 
 
+def _refuse_foreign_database(session_factory) -> None:
+    """Команда, которая открывает базу мимо `init_db`, сверяет метку сама.
+
+    `rematch` без PM_PROFILE в каталоге экземпляра электроники прогнал бы
+    аптечные правила по чужим парам — ровно то, от чего метка базы защищает.
+    """
+    try:
+        storage.refuse_database_of_another_profile(session_factory)
+    except storage.DatabaseOfAnotherProfile as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _default_scrape_sites() -> list[str]:
     """Сайты команды без `--site`: все, кроме тех, чей каталог приходит файлом."""
     return [site for site in SCRAPER_CLASSES if site not in site_profile.IMPORTED_SITES]
@@ -3181,6 +3193,16 @@ def _run_matching_stage(
     которые текущие правила запрещают.
     """
     summary: dict[str, int | None] = {"refreshed": None, "relinked": None, "reseated": None}
+    if not site_profile.is_pharmacy():
+        # Аптечные правила (доза, форма, страна) товарам другого профиля не
+        # подходят: у электроники своё сопоставление — по модели.
+        from src import electronics_matcher
+
+        # Аптечных подготовительных шагов у этого сопоставления нет: ноль, а не
+        # None — None читается как «шаг упал» (`rematch` на нём отказывает).
+        summary.update(refreshed=0, relinked=0, reseated=0, revalidated=0, flagged=0)
+        summary["clusters"] = electronics_matcher.match_products(session)
+        return summary
     for key, prepare in (
         ("refreshed", matcher.refresh_derived_fields),
         ("relinked", matcher.relink_stale_members),
@@ -3278,6 +3300,12 @@ def _hold_scrape_lock_until_command_exit(SessionFactory, *, wait: bool) -> bool:
     return True
 
 
+# Сайты, для которых прогон не сверяет число товаров с прошлыми прогонами.
+# Заполняет только `catalog import --allow-shrink` на время своего прогона:
+# человек сказал, что каталог и правда сократился.
+_BASELINE_WAIVED_SITES: set[str] = set()
+
+
 def baselines_for_sites(session: Session, sites: list[str]) -> dict[str, int | None]:
     """Pre-fetch products_per_site from latest ok run for each requested site.
 
@@ -3295,7 +3323,7 @@ def baselines_for_sites(session: Session, sites: list[str]) -> dict[str, int | N
         return out
     for site in sites:
         val = last_ok.products_per_site.get(site)
-        if isinstance(val, int) and val > 0:
+        if isinstance(val, int) and val > 0 and site not in _BASELINE_WAIVED_SITES:
             out[site] = val
     return out
 
@@ -3315,6 +3343,9 @@ def run_quality_baselines_for_sites(
     baseline forever.
     """
     candidates: dict[str, list[int]] = {site: [] for site in sites}
+    # Сайт, у которого встретился прогон «каталог сократился по слову человека»:
+    # всё, что старше, для него меркой больше не служит.
+    reset: set[str] = set()
     recent = session.scalars(
         select(storage.Run)
         .where(
@@ -3330,6 +3361,8 @@ def run_quality_baselines_for_sites(
         quality = run.run_quality or {}
         per_site = run.products_per_site or {}
         for site in sites:
+            if site in reset:
+                continue
             if quality:
                 if not quality.get("financially_eligible"):
                     continue
@@ -3340,12 +3373,14 @@ def run_quality_baselines_for_sites(
             value = per_site.get(site)
             if isinstance(value, int) and value > 0:
                 candidates[site].append(value)
+                if site in (quality.get("baseline_reset_sites") or ()):
+                    reset.add(site)
         if all(len(values) >= 5 for values in candidates.values()):
             break
 
     out: dict[str, int | None] = {}
     for site, values in candidates.items():
-        if not values:
+        if not values or site in _BASELINE_WAIVED_SITES:
             out[site] = None
             continue
         sample = sorted(values[:5])
@@ -7520,7 +7555,13 @@ def rematch_cmd(
             f"Для копии базы или стенда добавь {REMATCH_RESET_CONFIRM_FLAG}."
         )
 
+    if not site_profile.is_pharmacy() and (reset or revalidate or relink_dead or threshold):
+        raise click.UsageError(
+            "--reset, --revalidate, --relink-dead и --threshold — аптечные правила; у профиля "
+            f"{site_profile.PROFILE.name!r} своё сопоставление, запускай rematch без флагов."
+        )
     Session = storage.make_session()
+    _refuse_foreign_database(Session)
     # Запись прогона и сопоставление правят одни и те же строки товаров. Сбор
     # держит этот замок всю команду, а замок сопоставления — только на сам этап,
     # так что без проверки rematch шёл бы одновременно с записью прогона.
@@ -7676,6 +7717,7 @@ def validate_links_cmd(
         )
 
     Session = storage.make_session()
+    _refuse_foreign_database(Session)
     with Session() as session:
         q = select(storage.Product).where(storage.Product.site == site)
         if matched_only:
@@ -7736,6 +7778,7 @@ def validate_links_cmd(
 def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
     """Перегенерировать отчёт по существующему прогону."""
     Session = storage.make_session()
+    _refuse_foreign_database(Session)
     with Session() as session:
         run = None
         if run_id is None:
@@ -7822,6 +7865,244 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
 # ============================================================================
 # CATEGORIES — CRUD категорий для category-режима
 # ============================================================================
+
+
+@cli.group("catalog")
+def catalog_group() -> None:
+    """Каталог сайта из файла (сайты, которые сборщиком не читаются)."""
+
+
+@catalog_group.command("import")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--site",
+    "site",
+    required=True,
+    type=click.Choice(list(site_profile.IMPORTED_SITES)),
+    help="Сайт, чей каталог лежит в файле.",
+)
+@click.option("--dry-run", is_flag=True, help="Прочитать файл и показать итог, ничего не записывая.")
+@click.option("--no-alerts", is_flag=True, help="Загрузить без рассылки алертов по этому прогону.")
+@click.option(
+    "--allow-shrink",
+    is_flag=True,
+    help="Принять файл, в котором заметно меньше товаров, чем в прошлой загрузке.",
+)
+@click.pass_context
+def catalog_import(
+    ctx: click.Context, path: str, site: str, dry_run: bool, no_alerts: bool, allow_shrink: bool
+) -> None:
+    """Загрузить каталог сайта с ценами из файла CSV или XLSX.
+
+    Файл идёт тем же путём, что ночной сбор: полный прогон сайта с проверкой
+    полноты, сопоставлением, алертами и рекомендациями. Файл с ошибками не
+    принимается вовсе — причины печатаются построчно.
+    """
+    from src import catalog_file, site_routes
+
+    try:
+        catalog = catalog_file.read_catalog_file(path, site)
+    except catalog_file.CatalogFileError as exc:
+        for problem in exc.problems:
+            click.echo(f"  {problem}")
+        raise click.ClickException(str(exc)) from exc
+
+    priced = [product.price for product in catalog.products if product.price is not None]
+    click.echo(
+        f"{site}: строк {catalog.rows_read}, товаров {len(catalog.products)}, "
+        f"повторов строк {catalog.duplicate_rows}, без цены {catalog.without_price}"
+    )
+    click.echo(
+        "колонки: " + ", ".join(f"{column} ← «{title}»" for column, title in catalog.columns.items())
+    )
+    if priced:
+        click.echo(f"цены: от {min(priced):.2f} до {max(priced):.2f}")
+    for product in catalog.products[:3]:
+        click.echo(f"  {product.external_id}  {product.price}  {product.name[:70]}")
+    if catalog.ignored_columns:
+        click.echo("не прочитаны колонки: " + ", ".join(f"«{c}»" for c in catalog.ignored_columns))
+    if dry_run:
+        click.echo("dry-run: ничего не записано; сравнение с прошлой загрузкой не делалось")
+        return
+
+    storage.init_db()
+    Session = storage.make_session()
+    with Session() as session:
+        # У файла нет внешнего знаменателя: сколько товаров на сайте на самом
+        # деле, он не говорит. Единственная мерка — прошлая принятая загрузка
+        # этого же сайта. Общая проверка прогона для этого не годится: она
+        # сравнивает с последним удачным прогоном любого сайта экземпляра.
+        previous_count = next(
+            (
+                run.products_scraped
+                for run in session.scalars(
+                    select(storage.Run)
+                    .where(
+                        storage.Run.sites_completed == site,
+                        storage.Run.catalog_scope == "full",
+                        storage.Run.status == "ok",
+                    )
+                    .order_by(storage.Run.id.desc())
+                    .limit(20)
+                ).all()
+                # Мерка — только загрузка, которой система поверила целиком.
+                if storage.run_is_financially_eligible(run)
+            ),
+            None,
+        )
+        floor = catalog_file.MIN_FRACTION_OF_PREVIOUS
+        if previous_count and len(catalog.products) < previous_count * floor and not allow_shrink:
+            raise click.ClickException(
+                f"catalog import: в файле {len(catalog.products)} товаров, в прошлой принятой "
+                f"загрузке было {previous_count}. Меньше {floor:.0%} прежнего — скорее выгрузка "
+                "неполная; ничего не записано. Если каталог и правда сократился, повторить с "
+                "--allow-shrink"
+            )
+        # У сайта из файла один «раздел» — сам файл.
+        plan = site_routes.plan_route_sync(session, site, [catalog_file.FILE_ROUTE])
+        site_routes.apply_route_sync(session, plan, allow_shrink=True)
+        session.commit()
+
+    previous = SCRAPER_CLASSES.get(site)
+    SCRAPER_CLASSES[site] = catalog_file.file_scraper(site, catalog)
+    if allow_shrink:
+        # Явное слово человека снимает и общие проверки прогона на число
+        # товаров: иначе файл прошёл бы ворота здесь и был бы отвергнут там,
+        # уже записав цены.
+        _BASELINE_WAIVED_SITES.add(site)
+    try:
+        ctx.invoke(
+            run_cmd,
+            dry_run=False,
+            limit=None,
+            site=(site,),
+            mode="auto",
+            category_id=None,
+            hourly=False,
+            no_alerts=no_alerts,
+            force=True,
+            request_id=None,
+        )
+    finally:
+        _BASELINE_WAIVED_SITES.discard(site)
+        if previous is not None:
+            SCRAPER_CLASSES[site] = previous
+    if allow_shrink:
+        # Каталог сократился по слову человека: мерка качества следующих
+        # загрузок начинается с этой, а не с медианы прежних, больших. Иначе
+        # следующий обычный файл был бы принят, но рекомендации молча закрыты.
+        with Session() as session:
+            run = session.scalars(
+                select(storage.Run)
+                .where(storage.Run.sites_completed == site, storage.Run.status == "ok")
+                .order_by(storage.Run.id.desc())
+                .limit(1)
+            ).first()
+            if run is not None and storage.run_is_financially_eligible(run):
+                run.run_quality = {**(run.run_quality or {}), "baseline_reset_sites": [site]}
+                session.commit()
+
+
+@cli.group("routes")
+def routes_group() -> None:
+    """Разделы сайта для полного сбора (сайты без колонки в categories)."""
+
+
+def _route_sync_sites() -> list[str]:
+    """Сайты, чьи разделы находит сам сборщик и хранит `site_routes`."""
+    return [
+        site
+        for site, scraper in SCRAPER_CLASSES.items()
+        if site not in watchlist.CATEGORY_SLUG_FIELDS and hasattr(scraper, "discover_categories")
+    ]
+
+
+@routes_group.command("sync")
+@click.option("--site", "site", required=True, type=click.Choice(_route_sync_sites()))
+@click.option("--dry-run", is_flag=True, help="Показать, что изменится, и ничего не записать.")
+@click.option(
+    "--allow-shrink",
+    is_flag=True,
+    help="Записать, даже если с сайта разом исчезла заметная часть разделов.",
+)
+def routes_sync(site: str, dry_run: bool, allow_shrink: bool) -> None:
+    """Сверить список разделов сайта с самим сайтом и записать изменения.
+
+    Обход разделов идёт по живому сайту. Он либо полон, либо отказывает:
+    раздел, который не удалось прочитать, — ошибка, список при этом не меняется.
+    """
+    from src import site_routes
+
+    async def discover() -> list[str]:
+        async with SCRAPER_CLASSES[site]() as scraper:
+            return await scraper.discover_categories()
+
+    try:
+        discovered = asyncio.run(discover())
+    except Exception as exc:
+        from src.logging_setup import mask_addresses
+
+        raise click.ClickException(
+            f"routes sync: обход разделов {site} не удался, список не менялся: "
+            f"{type(exc).__name__}: {mask_addresses(str(exc))}"
+        ) from exc
+
+    storage.init_db()
+    Session = storage.make_session()
+    with Session() as session:
+        plan = site_routes.plan_route_sync(session, site, discovered)
+        click.echo(
+            f"{site}: на сайте {len(plan.discovered)} разделов; новых {len(plan.added)}, "
+            f"вернулись {len(plan.returned)}, пропали {len(plan.missing)}, "
+            f"без изменений {len(plan.unchanged)}"
+        )
+        for label, slugs in (("+", plan.added), ("↺", plan.returned), ("−", plan.missing)):
+            for slug in slugs:
+                click.echo(f"  {label} {slug}")
+        refusal = plan.refusal()
+        if refusal is not None:
+            click.echo(f"⚠ {refusal}")
+        if dry_run:
+            click.echo("dry-run: ничего не записано")
+            return
+        try:
+            site_routes.apply_route_sync(session, plan, allow_shrink=allow_shrink)
+        except site_routes.RouteSyncRefused as exc:
+            session.rollback()
+            raise click.ClickException(
+                f"routes sync: отказ, список не менялся — {exc}. Если разделы и правда "
+                "исчезли с сайта, повторить с --allow-shrink"
+            ) from exc
+        session.commit()
+        log.info(
+            "site_routes_synced",
+            site=site,
+            discovered=len(plan.discovered),
+            added=len(plan.added),
+            returned=len(plan.returned),
+            missing=len(plan.missing),
+        )
+        click.echo("записано" if plan.changes else "изменений нет")
+
+
+@routes_group.command("list")
+@click.option("--site", "site", default=None, help="Только этот сайт.")
+@click.option("--all", "show_all", is_flag=True, help="Показать и выключенные.")
+def routes_list(site: str | None, show_all: bool) -> None:
+    """Разделы, которые обходит полный сбор."""
+    storage.init_db()
+    Session = storage.make_session()
+    with Session() as session:
+        stmt = select(storage.SiteRoute).order_by(storage.SiteRoute.site, storage.SiteRoute.id)
+        if site:
+            stmt = stmt.where(storage.SiteRoute.site == site)
+        if not show_all:
+            stmt = stmt.where(storage.SiteRoute.is_active.is_(True))
+        rows = session.scalars(stmt).all()
+        for row in rows:
+            mark = " " if row.is_active else "×"
+            click.echo(f"{mark} {row.site}  {row.slug}  (виден {row.last_seen_at:%Y-%m-%d})")
+        click.echo(f"всего: {len(rows)}")
 
 
 @cli.group("category")
