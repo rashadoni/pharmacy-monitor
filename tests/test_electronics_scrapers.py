@@ -1862,23 +1862,70 @@ def _irshad_card_without_colour_choice() -> tuple[str, str]:
 
 
 def test_irshad_price_block_of_a_colour_the_site_does_not_offer_is_skipped():
-    # Список цветов у карточки есть, но пуст, а блоков с ценой два: второй —
+    # Список цветов у карточки есть, но пуст, а блоков с ценой два: скрытый —
     # цвет, которого сайт не показывает. На живом сайте так у MacBook в разделе
-    # ноутбуков (карточка 108447 несёт блок 108435, которого нет нигде), и
-    # раздел из-за этого был неполон при каждом сборе.
+    # ноутбуков, и раздел из-за этого был неполон при каждом сборе.
     product_id, card = _irshad_card_without_colour_choice()
-    products, failures = build_products(product_id, card, "c")
+    unlisted: list[str] = []
+    products, failures = build_products(product_id, card, "c", unlisted)
     assert [p.external_id for p in products] == ["85759"]
-    assert failures == 0
+    assert (failures, unlisted) == (0, ["108719"])
 
 
-def test_irshad_card_whose_own_product_has_no_name_is_still_a_failure():
-    # Пустой список цветов не извиняет карточку без названия самого товара.
+def test_irshad_card_title_belongs_to_the_block_the_site_shows():
+    # Живой случай 2026-11-13: у карточки 108447 виден блок 108435, а блок с
+    # номером самой карточки скрыт. Название и адрес из шапки — товара видимого
+    # блока, и цена берётся из него же, а не из скрытого.
+    product_id, card = _irshad_card_without_colour_choice()
+    card = card.replace(
+        'class="product__flex-right " data-selected-id="85759"',
+        'class="product__flex-right  d-none " data-selected-id="85759"',
+    ).replace(
+        'class="product__flex-right  d-none " data-selected-id="108719"',
+        'class="product__flex-right " data-selected-id="108719"',
+    )
+    shown_block = card[card.index('data-selected-id="108719"') :]
+    shown_price = price_or_none(_text_of(shown_block, "new-price"))
+    unlisted: list[str] = []
+    (product,), failures = build_products(product_id, card, "c", unlisted)
+    assert product.external_id == "108719"
+    assert (failures, unlisted) == (0, ["85759"])
+    assert (product.discount_price or product.price) == shown_price
+
+
+def test_irshad_shown_block_without_a_title_is_still_a_failure():
+    # Пустой список цветов не извиняет карточку без названия видимого товара.
     product_id, card = _irshad_card_without_colour_choice()
     card = card.replace('class="product__name product-link"', 'class="product__name"')
-    products, failures = build_products(product_id, card, "c")
-    assert "85759" not in [p.external_id for p in products]
-    assert failures >= 1
+    unlisted: list[str] = []
+    products, failures = build_products(product_id, card, "c", unlisted)
+    assert products == []
+    assert (failures, unlisted) == (1, ["108719"])
+
+
+async def test_irshad_many_untitled_hidden_blocks_make_the_pass_incomplete(monkeypatch):
+    # Редкий «призрак» — сбой сайта; много — скорее сменилась вёрстка
+    # переключателей цвета, и цвета пропадают молча.
+    from src.scrapers import irshad as irshad_module
+
+    monkeypatch.setattr(irshad_module, "_MIN_UNLISTED_OFFERS_ALLOWED", 0)
+    scraper = fast(IrshadScraper)
+    _, ghost_card = _irshad_card_without_colour_choice()
+    page = f'<div class="pjax-container"><div id="productGridItems">{ghost_card}</div></div>'
+    serve(scraper, irshad_site({"1": page}))
+    products = await collect(scraper, "c")
+    status = scraper._route_statuses["c"]
+    assert [p.external_id for p in products] == ["85759"]
+    assert not status.complete
+    assert status.abort_reason == "too_many_unlisted_offers"
+
+
+def _text_of(block_html: str, css_class: str) -> str:
+    import re
+
+    match = re.search(rf'class="{css_class}">(.*?)</', block_html, re.DOTALL)
+    assert match, css_class
+    return re.sub(r"<[^>]+>", "", match.group(1)).strip()
 
 
 def test_irshad_unreadable_current_price_next_to_a_struck_out_one_is_a_failure():
