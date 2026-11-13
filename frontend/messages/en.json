@@ -162,7 +162,8 @@
     "others_title": "Found on the sites, not in the comparison — {count}",
     "others_hint": "These products have no confirmed pair on another site yet (or the pair is hidden by the selected filter), so they are not in the comparison table. The price is as shown on the site.",
     "others_truncated": "Showing the first {shown} of {total} — refine your search.",
-    "out_of_stock": "out of stock"
+    "out_of_stock": "out of stock",
+    "spread_no_own_price": "No {site} price — the {pct}% gap is between competitors"
   },
   "overview": {
     "title": "Overview",
