@@ -1,0 +1,29 @@
+[Unit]
+Description=Electro Monitor — Next.js frontend (экземпляр электроники)
+After=network.target
+
+[Service]
+Type=simple
+User=pm
+Group=pm
+WorkingDirectory=/opt/electro-monitor/frontend
+Environment=NODE_ENV=production
+Environment=PORT=3010
+Environment=HOSTNAME=127.0.0.1
+ExecStartPre=+/bin/chown -R pm:pm /opt/electro-monitor/frontend/.next
+ExecStartPre=/bin/sh -c "cd /opt/electro-monitor/frontend && rm -rf .next/standalone/.next/static && cp -r .next/static .next/standalone/.next/static && (test -d public && rm -rf .next/standalone/public && cp -r public .next/standalone/public || true)"
+ExecStart=/usr/bin/node /opt/electro-monitor/frontend/.next/standalone/server.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/electro-monitor/frontend/.next /opt/electro-monitor/logs
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

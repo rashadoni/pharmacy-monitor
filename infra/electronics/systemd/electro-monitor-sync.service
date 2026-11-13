@@ -1,0 +1,10 @@
+[Unit]
+Description=Electro Monitor — подтянуть код из выложенного аптечного экземпляра
+After=postgresql.service
+
+[Service]
+Type=oneshot
+# root: копирует код, применяет миграции от имени pm, перезапускает юниты.
+ExecStart=/opt/electro-monitor/infra/electronics/sync.sh
+StandardOutput=journal
+StandardError=journal
