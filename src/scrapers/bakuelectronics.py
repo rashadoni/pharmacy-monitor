@@ -14,15 +14,29 @@
 конечных подразделов совпали товар в товар (371 и 371; замер 2026-11-12).
 Поэтому полный каталог — это разделы верхнего уровня. Исключение — раздел, у
 которого своя страница сломана на самом сайте (telefonlar-qadcetler отвечал
-502): ``discover_categories`` проверяет каждый раздел и вместо нерабочего берёт
-его подразделы.
+502 в браузере 2026-11-12 и 301 через прокси 2026-11-13):
+``discover_categories`` проверяет каждый раздел и вместо нерабочего берёт его
+подразделы.
 
 Дерево разделов в вёрстке главной не лежит: браузер получает меню отдельным
 запросом к API сайта (``/megamenu`` на служебном имени, заголовок ``lang``), и
 ссылки ``catalog/<раздел>/<подраздел>`` стоят в нём на всех уровнях (замер
-через прокси 2026-11-13: 770 ссылок, 447 разных разделов, 22 верхних). Часть
-ссылок меню ведёт на тот же раздел с фильтром (``?brand=apple``) — фильтр
-отбрасывается.
+через прокси 2026-11-13: 776 ссылок, из них 770 на каталог, 447 разных путей).
+Особенности меню, на которые рассчитан разбор:
+
+- ссылка на раздел с фильтром (``?brand=apple``) — фильтр отбрасывается;
+- у промежуточного уровня своей ссылки может не быть, есть только ссылки
+  глубже (так у 18 узлов) — дерево строится из начал всех путей;
+- у ссылки бывает потерян родитель: ``catalog/itler-ve-pishikler-ucun`` при
+  ``catalog/ev-heyvanlari-ucun/itler-ve-pishikler-ucun/...`` — такой путь не
+  верхний раздел, иначе те же товары читались бы дважды;
+- часть путей уже закодирована (``turizm-v%C9%99-kempinq``) — путь хранится
+  раскодированным и кодируется один раз, при запросе;
+- баннеры дают полные адреса сайта; ссылки на товары и чужие адреса —
+  не разделы.
+
+Меню — единственный источник дерева: раздел, которого в меню нет, обход не
+увидит и пропущенным не назовёт. Сверить меню не с чем.
 
 Товар узнаётся по ``product_code`` — коду товара на сайте (им же кончается
 адрес страницы товара). Обычная цена — ``price``, цена со скидкой —
@@ -37,7 +51,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import structlog
 
@@ -56,9 +70,30 @@ log = structlog.get_logger()
 
 _MAX_PAGES = 600
 _NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
-_MENU_CATALOG_LINK_RE = re.compile(r"(?:^|/)catalog/([^?#]+)")
 # Страницы под /catalog/, которые не разделы каталога.
 _NOT_CATEGORIES = {"muqayise-et"}
+_OWN_HOSTS = {"bakuelectronics.az", "www.bakuelectronics.az"}
+
+
+def section_from_menu_link(link: str) -> str | None:
+    """Путь раздела из ссылки меню; ``None``, если ссылка не на раздел каталога.
+
+    Разделом считается только путь ``catalog/...`` самого сайта: слово
+    ``catalog`` внутри другого пути, в строке запроса или на чужом адресе —
+    не раздел.
+    """
+    parts = urlsplit(link.strip())
+    if parts.netloc and parts.netloc.lower() not in _OWN_HOSTS:
+        return None
+    segments = [unquote(segment).strip() for segment in parts.path.split("/")]
+    segments = [segment for segment in segments if segment]
+    if segments[:1] == ["az"]:
+        segments = segments[1:]
+    if len(segments) < 2 or segments[0] != "catalog":
+        return None
+    if segments[1] in _NOT_CATEGORIES:
+        return None
+    return "/".join(segments[1:])
 
 
 def build_product(item: dict, category_slug: str) -> ScrapedProduct | None:
@@ -136,7 +171,12 @@ class BakuElectronicsScraper(HttpCatalogScraper):
         return html
 
     async def _menu_sections(self) -> list[str]:
-        """Разделы каталога из меню сайта, в порядке меню, без повторов."""
+        """Дерево разделов из меню сайта: каждый путь и все его начала.
+
+        Порядок — как в меню, без повторов. Уровень, на который в меню нет
+        собственной ссылки, но есть ссылки глубже, в дерево входит: иначе
+        замена нерабочего раздела подразделами теряла бы целые ветки.
+        """
         response = await self.fetch(
             self.menu_url, headers={"Accept": "application/json", "lang": "az"}
         )
@@ -144,26 +184,64 @@ class BakuElectronicsScraper(HttpCatalogScraper):
             menu = response.json()
         except ValueError as exc:
             raise PageFetchError("catalog menu is not readable") from exc
+        if not isinstance(menu, list):
+            raise PageFetchError("catalog menu is not a list of groups")
 
-        sections: list[str] = []
-        seen: set[str] = set()
+        paths: list[str] = []
+        not_sections: list[str] = []
+        empty_groups: list[str] = []
+        section_links = 0
 
         def walk(node: object) -> None:
+            nonlocal section_links
             if isinstance(node, dict):
                 link = node.get("link")
-                if isinstance(link, str):
-                    match = _MENU_CATALOG_LINK_RE.search(link)
-                    slug = match.group(1).strip("/") if match else ""
-                    if slug and slug.split("/")[0] not in _NOT_CATEGORIES and slug not in seen:
-                        seen.add(slug)
-                        sections.append(slug)
+                if isinstance(link, str) and link.strip():
+                    section = section_from_menu_link(link)
+                    if section is None:
+                        not_sections.append(link)
+                    else:
+                        section_links += 1
+                        if section not in paths:
+                            paths.append(section)
                 for value in node.values():
                     walk(value)
             elif isinstance(node, list):
                 for value in node:
                     walk(value)
 
-        walk(menu)
+        for group in menu:
+            before = section_links
+            walk(group)
+            if section_links == before and isinstance(group, dict):
+                empty_groups.append(str(group.get("slug") or group.get("title") or "?"))
+
+        # Ссылка с потерянным родителем: «x» при «a/x/...» и без своих «x/...».
+        nested = {segment for path in paths for segment in path.split("/")[1:]}
+        own_branches = {path.split("/")[0] for path in paths if "/" in path}
+        misplaced = [path for path in paths if "/" not in path and path in nested - own_branches]
+
+        sections: list[str] = []
+        for path in paths:
+            if path in misplaced:
+                continue
+            segments = path.split("/")
+            for depth in range(1, len(segments) + 1):
+                node = "/".join(segments[:depth])
+                if node not in sections:
+                    sections.append(node)
+
+        # Меню сверить не с чем: что пропущено, видно только здесь.
+        log.info(
+            "bakuelectronics_menu_read",
+            groups=len(menu),
+            sections=len(sections),
+            top_level=len({section.split("/")[0] for section in sections}),
+            groups_without_sections=empty_groups,
+            links_not_to_sections=len(not_sections),
+            links_not_to_sections_sample=not_sections[:10],
+            links_with_lost_parent=misplaced,
+        )
         return sections
 
     async def _listing_page(self, category_slug: str, page: int) -> dict:
@@ -255,7 +333,11 @@ class BakuElectronicsScraper(HttpCatalogScraper):
 
         Берутся разделы верхнего уровня из меню сайта. Раздел, чья
         собственная страница списка не отвечает, заменяется своими
-        подразделами — и так вниз по дереву ссылок меню.
+        подразделами — и так вниз по дереву меню.
+
+        Полнота — относительно меню: раздел, которого в меню нет, сюда не
+        попадёт, и отказа не будет. Что в меню не разобрано, пишет в журнал
+        ``bakuelectronics_menu_read``.
         """
         links = await self._menu_sections()
 

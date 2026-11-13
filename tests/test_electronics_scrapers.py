@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
 import pytest
@@ -18,6 +18,7 @@ import pytest
 from src.scrapers import http_catalog
 from src.scrapers.bakuelectronics import BakuElectronicsScraper
 from src.scrapers.bakuelectronics import build_product as build_be_product
+from src.scrapers.bakuelectronics import section_from_menu_link
 from src.scrapers.base import CaptchaDetected, SiteScrapeFatalError
 from src.scrapers.electronics import CLIENT_SITE, ELECTRONICS_SCRAPERS
 from src.scrapers.http_catalog import (
@@ -1216,7 +1217,12 @@ async def test_bakuelectronics_discovery_fails_when_a_section_cannot_be_replaced
 async def test_bakuelectronics_discovery_fails_without_a_readable_menu():
     # Главная читается, а меню — нет или в нём нет разделов: обход отказывает,
     # пустой список разделов выглядел бы как пустой каталог.
-    for menu in (httpx.Response(200, text="<html>oops</html>"), httpx.Response(200, json=[])):
+    for menu in (
+        httpx.Response(200, text="<html>oops</html>"),
+        httpx.Response(200, json=[]),
+        httpx.Response(200, json={"error": "menu is rebuilding"}),
+        httpx.Response(200, json=None),
+    ):
         scraper = fast(BakuElectronicsScraper)
 
         def site(request, menu=menu):
@@ -1228,6 +1234,186 @@ async def test_bakuelectronics_discovery_fails_without_a_readable_menu():
         serve(scraper, site)
         with pytest.raises(PageFetchError):
             await scraper.discover_categories()
+
+
+@pytest.mark.parametrize(
+    ("link", "section"),
+    [
+        ("catalog/tv/televizorlar", "tv/televizorlar"),
+        ("catalog/tv/televizorlar?brand=apple", "tv/televizorlar"),
+        ("catalog/tv/televizorlar?706=290779%2C640216", "tv/televizorlar"),
+        ("https://www.bakuelectronics.az/catalog/tv/televizorlar", "tv/televizorlar"),
+        ("/az/catalog/tv/", "tv"),
+        ("catalog//tv", "tv"),
+        (" catalog/tv", "tv"),
+        ("catalog/Kitablar", "Kitablar"),
+        # Сайт сам кодирует часть путей: хранится раскодированный путь.
+        ("catalog/idman/turizm-v%C9%99-kempinq", "idman/turizm-və-kempinq"),
+        ("catalog/mebel/is%20masası", "mebel/is masası"),
+        # Не разделы: чужой адрес, слово catalog не в начале пути, товар,
+        # служебная страница, голое слово, другой регистр.
+        ("https://promo.example/catalog/x", None),
+        ("campaign/catalog/sale", None),
+        ("mehsul/x?back=/catalog/abc", None),
+        ("mehsul/hediyye-kart-30-azn-162286", None),
+        ("mebel/yataq-otagi-mebel", None),
+        ("catalog/muqayise-et", None),
+        ("catalog", None),
+        ("Catalog/tv", None),
+    ],
+)
+def test_bakuelectronics_menu_link_to_section(link, section):
+    assert section_from_menu_link(link) == section
+
+
+# Меню в форме живого ответа /megamenu, с его же странностями: несколько
+# групп, вложенные пункты, фильтры, баннер с полным адресом, уровень без своей
+# ссылки, ссылка с потерянным родителем, закодированный путь, группа без
+# разделов, заглавная буква.
+BE_MENU = [
+    {
+        "id": 1,
+        "title": "TV",
+        "slug": "tv-qrupu",
+        "items": [
+            {
+                "id": 10,
+                "title": "Televizorlar",
+                "link": "catalog/tv/televizorlar",
+                "childrens": [
+                    {"id": 11, "name": "LG", "link": "catalog/tv/televizorlar?brand=lg"},
+                    {"id": 12, "name": "OLED", "link": "catalog/tv/televizorlar/oled"},
+                ],
+                "products": [],
+            }
+        ],
+        "images": [
+            {"link": "https://www.bakuelectronics.az/catalog/Kitablar/roman", "image": "x"},
+            {"link": "https://promo.example/catalog/aksiya", "image": "y"},
+        ],
+    },
+    {
+        "id": 2,
+        "title": "Heyvanlar",
+        "slug": "heyvanlar-qrupu",
+        "items": [
+            {
+                "id": 20,
+                "title": "Ev heyvanları",
+                "link": "catalog/pets",
+                "childrens": [
+                    {"id": 21, "name": "Qida", "link": "catalog/pets/dogs-cats/food"},
+                    {"id": 22, "name": "Oyuncaq", "link": "catalog/pets/dogs-cats/toys"},
+                    {"id": 23, "name": "Quşlar", "link": "catalog/pets/birds"},
+                ],
+                "products": [],
+            },
+            {"id": 24, "title": "İtlər", "link": "catalog/dogs-cats", "childrens": []},
+            {
+                "id": 25,
+                "title": "Turizm",
+                "link": "catalog/sport/turizm-v%C9%99-kempinq/cadirlar",
+                "childrens": [],
+            },
+        ],
+        "images": [],
+    },
+    {
+        "id": 3,
+        "title": "Hədiyyə kartları",
+        "slug": "kartlar",
+        "items": [{"id": 30, "title": "Kart", "link": "mehsul/kart-30-azn-162286"}],
+        "images": [],
+    },
+]
+
+
+def be_menu_site(broken=(), seen=None):
+    """Сайт с меню ``BE_MENU``; разделы из ``broken`` списка не отдают."""
+
+    def site(request):
+        url = urlsplit(str(request.url))
+        if seen is not None:
+            seen.append(request)
+        if url.path == "/megamenu":
+            assert url.netloc == "5vyra9x.bakuelectronics.az"
+            return httpx.Response(200, json=BE_MENU)
+        if url.path == "/":
+            return httpx.Response(200, text=be_home())
+        section = unquote(url.path.split("/az/catalog/")[1].removesuffix(".json"))
+        if section in broken:
+            return httpx.Response(502)
+        return httpx.Response(200, json=be_page([be_item()], 1))
+
+    return site
+
+
+async def test_bakuelectronics_discovery_refuses_a_menu_of_another_shape():
+    # Те же ссылки, но ответ не списком групп: форма меню сменилась, и что в
+    # ней теперь значит «раздел», неизвестно. Отказ, а не догадка.
+    scraper = fast(BakuElectronicsScraper)
+
+    def site(request):
+        if urlsplit(str(request.url)).path == "/megamenu":
+            return httpx.Response(200, json={"data": BE_MENU})
+        return httpx.Response(200, text=be_home())
+
+    serve(scraper, site)
+    with pytest.raises(PageFetchError) as error:
+        await scraper.discover_categories()
+    assert "not a list" in error.value.reason
+
+
+async def test_bakuelectronics_discovery_reads_the_whole_menu():
+    # Все группы, пункты и вложенные пункты; баннер с адресом сайта — раздел,
+    # чужой адрес — нет; «dogs-cats» с потерянным родителем не верхний раздел.
+    scraper = fast(BakuElectronicsScraper)
+    serve(scraper, be_menu_site())
+    assert await scraper.discover_categories() == ["tv", "Kitablar", "pets", "sport"]
+
+
+async def test_bakuelectronics_discovery_descends_through_a_level_without_its_own_link():
+    # У «pets/dogs-cats» своей ссылки в меню нет, только ссылки глубже. Замена
+    # сломанного «pets» обязана взять и эту ветку, а не одних птиц.
+    scraper = fast(BakuElectronicsScraper)
+    serve(scraper, be_menu_site(broken={"pets"}))
+    assert await scraper.discover_categories() == [
+        "tv",
+        "Kitablar",
+        "sport",
+        "pets/dogs-cats",
+        "pets/birds",
+    ]
+
+    scraper = fast(BakuElectronicsScraper)
+    serve(scraper, be_menu_site(broken={"pets", "pets/dogs-cats"}))
+    assert await scraper.discover_categories() == [
+        "tv",
+        "Kitablar",
+        "sport",
+        "pets/birds",
+        "pets/dogs-cats/food",
+        "pets/dogs-cats/toys",
+    ]
+
+
+async def test_bakuelectronics_discovery_requests_an_encoded_section_once_encoded():
+    scraper = fast(BakuElectronicsScraper)
+    seen = []
+    serve(scraper, be_menu_site(broken={"sport"}, seen=seen))
+    routes = await scraper.discover_categories()
+    assert routes == ["tv", "Kitablar", "pets", "sport/turizm-və-kempinq"]
+    paths = [request.url.raw_path.decode() for request in seen]
+    assert any(path.endswith("/az/catalog/sport/turizm-v%C9%99-kempinq.json") for path in paths)
+    assert not any("%25" in path for path in paths)
+
+
+async def test_bakuelectronics_discovery_fails_when_a_broken_branch_has_no_readable_leaf():
+    scraper = fast(BakuElectronicsScraper)
+    serve(scraper, be_menu_site(broken={"pets", "pets/birds"}))
+    with pytest.raises(PageFetchError) as error:
+        await scraper.discover_categories()
+    assert "pets/birds" in error.value.reason
 
 
 async def test_bakuelectronics_block_page_is_a_blocked_category():
