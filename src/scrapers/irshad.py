@@ -9,9 +9,14 @@
 пропавшая из вёрстки ссылка иначе превращала бы каждый раздел в «полный» раздел
 из одной страницы.
 
-Сдвиг списка посреди обхода виден по карточке, пришедшей второй раз (товар
-переехал выше или добавился новый): такой проход неполон и повторяется. Не
-виден один случай: товар, снятый с сайта посреди обхода, сдвигает список вверх
+Список запрашивается в порядке номеров товаров по возрастанию (``sort=id``).
+По умолчанию сайт отдаёт новинки первыми (``-id``), и каждый товар, добавленный
+посреди обхода, сдвигал все следующие страницы: первый полный сбор 2026-11-13
+оборвался так в четырёх больших разделах из четырнадцати, и повтор прохода не
+помог. При возрастании новый товар встаёт в конец и страниц не сдвигает.
+
+Сдвиг списка посреди обхода виден по карточке, пришедшей второй раз: такой
+проход неполон и повторяется. Не виден один случай: товар, снятый с сайта посреди обхода, сдвигает список вверх
 без повтора, и один из следующих товаров может не попасть ни на одну страницу.
 Без числа товаров от сайта этого не обнаружить.
 
@@ -50,6 +55,9 @@ from src.scrapers.http_catalog import (
 log = structlog.get_logger()
 
 _MAX_PAGES = 1500
+# Порядок списка, в котором добавленный посреди обхода товар не сдвигает
+# страницы: по номеру товара, старые первыми.
+_STABLE_SORT = "id"
 _CARD_OPEN_RE = re.compile(r'<div class="product (?:first )?product-(\d+)_[0-9a-f-]+[^"]*">')
 _NAME_LINK_RE = re.compile(
     r'<a\s+href="(https://irshad\.az/az/mehsullar/[^"]+)"[^>]*'
@@ -207,7 +215,7 @@ class IrshadScraper(HttpCatalogScraper):
     async def _list_page(self, category_slug: str, page: int) -> str:
         response = await self.fetch(
             f"{self.base_url}/az/list-products/{quote(category_slug.strip('/'), safe='/')}",
-            params={"page": str(page)},
+            params={"page": str(page), "sort": _STABLE_SORT},
             headers={"X-Requested-With": "XMLHttpRequest", "Accept": "text/html, */*"},
         )
         return response.text
@@ -253,6 +261,16 @@ class IrshadScraper(HttpCatalogScraper):
             seen_cards.update(product_id for product_id, _ in cards)
             for product_id, card_html in cards:
                 products, failures = build_products(product_id, card_html, category_slug)
+                if failures:
+                    # Раздел из-за такой карточки неполон; без номера карточки
+                    # причину потом не найти — список длиной в сотни страниц.
+                    log.warning(
+                        "irshad_card_not_parsed",
+                        category=category_slug,
+                        page=page,
+                        card=product_id,
+                        offers_failed=failures,
+                    )
                 result.raw_items += failures
                 result.item_failures += failures
                 for product in products:

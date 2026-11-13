@@ -1674,6 +1674,10 @@ async def test_irshad_category_follows_load_more_until_it_disappears():
     ]
     # Третий запрос — страница за концом списка: конец подтверждён, а не принят на веру.
     assert [parse_qs(urlsplit(str(r.url)).query)["page"][0] for r in seen] == ["1", "2", "3"]
+    # Каждая страница — в порядке номеров по возрастанию: по умолчанию сайт
+    # отдаёт новинки первыми, и товар, добавленный посреди обхода, сдвигал
+    # все следующие страницы (первый полный сбор 2026-11-13 так и оборвался).
+    assert [parse_qs(urlsplit(str(r.url)).query)["sort"] for r in seen] == [["id"]] * 3
     status = scraper._route_statuses["boyuk-meiset-texnikasi/iqlim/kondisioner"]
     assert status.complete and status.abort_reason is None
     assert status.expected_items is None
