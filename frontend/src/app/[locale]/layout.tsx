@@ -13,12 +13,19 @@
  */
 import { NextIntlClientProvider } from "next-intl";
 import { getMessages, setRequestLocale } from "next-intl/server";
+import { cookies } from "next/headers";
 import { notFound } from "next/navigation";
 import type { Metadata, Viewport } from "next";
 import { Providers } from "@/components/providers";
 import { locales, type Locale } from "@/i18n/config";
 import "../globals.css";
 import { PROFILE } from "@/lib/site-profile";
+import { ViewerSiteProvider } from "@/components/viewer-site-provider";
+import {
+  VIEWER_SITE_COOKIE,
+  VIEWER_SITE_SELECTABLE,
+  viewerSiteFromCookie,
+} from "@/lib/viewer-site-cookie";
 
 export const metadata: Metadata = {
   title: PROFILE.appName,
@@ -66,12 +73,20 @@ export default async function LocaleLayout({
   // win during standalone/RSC rendering and produce Russian messages under an
   // `/az/...` URL even though `<html lang>` is already `az`.
   const messages = await getMessages({ locale });
+  // «Свой магазин» (lib/viewer-site.ts) — для первого рендера страниц. У
+  // аптечного экземпляра куку не читаем: выбора там нет, а чтение делает
+  // страницы динамическими.
+  const viewerSite = viewerSiteFromCookie(
+    VIEWER_SITE_SELECTABLE ? cookies().get(VIEWER_SITE_COOKIE)?.value : undefined,
+  );
 
   return (
     <html lang={locale} suppressHydrationWarning>
       <body className="min-h-screen antialiased">
         <NextIntlClientProvider locale={locale} messages={messages}>
-          <Providers>{children}</Providers>
+          <ViewerSiteProvider site={viewerSite}>
+            <Providers>{children}</Providers>
+          </ViewerSiteProvider>
         </NextIntlClientProvider>
       </body>
     </html>

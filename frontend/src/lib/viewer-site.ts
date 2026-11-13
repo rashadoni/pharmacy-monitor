@@ -1,5 +1,5 @@
 // Хуки «своего магазина» для страниц; сам выбор и кука — viewer-site-cookie.ts.
-import { useMemo, useSyncExternalStore } from "react";
+import { createContext, useContext, useMemo, useSyncExternalStore } from "react";
 
 import { CLIENT_SITE } from "./site-profile";
 import { VIEWER_SITE_CHANGE_EVENT, readViewerSite, viewerSites } from "./viewer-site-cookie";
@@ -18,9 +18,16 @@ function subscribe(onChange: () => void): () => void {
   return () => window.removeEventListener(VIEWER_SITE_CHANGE_EVENT, onChange);
 }
 
-/** Текущий «свой» сайт. На сервере и до гидрации — клиент профиля. */
+/**
+ * «Свой» сайт, прочитанный сервером из куки (components/viewer-site-provider):
+ * значение на сервере и при гидрации. Без провайдера — клиент профиля.
+ */
+export const ViewerSiteContext = createContext<string>(CLIENT_SITE);
+
+/** Текущий «свой» сайт; на сервере и до гидрации — тот, что прочёл сервер. */
 export function useViewerSite(): string {
-  return useSyncExternalStore(subscribe, () => readViewerSite(), () => CLIENT_SITE);
+  const fromServer = useContext(ViewerSiteContext);
+  return useSyncExternalStore(subscribe, () => readViewerSite(), () => fromServer);
 }
 
 /** Сайты, «свой» первым. */
