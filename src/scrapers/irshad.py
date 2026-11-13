@@ -73,6 +73,7 @@ _OLD_PRICE_RE = re.compile(r'class="old-price">(.*?)</span>', re.DOTALL)
 _NEW_PRICE_RE = re.compile(r'class="new-price">(.*?)</p>', re.DOTALL)
 _LABEL_RE = re.compile(r'class="product__label[^"]*">(.*?)</div>', re.DOTALL)
 _IMAGE_RE = re.compile(r'class="product__img".*?<img\s+src="([^"]+)"', re.DOTALL)
+_COLORS_LIST_RE = re.compile(r'<ul class="product__colors">(.*?)</ul>', re.DOTALL)
 _LOAD_MORE_RE = re.compile(r'id="loadMore"[^>]*data-page="(\d+)"')
 _HOME_LINK_RE = re.compile(r'href="https://irshad\.az/az/([a-z0-9-]+(?:/[a-z0-9-]+)*)"')
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -136,6 +137,14 @@ def build_products(
     У обычной карточки товар один. У карточки с выбором цвета их столько,
     сколько цветов: название и адрес цвета стоят у его переключателя, цена и
     наличие — в блоке предложения с тем же номером.
+
+    Предложение-«призрак» отказом не считается: у карточки список цветов есть,
+    но пуст (``<ul class="product__colors"> </ul>``), а блоков с ценой
+    несколько. Чужой блок — цвет, который сайт не показывает: переключателя у
+    него нет, своей карточки в списке тоже (замер 2026-11-13, MacBook в разделе
+    ноутбуков: карточка 108447 несёт ещё блок 108435, которого нет нигде).
+    Назвать такой товар нечем и купить его нельзя. Собственный товар карточки
+    и предложение при непустом списке цветов по-прежнему обязаны опознаться.
     """
     # Кто есть кто: номер товара -> (адрес, название, картинка).
     identities: dict[str, tuple[str, str, str | None]] = {}
@@ -168,11 +177,16 @@ def build_products(
     ] or [(product_id, card_html)]
 
     product_type = _text((_TYPE_RE.search(card_html) or [None, None])[1])
+    color_lists = _COLORS_LIST_RE.findall(card_html)
+    no_colors_offered = bool(color_lists) and not any(body.strip() for body in color_lists)
     products: list[ScrapedProduct] = []
     failures = 0
     for offer_id, block_html in blocks:
         identity = identities.get(offer_id)
         if identity is None or not identity[0] or not identity[1]:
+            if identity is None and offer_id != product_id and no_colors_offered:
+                log.info("irshad_unlisted_offer_skipped", card=product_id, offer=offer_id)
+                continue
             failures += 1
             continue
         url, name, image_url = identity

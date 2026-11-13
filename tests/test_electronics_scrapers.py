@@ -1846,6 +1846,41 @@ async def test_irshad_unreadable_offer_makes_the_pass_incomplete():
     assert (status.item_failures, status.raw_items, status.parsed_items) == (1, 4, 3)
 
 
+def _irshad_card_without_colour_choice() -> tuple[str, str]:
+    """Многоцветная карточка, у которой сайт не показал выбор цвета."""
+    import re
+
+    (card,) = [card for card_id, card in split_cards(IRSHAD_LAST_PAGE) if card_id == "85759"]
+    emptied, count = re.subn(
+        r'<ul class="product__colors">.*?</ul>',
+        '<ul class="product__colors"> </ul>',
+        card,
+        flags=re.DOTALL,
+    )
+    assert count >= 1
+    return "85759", emptied
+
+
+def test_irshad_price_block_of_a_colour_the_site_does_not_offer_is_skipped():
+    # Список цветов у карточки есть, но пуст, а блоков с ценой два: второй —
+    # цвет, которого сайт не показывает. На живом сайте так у MacBook в разделе
+    # ноутбуков (карточка 108447 несёт блок 108435, которого нет нигде), и
+    # раздел из-за этого был неполон при каждом сборе.
+    product_id, card = _irshad_card_without_colour_choice()
+    products, failures = build_products(product_id, card, "c")
+    assert [p.external_id for p in products] == ["85759"]
+    assert failures == 0
+
+
+def test_irshad_card_whose_own_product_has_no_name_is_still_a_failure():
+    # Пустой список цветов не извиняет карточку без названия самого товара.
+    product_id, card = _irshad_card_without_colour_choice()
+    card = card.replace('class="product__name product-link"', 'class="product__name"')
+    products, failures = build_products(product_id, card, "c")
+    assert "85759" not in [p.external_id for p in products]
+    assert failures >= 1
+
+
 def test_irshad_unreadable_current_price_next_to_a_struck_out_one_is_a_failure():
     # Действующая цена не прочиталась — зачёркнутую за неё выдавать нельзя.
     product_id, card = split_cards(IRSHAD_PAGE)[0]
