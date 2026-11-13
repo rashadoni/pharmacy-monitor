@@ -41,22 +41,24 @@ STRATEGY_SERIES = "model_series"
 # Пара с разницей больше этой — скорее разные товары под похожим названием.
 MAX_PRICE_RATIO = 1.6
 
-_FOLD = str.maketrans("əıöüğşçİ", "eiougsci")
+_FOLD = str.maketrans("əıöüğşç", "eiougsc")
 
 # Слова «что это за товар»: у одного сайта стоят перед брендом, у другого нет.
+# Сюда нельзя вносить слово, которое отличает один товар от другого: названия
+# аксессуаров («çexol», «kabel», «üçün») остаются словами модели, иначе чехол
+# для телефона получил бы признаки самого телефона.
 _TYPE_WORDS = frozenset(
     """
     smartfon smartphone telefon mobil phone televizor tv television noutbuk notbuk laptop
     notebook planset planshet tablet qulaqliq qulaqciq headphones earbuds nausnik saat
     smartsaat smartwatch watch soyuducu refrigerator fridge dondurucu paltaryuyan
     washing machine masin qabyuyan dishwasher kondisioner conditioner tozsoran vacuum
-    cleaner robot utu iron fen hairdryer mikrodalga microwave soba oven plite printer
-    monitor kamera camera fotoaparat konsol console oyun game klaviatura keyboard
-    mouse sican kolonka speaker dinamik powerbank adapter kabel cable cexol case
-    qizdirici heater ventilyator fan blender mikser mixer toster toaster caydan kettle
-    qehvebisiren coffee maker epilyator trimmer britva ustelik desktop komputer computer
-    pc sistem bloku ag wi-fi router modem proyektor projector elektrik electric simsiz
-    wireless ucun for ile with ve and yeni new
+    cleaner utu iron fen hairdryer mikrodalga microwave soba oven plite printer
+    monitor kamera camera fotoaparat konsol console klaviatura keyboard
+    mouse sican kolonka speaker dinamik powerbank
+    qizdirici heater ventilyator blender mikser mixer toster toaster caydan kettle
+    qehvebisiren epilyator trimmer britva ustelik desktop komputer computer
+    router modem proyektor projector ve and yeni new
     """.split()
 )
 
@@ -64,7 +66,6 @@ _TYPE_WORDS = frozenset(
 _COLORS = {
     "black": "black",
     "qara": "black",
-    "cernyy": "black",
     "черный": "black",
     "чёрный": "black",
     "white": "white",
@@ -128,18 +129,40 @@ _COLORS = {
     "burgundy": "burgundy",
     "sand": "sand",
     "rose": "rose",
+    # Слова оттенка — часть цвета: «Light Blue» и «Blue» разные расцветки.
+    "light": "light",
+    "dark": "dark",
+    "deep": "deep",
+    "sky": "sky",
+    "ice": "ice",
+    "icy": "ice",
+    "ocean": "ocean",
+    "forest": "forest",
+    "space": "space",
+    "pearl": "pearl",
+    "jet": "jet",
+    "onyx": "onyx",
+    "glacier": "glacier",
+    "aurora": "aurora",
+    "sunset": "sunset",
+    "polar": "polar",
+    "marble": "marble",
+    "crystal": "crystal",
+    "sierra": "sierra",
+    "alpine": "alpine",
+    "pacific": "pacific",
+    "cloud": "cloud",
+    "dawn": "dawn",
 }
-# Рекламные слова при цвете: «Awesome Navy» и «Navy» — один цвет.
+# Чисто рекламные слова при цвете: «Awesome Navy» и «Navy» — один цвет.
 _COLOR_FILLERS = frozenset(
-    "awesome phantom mystic cosmic space icy ice deep dark light sky ocean forest glacier "
-    "aurora cloud dawn sunset polar onyx marble jet matte glossy pearl crystal sierra alpine "
-    "pacific rengi reng color colour".split()
+    "awesome phantom mystic cosmic matte glossy rengi reng rengli color colour".split()
 )
-# Слова, которые о модели ничего не говорят.
+# Слова, которые о модели ничего не говорят. Технология экрана и связь сюда не
+# входят: «OLED» и «LCD», «Wi-Fi» и без него — разные товары.
 _NOISE = frozenset(
-    "smart uhd fhd hd qled oled led lcd android ios dual sim nano esim nfc wifi wi fi "
-    "bluetooth gb tb ram rom inch duym dm ekran display garantiya zemanet resmi original "
-    "eu global version versiya".split()
+    "smart uhd fhd hd 4k 8k android ios dual sim nano esim nfc bluetooth gb tb ram rom inch "
+    "duym dm ekran display garantiya zemanet resmi original global version versiya".split()
 )
 _BRANDS = frozenset(
     """
@@ -152,10 +175,9 @@ _BRANDS = frozenset(
     kenwood moulinex delonghi nespresso rowenta remington babyliss vitek polaris
     zass hoffmann eurolux vestel grundig blaupunkt kivi yandex nintendo
     epson brother kingston sandisk seagate western transcend tp-link tplink mercusys
-    d-link dlink zyxel ubiquiti keenetic nothing blackview ulefone doogee cubot zte
+    d-link dlink zyxel ubiquiti keenetic nothing blackview ulefone doogee cubot zte hoco
     """.split()
 )
-
 # Линейка, по которой бренд понятен без его имени.
 _LINE_BRANDS = {
     "iphone": "apple",
@@ -174,14 +196,35 @@ _LINE_BRANDS = {
     "playstation": "sony",
     "xbox": "microsoft",
 }
+# Слова-варианты модели: при совпавшем заводском коде они не должны спорить.
+_VARIANT_WORDS = frozenset(
+    "pro max plus ultra lite fe mini air neo turbo se f s e x t c 4g 5g lte wi-fi wifi "
+    "cellular oled qled led lcd".split()
+)
 
 _MEMORY_PAIR_RE = re.compile(r"\b(\d{1,2})\s*(?:gb)?\s*[/+]\s*(?:(\d{2,4})\s*(gb)?|(\d)\s*(tb))\b")
 _STORAGE_RE = re.compile(r"\b(\d{2,4})\s*(gb|tb)\b")
 _TB_RE = re.compile(r"\b(\d)\s*tb\b")
 _RAM_RE = re.compile(r"\b(\d{1,2})\s*gb\s*(?:ram|ozu)\b|\bram\s*(\d{1,2})\s*gb\b")
-_SCREEN_RE = re.compile(r"""\b(\d{2,3})(?:[.,]\d)?\s*(?:"|''|”|inch|duym|dm)(?=\s|$)""")
+_SCREEN_RE = re.compile(r"""\b(\d{2,3})(?:[.,](\d))?\s*(?:"|''|”|inch|duym|dm)(?=\s|$)""")
+_PLUS_RE = re.compile(r"(?<=[0-9a-zа-яё])\+")
 _TOKEN_RE = re.compile(r"[0-9a-zа-яё]+(?:[-.][0-9a-zа-яё]+)*")
 _NETWORK = frozenset({"4g", "5g", "3g", "lte"})
+# Характеристика, а не заводской код: процессор, ёмкость, мощность, класс
+# Wi-Fi, память, видеокарта, разрешение. Выглядит как код (буквы с цифрами),
+# но одна и та же у разных моделей.
+_SPEC_RE = re.compile(
+    r"""^(?:
+        \d+(?:[.,]\d+)?(?:mah|w|wt|vt|hz|mm|sm|cm|ml|l|kg|kq|qr|btu|rpm|dpi|mp|v|a|k|bar|db)
+      | (?:i[3579]|r[3579]|n\d|m[1-4])-?\d{3,5}[a-z]{0,3}
+      | (?:ax|ac|be|n)\d{3,5}
+      | ddr\d(?:-?\d+)?
+      | (?:rtx|gtx|rx|mx)-?\d{3,4}[a-z]*
+      | \d+x\d+
+      | \d{3,4}p
+    )$""",
+    re.VERBOSE,
+)
 
 
 @dataclass(frozen=True)
@@ -191,26 +234,33 @@ class Signature:
     words: frozenset[str]
     ram: int | None
     storage: int | None
+    screen: str | None
     colors: frozenset[str]
 
     @property
-    def code_key(self) -> tuple | None:
-        return (self.brand, self.code) if self.code else None
+    def variant(self) -> frozenset[str]:
+        """Слова, отличающие вариант модели: с цифрой и из списка вариантов."""
+        return frozenset(
+            word
+            for word in self.words
+            if word in _VARIANT_WORDS or any(character.isdigit() for character in word)
+        )
 
     @property
     def series_key(self) -> tuple | None:
-        # Без слов модели и без памяти сравнивать нечего: «Samsung Black».
         if not self.words:
             return None
-        return (self.brand, self.words, self.ram, self.storage, self.colors)
+        return (self.brand, self.words, self.ram, self.storage, self.screen, self.colors)
 
 
 def _is_model_code(token: str) -> bool:
-    """Заводской код модели: буквы и цифры вперемешку, длинный."""
+    """Заводской код модели: буквы и цифры вперемешку, длинный, не характеристика."""
+    if _SPEC_RE.match(token):
+        return False
     compact = token.replace("-", "").replace(".", "")
     digits = sum(character.isdigit() for character in compact)
     letters = sum(character.isalpha() for character in compact)
-    return len(compact) >= 6 and digits >= 2 and letters >= 2
+    return len(compact) >= 6 and digits >= 3 and letters >= 2
 
 
 def _is_designation(token: str) -> bool:
@@ -225,7 +275,8 @@ def _is_designation(token: str) -> bool:
 
 def signature(name: str | None) -> Signature | None:
     """Признаки товара из названия; ``None``, если бренд не узнать."""
-    text = " ".join((name or "").lower().translate(_FOLD).split())
+    # «İ» до приведения к нижнему регистру: иначе она распадается на «i» и точку.
+    text = " ".join((name or "").replace("İ", "i").lower().translate(_FOLD).split())
     if not text:
         return None
 
@@ -248,7 +299,16 @@ def signature(name: str | None) -> Signature | None:
         elif single:
             storage = int(single.group(1)) * (1024 if single.group(2) == "tb" else 1)
             text = text[: single.start()] + " " + text[single.end() :]
-    text = _SCREEN_RE.sub(" ", text)
+
+    screen = None
+    inches = _SCREEN_RE.search(text)
+    if inches:
+        screen = inches.group(1) + (
+            f".{inches.group(2)}" if inches.group(2) not in (None, "0") else ""
+        )
+        text = _SCREEN_RE.sub(" ", text)
+    # «S23+», «Pro+» — другая модель, чем «S23» и «Pro».
+    text = _PLUS_RE.sub(" plus ", text)
 
     tokens = [token.strip("-.") for token in _TOKEN_RE.findall(text)]
     tokens = [token for token in tokens if token]
@@ -260,23 +320,22 @@ def signature(name: str | None) -> Signature | None:
         brand = next((_LINE_BRANDS[token] for token in tokens if token in _LINE_BRANDS), None)
     if brand is None:
         brand = next((token for token in tokens if token not in _TYPE_WORDS), None)
-    if brand is None or brand.isdigit():
+    if brand is None or brand.isdigit() or len(brand) < 2:
         return None
 
     code = None
     words: set[str] = set()
     colors: set[str] = set()
     for token in tokens:
-        if token == brand or token in _TYPE_WORDS or token in _COLOR_FILLERS:
+        if token == brand or token in _COLOR_FILLERS:
             continue
         if token in _COLORS:
             colors.add(_COLORS[token])
             continue
-        if token in _NOISE and token not in _NETWORK:
+        if token in _TYPE_WORDS or token in _NOISE:
             continue
         if code is None and _is_model_code(token):
-            # «55UR78006LK.AMCE», «RB34T600FSA-WT»: региональный и цветовой
-            # хвост после точки пишут не все сайты.
+            # «55UR78006LK.AMCE»: региональный хвост после точки пишут не все.
             code = token.split(".")[0].replace("-", "")
             continue
         words.add(token)
@@ -287,8 +346,14 @@ def signature(name: str | None) -> Signature | None:
         words=frozenset(words),
         ram=ram,
         storage=storage,
+        screen=screen,
         colors=frozenset(colors),
     )
+
+
+def _agree(first, second) -> bool:
+    """Признак не спорит: назван у обоих одинаково или у кого-то не назван."""
+    return not first or not second or first == second
 
 
 def _same_product(a: Signature, b: Signature) -> str | None:
@@ -298,10 +363,16 @@ def _same_product(a: Signature, b: Signature) -> str | None:
     if a.code and b.code:
         if a.code != b.code:
             return None
-        # Код совпал; память и цвет не должны спорить там, где названы у обоих.
-        if a.storage and b.storage and a.storage != b.storage:
-            return None
-        if a.colors and b.colors and a.colors != b.colors:
+        # Код совпал. Всё, что названо у обоих, должно совпасть; вариант модели
+        # (слова с цифрой, «Pro», «Plus», «OLED») — совпасть в любом случае:
+        # один и тот же код пишут у ноутбуков с разным процессором и памятью.
+        if not (
+            _agree(a.ram, b.ram)
+            and _agree(a.storage, b.storage)
+            and _agree(a.screen, b.screen)
+            and _agree(a.colors, b.colors)
+            and a.variant == b.variant
+        ):
             return None
         return STRATEGY_CODE
     if a.series_key is not None and a.series_key == b.series_key:
@@ -334,26 +405,30 @@ def match_products(session: Session, *, tenant_id: int = 1) -> int:
     """Свести товары сайтов экземпляра в пары; возвращает число новых пар.
 
     Существующие пары не разбираются и не сливаются: новый товар входит в пару,
-    только если подходит каждому её члену, а его сайт в ней ещё не представлен.
-    Ручные пары (`is_manual`) не трогаются. Commit — за вызывающим.
+    только если подходит каждому её члену, его сайт в ней не представлен ни
+    живым, ни пропавшим товаром и другого такого же кандидата у сайта нет.
+    Ручные пары (`is_manual`) не трогаются. Результат фиксируется здесь же —
+    как у аптечного `matcher.match_products`: этап сопоставления идёт под своим
+    замком, и пары не должны зависеть от шагов прогона после него.
     """
-    products = list(
+    rows = list(
         session.scalars(
             select(Product).where(
-                Product.site.in_(site_profile.SITES),
-                Product.tenant_id == tenant_id,
-                Product.url_dead_at.is_(None),
+                Product.site.in_(site_profile.SITES), Product.tenant_id == tenant_id
             )
         ).all()
     )
+    by_id = {product.id: product for product in rows}
+    # Товар с мёртвой ссылкой новых пар не образует, но место своего сайта в
+    # уже существующей паре занимает.
+    alive = [product for product in rows if product.url_dead_at is None]
     signatures: dict[int, Signature] = {}
-    for product in products:
+    for product in alive:
         found = signature(product.name)
         if found is not None:
             signatures[product.id] = found
-    by_id = {product.id: product for product in products}
     rejected = _rejected_pairs(session)
-    snapshots = latest_snapshots_per_product(session, list(signatures))
+    snapshots = latest_snapshots_per_product(session, list(signatures), tenant_id=tenant_id)
     prices = {
         product_id: float(snapshot.discount_price or snapshot.price)
         for product_id, snapshot in snapshots.items()
@@ -367,106 +442,125 @@ def match_products(session: Session, *, tenant_id: int = 1) -> int:
             return None
         return _same_product(signatures[first], signatures[second])
 
-    # Кандидаты встречаются только внутри одного бренда.
-    by_brand: dict[str, list[int]] = defaultdict(list)
+    # Кандидаты ищутся не перебором бренда, а по ключам: товары с тем же
+    # заводским кодом и товары с теми же признаками линейки. Перебор всех пар
+    # бренда на каталоге в десятки тысяч товаров шёл бы десятки минут.
+    by_code: dict[tuple, list[int]] = defaultdict(list)
+    by_series: dict[tuple, list[int]] = defaultdict(list)
     for product_id, found in signatures.items():
-        by_brand[found.brand].append(product_id)
+        if found.code:
+            by_code[(found.brand, found.code)].append(product_id)
+        if found.series_key is not None:
+            by_series[found.series_key].append(product_id)
+
+    def neighbours(product_id: int) -> list[int]:
+        found = signatures[product_id]
+        out: dict[int, None] = {}
+        if found.code:
+            for other in by_code[(found.brand, found.code)]:
+                out[other] = None
+        if found.series_key is not None:
+            for other in by_series[found.series_key]:
+                out[other] = None
+        out.pop(product_id, None)
+        return sorted(out)
 
     clusters: dict[int, list[int]] = defaultdict(list)
-    manual = set(session.scalars(select(Match.id).where(Match.is_manual.is_(True))).all())
-    for product in products:
+    for product in rows:
         if product.canonical_id is not None:
             clusters[product.canonical_id].append(product.id)
+    manual = set(session.scalars(select(Match.id).where(Match.is_manual.is_(True))).all())
+    free = sorted(pid for pid in signatures if by_id[pid].canonical_id is None)
 
+    # 1. Свободный товар входит в существующую пару. Кандидаты пары считаются
+    #    по сайтам: два равно подходящих товара одного сайта — никто не входит.
     created = attached = ambiguous = 0
-    for members in by_brand.values():
-        free = sorted(pid for pid in members if by_id[pid].canonical_id is None)
-
-        # 1. Свободный товар входит в существующую пару, если подходит всем.
-        for product_id in list(free):
-            site = by_id[product_id].site
-            homes = []
-            for match_id, cluster in clusters.items():
-                if match_id in manual or not cluster:
-                    continue
-                known = [pid for pid in cluster if pid in signatures]
-                if len(known) != len(cluster) or any(by_id[pid].site == site for pid in cluster):
-                    continue
-                if all(compatible(product_id, pid) for pid in cluster):
-                    homes.append(match_id)
-            if len(homes) == 1:
-                by_id[product_id].canonical_id = homes[0]
-                clusters[homes[0]].append(product_id)
-                free.remove(product_id)
-                attached += 1
-            elif len(homes) > 1:
-                ambiguous += 1
-                free.remove(product_id)
-
-        # 2. Свободные товары разных сайтов образуют новую пару.
-        partners: dict[int, dict[str, list[int]]] = {}
-        for product_id in free:
-            sites: dict[str, list[int]] = defaultdict(list)
-            for other in free:
-                if other != product_id and by_id[other].site != by_id[product_id].site:
-                    if compatible(product_id, other):
-                        sites[by_id[other].site].append(other)
-            partners[product_id] = sites
-
-        used: set[int] = set()
-        for product_id in free:
-            if product_id in used or not partners[product_id]:
+    claims: dict[tuple[int, str], list[int]] = defaultdict(list)
+    homes: dict[int, set[int]] = defaultdict(set)
+    for product_id in free:
+        site = by_id[product_id].site
+        for match_id in {by_id[n].canonical_id for n in neighbours(product_id)} - {None}:
+            cluster = clusters[match_id]
+            if match_id in manual or any(by_id[pid].site == site for pid in cluster):
                 continue
-            group = [product_id]
-            unsure = False
-            for site, candidates in partners[product_id].items():
-                candidates = [pid for pid in candidates if pid not in used]
-                if len(candidates) != 1:
-                    # Два одинаково подходящих товара одного сайта — не выбираем.
-                    unsure = unsure or len(candidates) > 1
-                    continue
-                candidate = candidates[0]
-                # Взаимность: и для кандидата наш сайт должен быть однозначным.
-                back = [
-                    pid
-                    for pid in partners[candidate].get(by_id[product_id].site, [])
-                    if pid not in used
-                ]
-                if back != [product_id]:
-                    unsure = True
-                    continue
-                if all(compatible(candidate, member) for member in group):
-                    group.append(candidate)
-            if unsure:
-                ambiguous += 1
-            if len(group) < 2:
-                continue
-            strategies = {
-                _same_product(signatures[group[0]], signatures[other]) for other in group[1:]
-            }
-            anchor = next(
-                (pid for pid in group if by_id[pid].site == site_profile.CLIENT_SITE), group[0]
-            )
-            match = Match(
-                tenant_id=tenant_id,
-                canonical_name=by_id[anchor].name[:500],
-                canonical_brand=signatures[anchor].brand[:200],
-                confidence=1.0 if strategies == {STRATEGY_CODE} else 0.9,
-                is_manual=False,
-                match_strategy=STRATEGY_CODE if strategies == {STRATEGY_CODE} else STRATEGY_SERIES,
-            )
-            session.add(match)
-            session.flush()
-            for pid in group:
-                by_id[pid].canonical_id = match.id
-                used.add(pid)
-            clusters[match.id] = list(group)
-            created += 1
+            members = [pid for pid in cluster if pid in signatures]
+            if members and all(compatible(product_id, pid) for pid in members):
+                claims[(match_id, site)].append(product_id)
+                homes[product_id].add(match_id)
+    for (match_id, _site), candidates in sorted(claims.items()):
+        if len(candidates) != 1 or len(homes[candidates[0]]) != 1:
+            ambiguous += 1
+            continue
+        by_id[candidates[0]].canonical_id = match_id
+        clusters[match_id].append(candidates[0])
+        attached += 1
+    # Товар, который спорил за место в готовой паре, новую пару не начинает.
+    free = [pid for pid in free if by_id[pid].canonical_id is None and not homes[pid]]
 
-    session.flush()
+    # 2. Свободные товары разных сайтов образуют новую пару.
+    free_set = set(free)
+    partners: dict[int, dict[str, list[int]]] = {}
+    for product_id in free:
+        sites: dict[str, list[int]] = defaultdict(list)
+        for other in neighbours(product_id):
+            if other in free_set and by_id[other].site != by_id[product_id].site:
+                if compatible(product_id, other):
+                    sites[by_id[other].site].append(other)
+        partners[product_id] = sites
+
+    used: set[int] = set()
+    for product_id in free:
+        if product_id in used or not partners[product_id]:
+            continue
+        group = [product_id]
+        unsure = False
+        for _site, candidates in sorted(partners[product_id].items()):
+            candidates = [pid for pid in candidates if pid not in used]
+            if len(candidates) != 1:
+                # Два одинаково подходящих товара одного сайта — не выбираем.
+                unsure = unsure or len(candidates) > 1
+                continue
+            candidate = candidates[0]
+            # Взаимность: и для кандидата наш сайт должен быть однозначным.
+            back = [
+                pid
+                for pid in partners[candidate].get(by_id[product_id].site, [])
+                if pid not in used
+            ]
+            if back != [product_id]:
+                unsure = True
+                continue
+            if all(compatible(candidate, member) for member in group):
+                group.append(candidate)
+        if unsure:
+            ambiguous += 1
+        if len(group) < 2:
+            continue
+        strategies = {_same_product(signatures[group[0]], signatures[other]) for other in group[1:]}
+        anchor = next(
+            (pid for pid in group if by_id[pid].site == site_profile.CLIENT_SITE), group[0]
+        )
+        by_code_only = strategies == {STRATEGY_CODE}
+        match = Match(
+            tenant_id=tenant_id,
+            canonical_name=by_id[anchor].name[:500],
+            canonical_brand=signatures[anchor].brand[:200],
+            confidence=1.0 if by_code_only else 0.9,
+            is_manual=False,
+            match_strategy=STRATEGY_CODE if by_code_only else STRATEGY_SERIES,
+        )
+        session.add(match)
+        session.flush()
+        for pid in group:
+            by_id[pid].canonical_id = match.id
+            used.add(pid)
+        clusters[match.id] = list(group)
+        created += 1
+
+    session.commit()
     log.info(
         "electronics_matcher_done",
-        products=len(products),
+        products=len(rows),
         with_signature=len(signatures),
         new_clusters=created,
         attached=attached,

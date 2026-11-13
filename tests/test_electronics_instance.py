@@ -130,6 +130,53 @@ def test_pharmacy_command_refuses_the_electronics_database(tmp_path):
     assert "kontakt  telefonlar" in done.stdout
 
 
+def _run(tmp_path: Path, profile: str | None, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "src.main", *args],
+        cwd=tmp_path,
+        env=_env(tmp_path, profile),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+
+def test_rematch_works_on_the_electronics_instance_and_keeps_its_pairs(tmp_path):
+    import sqlite3
+
+    _probe(tmp_path, "kontakt,irshad,bakuelectronics")
+    with sqlite3.connect(tmp_path / "instance.db") as connection:
+        connection.execute("update products set canonical_id = null")
+        connection.execute("delete from matches")
+
+    done = _run(tmp_path, "electronics", "rematch")
+    assert done.returncode == 0, (done.stdout + done.stderr)[-2000:]
+    assert "Matcher done: 3 clusters" in done.stdout
+    with sqlite3.connect(tmp_path / "instance.db") as connection:
+        assert connection.execute("select count(*) from matches").fetchone()[0] == 3
+        assert (
+            connection.execute(
+                "select count(*) from products where canonical_id is not null"
+            ).fetchone()[0]
+            == 9
+        )
+
+    # Аптечные режимы rematch другому профилю не подходят — отказ, а не запуск
+    # аптечных правил по парам электроники.
+    for flag in ("--revalidate", "--relink-dead"):
+        refused = _run(tmp_path, "electronics", "rematch", flag)
+        assert refused.returncode != 0
+        assert "аптечные правила" in refused.stdout + refused.stderr
+
+    # И аптечный rematch в базе электроники не идёт вовсе.
+    foreign = _run(tmp_path, None, "rematch")
+    assert foreign.returncode != 0
+    assert "belongs to a 'electronics' instance" in foreign.stdout + foreign.stderr
+    with sqlite3.connect(tmp_path / "instance.db") as connection:
+        assert connection.execute("select count(*) from matches").fetchone()[0] == 3
+
+
 def _factory_with_default_client(db_session, client_site):
     tenant = tenants.get_or_create_default(db_session)
     tenant.client_site = client_site

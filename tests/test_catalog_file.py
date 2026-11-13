@@ -124,6 +124,114 @@ def test_file_without_a_required_column_or_rows_is_refused(tmp_path):
         read_catalog_file(_write(tmp_path, "x", name="kontakt.pdf"), "kontakt")
 
 
+def _one(tmp_path, header, row):
+    catalog = read_catalog_file(_write(tmp_path, header + "\n" + row + "\n"), "kontakt")
+    (product,) = catalog.products
+    return product.price, product.discount_price, product.is_on_sale
+
+
+def test_current_price_is_the_sale_price_when_the_file_names_one(tmp_path):
+    header = "name;url;Qiymət;Endirimli qiymət;Köhnə qiymət"
+    url = "https://kontakt.az/a"
+    # Цена 1000, со скидкой 800: действующая 800, обычная 1000.
+    assert _one(tmp_path, header, f"A;{url};1000;800;") == (1000.0, 800.0, True)
+    # Скидочная пуста — действует обычная цена.
+    assert _one(tmp_path, header, f"A;{url};1000;;") == (1000.0, None, False)
+    # Старая цена ниже действующей — подорожание: действующей она не становится.
+    assert _one(tmp_path, header, f"A;{url};1000;;900") == (1000.0, None, False)
+    # Старая выше — скидка от неё.
+    assert _one(tmp_path, header, f"A;{url};1000;;1200") == (1200.0, 1000.0, True)
+    # Ноль и прочерк в необязательной цене — «не названа».
+    assert _one(tmp_path, header, f"A;{url};1000;0;-") == (1000.0, None, False)
+
+
+def test_empty_price_with_an_old_price_is_a_product_without_a_price(tmp_path):
+    text = "name;url;price;old price\nA;https://kontakt.az/a;;900\nB;https://kontakt.az/b;5;\n"
+    catalog = read_catalog_file(_write(tmp_path, text), "kontakt")
+    assert [(p.name, p.price) for p in catalog.products] == [("A", None), ("B", 5.0)]
+
+
+@pytest.mark.parametrize(
+    ("header", "message"),
+    [
+        # Две колонки на одну роль: какая из них цена — не выбираем.
+        ("name;url;price;Qiymət", "на одну роль (price)"),
+        ("name;url;price;sale price;Yeni qiymət", "на одну роль (sale_price)"),
+        # Незнакомая колонка с ценой молча не пропускается.
+        ("name;url;price;Kredit qiyməti", "колонка с ценой не узнана"),
+        ("name;url;price;Цена в рассрочку", "колонка с ценой не узнана"),
+    ],
+)
+def test_ambiguous_or_unknown_price_column_refuses_the_file(tmp_path, header, message):
+    row = ";".join(["A", "https://kontakt.az/a"] + ["10"] * (header.count(";") - 1))
+    with pytest.raises(CatalogFileError) as error:
+        read_catalog_file(_write(tmp_path, header + "\n" + row + "\n"), "kontakt")
+    assert message in str(error.value)
+
+
+def test_unknown_column_that_is_not_a_price_is_reported_not_refused(tmp_path):
+    text = "name;url;price;Zəmanət;Rəng\nA;https://kontakt.az/a;10;2 il;Qara\n"
+    catalog = read_catalog_file(_write(tmp_path, text), "kontakt")
+    assert catalog.ignored_columns == ["Zəmanət", "Rəng"]
+
+
+def test_values_the_database_cannot_hold_refuse_the_file(tmp_path):
+    for row in (
+        "A,10,https://kontakt.az/" + "x" * 250,
+        "N" * 501 + ",10,https://kontakt.az/a",
+    ):
+        with pytest.raises(CatalogFileError) as error:
+            read_catalog_file(_write(tmp_path, "name,price,url\n" + row + "\n"), "kontakt")
+        assert "длиннее допустимого" in error.value.problems[0]
+
+
+def test_sku_does_not_excuse_an_unreadable_address(tmp_path):
+    for url in ("n/a", "kontakt.az/a"):
+        text = f"name,price,url,sku\nA,10,{url},TM-1\n"
+        with pytest.raises(CatalogFileError) as error:
+            read_catalog_file(_write(tmp_path, text), "kontakt")
+        assert "адрес страницы не читается" in error.value.problems[0]
+
+
+def test_query_string_is_part_of_the_identity(tmp_path):
+    text = "name,price,url\nA,10,https://kontakt.az/p?id=1\nA,10,https://kontakt.az/p?id=2\n"
+    catalog = read_catalog_file(_write(tmp_path, text), "kontakt")
+    assert [p.external_id for p in catalog.products] == ["p?id=1", "p?id=2"]
+    assert catalog.duplicate_rows == 0
+
+
+def test_file_without_a_single_price_is_not_a_price_catalog(tmp_path):
+    text = "name,price,url\nA,,https://kontakt.az/a\nB,,https://kontakt.az/b\n"
+    with pytest.raises(CatalogFileError) as error:
+        read_catalog_file(_write(tmp_path, text), "kontakt")
+    assert "нет цены" in str(error.value)
+
+
+def test_unreadable_files_are_refused_with_a_reason_not_a_traceback(tmp_path):
+    cp1251 = tmp_path / "excel.csv"
+    cp1251.write_bytes("Название;Цена;Ссылка\nТелефон;10;https://kontakt.az/a\n".encode("cp1251"))
+    with pytest.raises(CatalogFileError) as error:
+        read_catalog_file(cp1251, "kontakt")
+    assert "UTF-8" in str(error.value)
+
+    broken = tmp_path / "broken.xlsx"
+    broken.write_bytes(b"this is not a spreadsheet")
+    with pytest.raises(CatalogFileError) as error:
+        read_catalog_file(broken, "kontakt")
+    assert "не читается" in str(error.value)
+
+    # Каталог на двух листах: первый лист — не весь каталог.
+    book = Workbook()
+    for sheet in (book.active, book.create_sheet("TV")):
+        sheet.append(["name", "price", "url"])
+        sheet.append([f"A {sheet.title}", 10, f"https://kontakt.az/{sheet.title}"])
+    path = tmp_path / "two.xlsx"
+    book.save(path)
+    with pytest.raises(CatalogFileError) as error:
+        read_catalog_file(path, "kontakt")
+    assert "листов с данными 2" in str(error.value)
+
+
 def test_file_scraper_reports_the_file_as_one_complete_route(tmp_path):
     catalog = read_catalog_file(_write(tmp_path, GOOD_CSV), "kontakt")
     scraper_class = catalog_file.file_scraper("kontakt", catalog)
@@ -208,6 +316,46 @@ def test_electronics_instance_takes_the_client_catalog_from_a_file(tmp_path):
     assert done.returncode == 0, (done.stdout + done.stderr)[-3000:]
     assert _db(tmp_path, "select count(*) from products")[0][0] == 3
     assert _db(tmp_path, "select count(*) from price_snapshots")[0][0] == snapshots_before + 1
+
+
+def test_file_much_smaller_than_the_last_accepted_one_is_refused(tmp_path):
+    # У файла нет внешнего знаменателя: мерка — прошлая принятая загрузка.
+    rows = "".join(f"P{n};{n + 10};;https://kontakt.az/p{n};K{n};;\n" for n in range(20))
+    header = GOOD_CSV.splitlines()[0] + "\n"
+    full = _write(tmp_path, header + rows, name="full.csv")
+    assert (
+        _cli(
+            tmp_path, "electronics", "catalog", "import", "--site", "kontakt", str(full)
+        ).returncode
+        == 0
+    )
+
+    # 17 из 20 — меньше девяти десятых: отказ до записи, прогон не заводится.
+    part = _write(tmp_path, header + "".join(rows.splitlines(keepends=True)[:17]), name="part.csv")
+    done = _cli(tmp_path, "electronics", "catalog", "import", "--site", "kontakt", str(part))
+    assert done.returncode != 0
+    assert "в прошлой принятой загрузке было 20" in done.stdout + done.stderr
+    assert _db(tmp_path, "select count(*) from runs")[0][0] == 1
+
+    # 18 из 20 проходит; а 17 — только по явному слову.
+    ok = _write(tmp_path, header + "".join(rows.splitlines(keepends=True)[:18]), name="ok.csv")
+    assert (
+        _cli(tmp_path, "electronics", "catalog", "import", "--site", "kontakt", str(ok)).returncode
+        == 0
+    )
+    done = _cli(
+        tmp_path,
+        "electronics",
+        "catalog",
+        "import",
+        "--site",
+        "kontakt",
+        str(part),
+        "--allow-shrink",
+        "--no-alerts",
+    )
+    assert done.returncode == 0, (done.stdout + done.stderr)[-2000:]
+    assert _db(tmp_path, "select products_scraped from runs order by id") == [(20,), (18,), (17,)]
 
 
 def test_refused_file_writes_nothing(tmp_path):

@@ -3069,6 +3069,18 @@ if set(SCRAPER_CLASSES) != set(site_profile.SITES):
     )
 
 
+def _refuse_foreign_database(session_factory) -> None:
+    """Команда, которая открывает базу мимо `init_db`, сверяет метку сама.
+
+    `rematch` без PM_PROFILE в каталоге экземпляра электроники прогнал бы
+    аптечные правила по чужим парам — ровно то, от чего метка базы защищает.
+    """
+    try:
+        storage.refuse_database_of_another_profile(session_factory)
+    except storage.DatabaseOfAnotherProfile as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _default_scrape_sites() -> list[str]:
     """Сайты команды без `--site`: все, кроме тех, чей каталог приходит файлом."""
     return [site for site in SCRAPER_CLASSES if site not in site_profile.IMPORTED_SITES]
@@ -3186,9 +3198,10 @@ def _run_matching_stage(
         # подходят: у электроники своё сопоставление — по модели.
         from src import electronics_matcher
 
+        # Аптечных подготовительных шагов у этого сопоставления нет: ноль, а не
+        # None — None читается как «шаг упал» (`rematch` на нём отказывает).
+        summary.update(refreshed=0, relinked=0, reseated=0, revalidated=0, flagged=0)
         summary["clusters"] = electronics_matcher.match_products(session)
-        summary["revalidated"] = None
-        summary["flagged"] = None
         return summary
     for key, prepare in (
         ("refreshed", matcher.refresh_derived_fields),
@@ -7529,7 +7542,13 @@ def rematch_cmd(
             f"Для копии базы или стенда добавь {REMATCH_RESET_CONFIRM_FLAG}."
         )
 
+    if not site_profile.is_pharmacy() and (reset or revalidate or relink_dead or threshold):
+        raise click.UsageError(
+            "--reset, --revalidate, --relink-dead и --threshold — аптечные правила; у профиля "
+            f"{site_profile.PROFILE.name!r} своё сопоставление, запускай rematch без флагов."
+        )
     Session = storage.make_session()
+    _refuse_foreign_database(Session)
     # Запись прогона и сопоставление правят одни и те же строки товаров. Сбор
     # держит этот замок всю команду, а замок сопоставления — только на сам этап,
     # так что без проверки rematch шёл бы одновременно с записью прогона.
@@ -7685,6 +7704,7 @@ def validate_links_cmd(
         )
 
     Session = storage.make_session()
+    _refuse_foreign_database(Session)
     with Session() as session:
         q = select(storage.Product).where(storage.Product.site == site)
         if matched_only:
@@ -7745,6 +7765,7 @@ def validate_links_cmd(
 def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
     """Перегенерировать отчёт по существующему прогону."""
     Session = storage.make_session()
+    _refuse_foreign_database(Session)
     with Session() as session:
         run = None
         if run_id is None:
@@ -7848,8 +7869,16 @@ def catalog_group() -> None:
     help="Сайт, чей каталог лежит в файле.",
 )
 @click.option("--dry-run", is_flag=True, help="Прочитать файл и показать итог, ничего не записывая.")
+@click.option("--no-alerts", is_flag=True, help="Загрузить без рассылки алертов по этому прогону.")
+@click.option(
+    "--allow-shrink",
+    is_flag=True,
+    help="Принять файл, в котором заметно меньше товаров, чем в прошлой загрузке.",
+)
 @click.pass_context
-def catalog_import(ctx: click.Context, path: str, site: str, dry_run: bool) -> None:
+def catalog_import(
+    ctx: click.Context, path: str, site: str, dry_run: bool, no_alerts: bool, allow_shrink: bool
+) -> None:
     """Загрузить каталог сайта с ценами из файла CSV или XLSX.
 
     Файл идёт тем же путём, что ночной сбор: полный прогон сайта с проверкой
@@ -7877,13 +7906,38 @@ def catalog_import(ctx: click.Context, path: str, site: str, dry_run: bool) -> N
         click.echo(f"цены: от {min(priced):.2f} до {max(priced):.2f}")
     for product in catalog.products[:3]:
         click.echo(f"  {product.external_id}  {product.price}  {product.name[:70]}")
+    if catalog.ignored_columns:
+        click.echo("не прочитаны колонки: " + ", ".join(f"«{c}»" for c in catalog.ignored_columns))
     if dry_run:
-        click.echo("dry-run: ничего не записано")
+        click.echo("dry-run: ничего не записано; сравнение с прошлой загрузкой не делалось")
         return
 
     storage.init_db()
     Session = storage.make_session()
     with Session() as session:
+        # У файла нет внешнего знаменателя: сколько товаров на сайте на самом
+        # деле, он не говорит. Единственная мерка — прошлая принятая загрузка
+        # этого же сайта. Общая проверка прогона для этого не годится: она
+        # сравнивает с последним удачным прогоном любого сайта экземпляра.
+        previous_count = session.scalar(
+            select(storage.Run.products_scraped)
+            .where(
+                storage.Run.sites_completed == site,
+                storage.Run.catalog_scope == "full",
+                storage.Run.catalog_verified.is_(True),
+                storage.Run.status == "ok",
+            )
+            .order_by(storage.Run.id.desc())
+            .limit(1)
+        )
+        floor = catalog_file.MIN_FRACTION_OF_PREVIOUS
+        if previous_count and len(catalog.products) < previous_count * floor and not allow_shrink:
+            raise click.ClickException(
+                f"catalog import: в файле {len(catalog.products)} товаров, в прошлой принятой "
+                f"загрузке было {previous_count}. Меньше {floor:.0%} прежнего — скорее выгрузка "
+                "неполная; ничего не записано. Если каталог и правда сократился, повторить с "
+                "--allow-shrink"
+            )
         # У сайта из файла один «раздел» — сам файл.
         plan = site_routes.plan_route_sync(session, site, [catalog_file.FILE_ROUTE])
         site_routes.apply_route_sync(session, plan, allow_shrink=True)
@@ -7900,7 +7954,7 @@ def catalog_import(ctx: click.Context, path: str, site: str, dry_run: bool) -> N
             mode="auto",
             category_id=None,
             hourly=False,
-            no_alerts=False,
+            no_alerts=no_alerts,
             force=True,
             request_id=None,
         )
