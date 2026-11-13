@@ -279,7 +279,9 @@ class BakuElectronicsScraper(HttpCatalogScraper):
         total = one.get("total")
         if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
             return False
-        return total == two.get("total") and codes(one) == codes(two)
+        # Пустая первая страница при названном числе товаров — сломанный
+        # ответ, а не совпадение.
+        return total == two.get("total") and bool(codes(one)) and codes(one) == codes(two)
 
     async def _listing_page(self, category_slug: str, page: int) -> dict:
         """Одна страница списка раздела; ``PageFetchError``, если списка нет."""

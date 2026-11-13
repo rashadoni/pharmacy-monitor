@@ -1420,6 +1420,14 @@ async def test_bakuelectronics_discovery_keeps_a_top_section_that_only_shares_a_
     serve(scraper, be_menu_site(broken={"pets/dogs-cats"}))
     assert "dogs-cats" in await scraper.discover_categories()
 
+    # Оба адреса пусты или оба отдали пустую страницу при названном числе
+    # товаров: сравнивать нечего, совпадением это не считается.
+    empty = {"dogs-cats": [], "pets/dogs-cats": []}
+    for totals in ({}, {"dogs-cats": 5, "pets/dogs-cats": 5}):
+        scraper = fast(BakuElectronicsScraper)
+        serve(scraper, be_menu_site(listings=empty, totals=totals))
+        assert "dogs-cats" in await scraper.discover_categories()
+
     scraper = fast(BakuElectronicsScraper)
     serve(scraper, be_menu_site(broken={"dogs-cats"}))
     with pytest.raises(PageFetchError) as error:
