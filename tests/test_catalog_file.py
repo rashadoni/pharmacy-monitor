@@ -363,6 +363,34 @@ def test_file_much_smaller_than_the_last_accepted_one_is_refused(tmp_path):
     )
 
 
+def test_load_after_an_accepted_shrink_is_trusted(tmp_path):
+    # Каталог сократился втрое по слову человека. Следующая обычная загрузка
+    # того же размера обязана быть доверенной: мерка качества начинается с
+    # сокращённого каталога, а не с медианы прежних, больших.
+    header = GOOD_CSV.splitlines()[0] + "\n"
+    rows = [f"P{n};{n + 10};;https://kontakt.az/p{n};K{n};;\n" for n in range(20)]
+    base = ("electronics", "catalog", "import", "--site", "kontakt")
+    full = _write(tmp_path, header + "".join(rows), name="full.csv")
+    assert _cli(tmp_path, *base, str(full), "--no-alerts").returncode == 0
+    small = _write(tmp_path, header + "".join(rows[:6]), name="small.csv")
+    assert _cli(tmp_path, *base, str(small), "--allow-shrink", "--no-alerts").returncode == 0
+    again = _write(tmp_path, header + "".join(rows[:6]).replace(";10;", ";11;"), name="again.csv")
+    done = _cli(tmp_path, *base, str(again), "--no-alerts")
+    assert done.returncode == 0, (done.stdout + done.stderr)[-2000:]
+
+    runs = _db(tmp_path, "select status, products_scraped, run_quality from runs order by id")
+    assert [(status, products) for status, products, _ in runs] == [
+        ("ok", 20),
+        ("ok", 6),
+        ("ok", 6),
+    ]
+    assert [json.loads(quality)["financially_eligible"] for *_, quality in runs] == [
+        True,
+        True,
+        True,
+    ]
+
+
 def test_refused_file_writes_nothing(tmp_path):
     bad = _write(tmp_path, GOOD_CSV + "Broken;abc;;https://kontakt.az/x;TM-X;;\n")
     done = _cli(tmp_path, "electronics", "catalog", "import", "--site", "kontakt", str(bad))

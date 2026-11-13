@@ -59,6 +59,7 @@ _TYPE_WORDS = frozenset(
     qizdirici heater ventilyator blender mikser mixer toster toaster caydan kettle
     qehvebisiren epilyator trimmer britva ustelik desktop komputer computer
     router modem proyektor projector ve and yeni new
+    masini telefonu televizoru soyuducusu tozsorani qulaqligi konsolu notbuku planseti
     """.split()
 )
 
@@ -175,7 +176,16 @@ _NOISE = frozenset(
 # один сайт и не пишет другой («LED», «4K», «8 kq», «No Frost»).
 _CODE_PATH_NOISE = frozenset(
     "4k 8k led qled oled lcd nfc sm cm mm kq kg qr l litr dovr rpm no frost nofrost inverter "
-    "serie series class sinif tv".split()
+    "serie series class sinif tv ds simsiz wireless tizen webos crystal nanocell noise "
+    "cancelling intel core".split()
+)
+# Слова комплекта, состояния и аксессуара. Товар с таким словом и товар без
+# него — разные товары, даже когда заводской код один: приставка и приставка
+# с игрой, новый телефон и уценённый, ноутбук и адаптер «для» него. Поэтому
+# эти слова обязаны совпасть у обеих сторон, а не «не спорить».
+_MARKERS = frozenset(
+    "bundle ile with ucun for kit body dest komplekt set islenmis vitrin used refurbished "
+    "yenilenmis cexol case cover qoruyucu adapter kabel cable edition touch".split()
 )
 _BRANDS = frozenset(
     """
@@ -216,6 +226,11 @@ _TB_RE = re.compile(r"\b(\d)\s*tb\b")
 _RAM_RE = re.compile(r"\b(\d{1,2})\s*gb\s*(?:ram|ozu)\b|\bram\s*(\d{1,2})\s*gb\b")
 _SCREEN_RE = re.compile(r"""\b(\d{2,3})(?:[.,](\d))?\s*(?:"|''|”|inch|duym|dm)(?=\s|$)""")
 _PLUS_RE = re.compile(r"(?<=[0-9a-zа-яё])\+")
+# Отдельно стоящий «+» — комплект: «PlayStation 5 + FC 25».
+_BUNDLE_RE = re.compile(r"(?:^|\s)\+(?=\s|$)")
+# Хвост заводского кода после косой черты («WW80T4020CE/LP», «55PUS8108/12»):
+# регион или цвет, который пишут не все сайты.
+_CODE_TAIL_RE = re.compile(r"(?<=[0-9a-z]{5})/[0-9a-z]{1,3}(?=\s|$)")
 _TOKEN_RE = re.compile(r"[0-9a-zа-яё]+(?:[-.][0-9a-zа-яё]+)*")
 _NETWORK = frozenset({"4g", "5g", "3g", "lte"})
 # Характеристика, а не заводской код: процессор, ёмкость, мощность, класс
@@ -250,12 +265,17 @@ class Signature:
     def distinguishing(self) -> frozenset[str]:
         """Слова и цвета, которыми товары с одним кодом могут различаться.
 
-        Чисто числовые слова и слова из ``_CODE_PATH_NOISE`` не в счёт: их
-        дописывает один сайт и не пишет другой.
+        Слова из ``_CODE_PATH_NOISE`` не в счёт: их дописывает один сайт и не
+        пишет другой. Числа в счёт: «55 CU7100» и «65 CU7100» — разные товары,
+        когда «код» на деле обозначает серию.
         """
-        return frozenset(
-            word for word in self.words if not word.isdigit() and word not in _CODE_PATH_NOISE
-        ) | frozenset(f"colour:{colour}" for colour in self.colors)
+        return frozenset(word for word in self.words if word not in _CODE_PATH_NOISE) | frozenset(
+            f"colour:{colour}" for colour in self.colors
+        )
+
+    @property
+    def markers(self) -> frozenset[str]:
+        return frozenset(word for word in self.words if word in _MARKERS)
 
     @property
     def series_key(self) -> tuple | None:
@@ -320,6 +340,8 @@ def signature(name: str | None) -> Signature | None:
         text = _SCREEN_RE.sub(" ", text)
     # «S23+», «Pro+» — другая модель, чем «S23» и «Pro».
     text = _PLUS_RE.sub(" plus ", text)
+    text = _BUNDLE_RE.sub(" bundle ", text)
+    text = _CODE_TAIL_RE.sub(" ", text)
 
     tokens = [token.strip("-.") for token in _TOKEN_RE.findall(text)]
     tokens = [token for token in tokens if token]
@@ -382,6 +404,8 @@ def _same_product(a: Signature, b: Signature) -> str | None:
         if not (
             _agree(a.ram, b.ram) and _agree(a.storage, b.storage) and _agree(a.screen, b.screen)
         ):
+            return None
+        if a.markers != b.markers:
             return None
         if a.distinguishing - b.distinguishing and b.distinguishing - a.distinguishing:
             return None

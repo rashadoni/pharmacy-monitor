@@ -3343,6 +3343,9 @@ def run_quality_baselines_for_sites(
     baseline forever.
     """
     candidates: dict[str, list[int]] = {site: [] for site in sites}
+    # Сайт, у которого встретился прогон «каталог сократился по слову человека»:
+    # всё, что старше, для него меркой больше не служит.
+    reset: set[str] = set()
     recent = session.scalars(
         select(storage.Run)
         .where(
@@ -3358,6 +3361,8 @@ def run_quality_baselines_for_sites(
         quality = run.run_quality or {}
         per_site = run.products_per_site or {}
         for site in sites:
+            if site in reset:
+                continue
             if quality:
                 if not quality.get("financially_eligible"):
                     continue
@@ -3368,6 +3373,8 @@ def run_quality_baselines_for_sites(
             value = per_site.get(site)
             if isinstance(value, int) and value > 0:
                 candidates[site].append(value)
+                if site in (quality.get("baseline_reset_sites") or ()):
+                    reset.add(site)
         if all(len(values) >= 5 for values in candidates.values()):
             break
 
@@ -7980,6 +7987,20 @@ def catalog_import(
         _BASELINE_WAIVED_SITES.discard(site)
         if previous is not None:
             SCRAPER_CLASSES[site] = previous
+    if allow_shrink:
+        # Каталог сократился по слову человека: мерка качества следующих
+        # загрузок начинается с этой, а не с медианы прежних, больших. Иначе
+        # следующий обычный файл был бы принят, но рекомендации молча закрыты.
+        with Session() as session:
+            run = session.scalars(
+                select(storage.Run)
+                .where(storage.Run.sites_completed == site, storage.Run.status == "ok")
+                .order_by(storage.Run.id.desc())
+                .limit(1)
+            ).first()
+            if run is not None and storage.run_is_financially_eligible(run):
+                run.run_quality = {**(run.run_quality or {}), "baseline_reset_sites": [site]}
+                session.commit()
 
 
 @cli.group("routes")

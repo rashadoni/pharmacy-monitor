@@ -208,6 +208,65 @@ def test_model_code_is_found_whatever_surrounds_it():
             "Soyuducu Samsung RB34T600FSA Silver No Frost",
             em.STRATEGY_CODE,
         ),
+        # Третья охота разбора. Комплект, уценка, аксессуар под тем же кодом.
+        (
+            "Sony PlayStation 5 Slim CFI-2016A",
+            "Sony PlayStation 5 Slim CFI-2016A + EA Sports FC 25",
+            None,
+        ),
+        ("LG 55UR78006LK", "LG 55UR78006LK + LG SN5 soundbar", None),
+        ("Samsung UE55CU7100UXRU", "Samsung UE55CU7100UXRU divar kronşteyni ilə", None),
+        ("Sony ILCE-6400", "Sony ILCE-6400 Kit 16-50mm", None),
+        (
+            "Samsung Galaxy A55 SM-A556E 8/256GB Navy",
+            "Samsung Galaxy A55 SM-A556E 8/256GB Navy İşlənmiş",
+            None,
+        ),
+        (
+            "Samsung Galaxy A55 SM-A556E 8/256GB Navy",
+            "Samsung Galaxy A55 SM-A556E 8/256GB Navy Vitrin",
+            None,
+        ),
+        (
+            "Samsung Galaxy S24 SM-S921B 8/256GB",
+            "Samsung Galaxy S24 SM-S921B 8/256GB Enterprise Edition",
+            None,
+        ),
+        (
+            "Samsung Galaxy Tab S9 SM-X710 8/128GB",
+            "Samsung Galaxy Tab S9 SM-X710 8/128GB Keyboard Cover",
+            None,
+        ),
+        ("Lenovo IdeaPad 3 15IAU7 8/512GB", "Lenovo IdeaPad 3 15IAU7 8/512GB Touch", None),
+        ("Samsung Galaxy A55 SM-A556E 8/256GB", "Çexol Samsung Galaxy A55 SM-A556E üçün", None),
+        ("Noutbuk HP 15-fd0052nia", "HP 15-fd0052nia üçün adapter 65W", None),
+        (
+            "Sony PlayStation 5 Slim CFI-2016A + EA Sports FC 25",
+            "PlayStation 5 Slim CFI-2016A + FC 25 Sony",
+            em.STRATEGY_CODE,
+        ),
+        # Числа при совпавшем коде — в счёт, когда названы у обоих.
+        ("Samsung 55 CU7100 Crystal UHD", "Samsung 65 CU7100 Crystal UHD", None),
+        ("Philips 55 PUS8108", "Philips 65 PUS8108", None),
+        ("Lenovo IdeaPad 3 15IAU7", "Lenovo IdeaPad 5 15IAU7", None),
+        # Оба сайта дописали к коду своё описание — товар тот же.
+        (
+            "Paltaryuyan maşın Samsung WW80T4020CE/LP",
+            "Samsung WW80T4020CE 8 kq ağ",
+            em.STRATEGY_CODE,
+        ),
+        ("Paltaryuyan maşını Bosch WAN28282GC", "Bosch WAN28282GC Ağ", em.STRATEGY_CODE),
+        (
+            "Televizor Samsung UE55CU7100UXRU Crystal UHD",
+            "Samsung UE55CU7100UXRU Tizen Smart TV",
+            em.STRATEGY_CODE,
+        ),
+        ("LG 55UR78006LK NanoCell", "Televizor LG 55UR78006LK webOS", em.STRATEGY_CODE),
+        (
+            "Samsung Galaxy A55 5G SM-A556E 8/256GB Awesome Navy",
+            "Smartfon Samsung Galaxy A55 SM-A556E/DS 8/256GB Navy",
+            em.STRATEGY_CODE,
+        ),
         # Прописная «İ» не ломает бренд.
         ("İndesit IWSC 51051", "Indesit IWSC 51051", None),
     ],
