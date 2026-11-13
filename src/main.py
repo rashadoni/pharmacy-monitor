@@ -7824,6 +7824,82 @@ def report_cmd(run_id: int | None, send: bool, tenant_id: int) -> None:
 # ============================================================================
 
 
+@cli.group("catalog")
+def catalog_group() -> None:
+    """Каталог сайта из файла (сайты, которые сборщиком не читаются)."""
+
+
+@catalog_group.command("import")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--site",
+    "site",
+    required=True,
+    type=click.Choice(list(site_profile.IMPORTED_SITES)),
+    help="Сайт, чей каталог лежит в файле.",
+)
+@click.option("--dry-run", is_flag=True, help="Прочитать файл и показать итог, ничего не записывая.")
+@click.pass_context
+def catalog_import(ctx: click.Context, path: str, site: str, dry_run: bool) -> None:
+    """Загрузить каталог сайта с ценами из файла CSV или XLSX.
+
+    Файл идёт тем же путём, что ночной сбор: полный прогон сайта с проверкой
+    полноты, сопоставлением, алертами и рекомендациями. Файл с ошибками не
+    принимается вовсе — причины печатаются построчно.
+    """
+    from src import catalog_file, site_routes
+
+    try:
+        catalog = catalog_file.read_catalog_file(path, site)
+    except catalog_file.CatalogFileError as exc:
+        for problem in exc.problems:
+            click.echo(f"  {problem}")
+        raise click.ClickException(str(exc)) from exc
+
+    priced = [product.price for product in catalog.products if product.price is not None]
+    click.echo(
+        f"{site}: строк {catalog.rows_read}, товаров {len(catalog.products)}, "
+        f"повторов строк {catalog.duplicate_rows}, без цены {catalog.without_price}"
+    )
+    click.echo(
+        "колонки: " + ", ".join(f"{column} ← «{title}»" for column, title in catalog.columns.items())
+    )
+    if priced:
+        click.echo(f"цены: от {min(priced):.2f} до {max(priced):.2f}")
+    for product in catalog.products[:3]:
+        click.echo(f"  {product.external_id}  {product.price}  {product.name[:70]}")
+    if dry_run:
+        click.echo("dry-run: ничего не записано")
+        return
+
+    storage.init_db()
+    Session = storage.make_session()
+    with Session() as session:
+        # У сайта из файла один «раздел» — сам файл.
+        plan = site_routes.plan_route_sync(session, site, [catalog_file.FILE_ROUTE])
+        site_routes.apply_route_sync(session, plan, allow_shrink=True)
+        session.commit()
+
+    previous = SCRAPER_CLASSES.get(site)
+    SCRAPER_CLASSES[site] = catalog_file.file_scraper(site, catalog)
+    try:
+        ctx.invoke(
+            run_cmd,
+            dry_run=False,
+            limit=None,
+            site=(site,),
+            mode="auto",
+            category_id=None,
+            hourly=False,
+            no_alerts=False,
+            force=True,
+            request_id=None,
+        )
+    finally:
+        if previous is not None:
+            SCRAPER_CLASSES[site] = previous
+
+
 @cli.group("routes")
 def routes_group() -> None:
     """Разделы сайта для полного сбора (сайты без колонки в categories)."""
