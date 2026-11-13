@@ -6704,3 +6704,92 @@ def test_comparison_export_marks_out_of_stock(client, tenant_user, setup_db):
     assert row[8] is None
     assert "Pharmonline: нет в наличии" in row[9]
     assert sheet.cell(row=2, column=3).font.strike
+
+
+def test_comparison_drops_out_of_stock_rows_that_compare_nothing(client, tenant_user, setup_db):
+    from datetime import timedelta
+
+    s = setup_db
+    run = _search_run(s)
+    # Закончился у всех: сравнивать нечего.
+    _make_match_with_prices(
+        s, run, canonical="Gone everywhere", prices={"pharmonline": 10.0, "aptekonline": 8.0}
+    )
+    _mark_out_of_stock(s, "Gone everywhere", "pharmonline")
+    _mark_out_of_stock(s, "Gone everywhere", "aptekonline")
+    # Сайт давно не показывает товар: это «снят с продажи», а не «закончился».
+    _make_match_with_prices(
+        s,
+        run,
+        canonical="Delisted long ago",
+        prices={"pharmonline": 10.0, "aptekonline": 8.0, "aloe": 7.0},
+    )
+    _mark_out_of_stock(s, "Delisted long ago", "aloe")
+    old = s.scalars(
+        select(storage.Product).where(storage.Product.external_id == "aloe-Delisted long ago")
+    ).one()
+    old.last_seen_at = utcnow() - timedelta(days=60)
+    s.commit()
+    _login(client, tenant_user, s)
+
+    rows = client.get("/api/v1/dash/comparison").json()
+
+    assert [row["name"] for row in rows] == ["Delisted long ago"]
+    assert set(rows[0]["prices"]) == {"pharmonline", "aptekonline"}
+
+
+def test_comparison_out_of_stock_without_a_known_price(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_prices(
+        s, run, canonical="No last price", prices={"pharmonline": 10.0, "aptekonline": 8.0}
+    )
+    _mark_out_of_stock(s, "No last price", "aptekonline")
+    product = s.scalars(
+        select(storage.Product).where(storage.Product.external_id == "aptekonline-No last price")
+    ).one()
+    s.execute(
+        storage.PriceSnapshot.__table__.delete().where(
+            storage.PriceSnapshot.product_id == product.id
+        )
+    )
+    s.commit()
+    _login(client, tenant_user, s)
+
+    (row,) = client.get("/api/v1/dash/comparison").json()
+    sheet = _load_export(client.get("/api/v1/dash/comparison/export.xlsx")).worksheets[1]
+
+    assert row["prices"]["aptekonline"] == row["prices"]["aptekonline"] | {
+        "price": None,
+        "out_of_stock": True,
+    }
+    # В файле вместо цены — слова, строка не роняет выгрузку.
+    assert [cell.value for cell in sheet[2]][2:4] == [10.0, "нет в наличии"]
+
+
+def test_comparison_export_follows_the_stock_filter(client, tenant_user, setup_db):
+    s = setup_db
+    run = _search_run(s)
+    _make_match_with_prices(
+        s, run, canonical="Rival ran out", prices={"pharmonline": 10.0, "aptekonline": 8.0}
+    )
+    _mark_out_of_stock(s, "Rival ran out", "aptekonline")
+    _make_match_with_prices(
+        s, run, canonical="Own ran out", prices={"pharmonline": 10.0, "aptekonline": 8.0}
+    )
+    _mark_out_of_stock(s, "Own ran out", "pharmonline")
+    _make_match_with_prices(
+        s, run, canonical="Both sell", prices={"pharmonline": 10.0, "aptekonline": 8.0}
+    )
+    _login(client, tenant_user, s)
+
+    def names(query: str) -> list[str]:
+        wb = _load_export(client.get(f"/api/v1/dash/comparison/export.xlsx?{query}"))
+        return sorted(row[0] for row in wb.worksheets[1].iter_rows(min_row=2, values_only=True))
+
+    assert names("") == ["Both sell", "Own ran out", "Rival ran out"]
+    assert names("stock=rival") == ["Rival ran out"]
+    assert names("stock=own") == ["Own ran out"]
+    # Глазами конкурента «свой» и «чужой» меняются местами.
+    assert names("stock=rival&client_site=aptekonline") == ["Own ran out"]
+    assert client.get("/api/v1/dash/comparison/export.xlsx?stock=zzz").status_code == 400

@@ -204,8 +204,11 @@ export default function ComparisonPage() {
           (Math.abs(a.spread_pct ?? 0) - Math.abs(b.spread_pct ?? 0)) * dir
         );
       // per-site price: отсутствующая цена всегда внизу, независимо от dir
-      const av = a.prices[sortKey]?.price;
-      const bv = b.prices[sortKey]?.price;
+      // «Нет в наличии» — последняя известная цена, не действующая: внизу.
+      const ap = a.prices[sortKey];
+      const bp = b.prices[sortKey];
+      const av = ap?.out_of_stock ? null : ap?.price;
+      const bv = bp?.out_of_stock ? null : bp?.price;
       if (av == null && bv == null) return 0;
       if (av == null) return 1;
       if (bv == null) return -1;
@@ -273,6 +276,7 @@ export default function ComparisonPage() {
         diff_only: diffOnly,
         locale,
         client_site: viewerSite,
+        stock: stockFilter ?? undefined,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");

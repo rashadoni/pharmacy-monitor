@@ -216,6 +216,32 @@ def _comparable(entry: dict[str, Any]) -> bool:
     return not entry.get("stale") and not entry.get("out_of_stock")
 
 
+STOCK_FILTERS = ("rival", "own")
+
+
+def matches_stock_filter(row: dict[str, Any], mode: str, client_site: str = CLIENT_SITE) -> bool:
+    """Фильтр «Наличие» страницы сравнения — то же правило для файла.
+
+    `rival` — у своего магазина товар продаётся, у кого-то из конкурентов
+    закончился; `own` — закончился у своего, у кого-то из конкурентов есть.
+    """
+    own = row["prices"].get(client_site)
+    rivals = [entry for site, entry in row["prices"].items() if site != client_site]
+    if mode == "rival":
+        return (
+            own is not None
+            and not own.get("out_of_stock")
+            and any(entry.get("out_of_stock") for entry in rivals)
+        )
+    if mode == "own":
+        return (
+            own is not None
+            and bool(own.get("out_of_stock"))
+            and any(not entry.get("out_of_stock") for entry in rivals)
+        )
+    raise ValueError(f"unknown stock filter: {mode!r}")
+
+
 def _compared_value(row: dict[str, Any], entry: dict[str, Any]) -> float:
     if row.get("spread_basis") == "unit" and entry.get("unit_price") is not None:
         return entry["unit_price"]
@@ -389,16 +415,14 @@ def _write_sheet(
             else:
                 cell = ws.cell(row=index, column=price_col[site], value=round(entry["price"], 2))
                 cell.number_format = _MONEY
-            if entry.get("price") is None:
-                pass
-            elif not _comparable(entry):
-                cell.font = _STALE_FONT
-            elif differs:
-                value = _compared_value(row, entry)
-                if value == row["min_price"]:
-                    cell.font = _LOW_FONT
-                elif value == row["max_price"]:
-                    cell.font = _HIGH_FONT
+                if not _comparable(entry):
+                    cell.font = _STALE_FONT
+                elif differs:
+                    value = _compared_value(row, entry)
+                    if value == row["min_price"]:
+                        cell.font = _LOW_FONT
+                    elif value == row["max_price"]:
+                        cell.font = _HIGH_FONT
             url = entry.get("url") or ""
             if url.startswith(("http://", "https://")) and not ILLEGAL_CHARACTERS_RE.search(url):
                 link = ws.cell(row=index, column=link_col[site], value=SITE_TITLES[site])

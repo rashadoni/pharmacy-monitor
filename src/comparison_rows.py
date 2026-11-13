@@ -366,6 +366,10 @@ def _comparison_rows(
         prices: dict[str, dict[str, Any]] = {}
         # Нет в наличии: в расчёт не идут, в строку возвращаются после него.
         unavailable: dict[str, dict[str, Any]] = {}
+        # Сайты, у которых в кластере есть товар в продаже — даже если его
+        # цена потом не вошла в строку (выброс, нет цены): про такой сайт
+        # «нет в наличии» не пишем.
+        selling_sites: set[str] = set()
         for p in products:
             # «Фантомные» товары (страница 404, помечены validate-links) — скрываем,
             # чтобы не показывать матч с мёртвой ссылкой на конкурента.
@@ -373,7 +377,12 @@ def _comparison_rows(
                 continue
             offer = policy_offer_eligibility(p, now=now)
             if not offer.eligible:
-                if include_unavailable and offer.reason == "out_of_stock":
+                age_days = _price_age_days(now, p.last_seen_at)
+                # Товар, которого сайт давно не показывает, — снят с продажи, а
+                # не «закончился»: в строке ему не место (тот же срок, после
+                # которого цена считается устаревшей).
+                listed_recently = age_days is None or age_days <= _COMPARISON_STALE_DAYS
+                if include_unavailable and offer.reason == "out_of_stock" and listed_recently:
                     latest = prices_by_pid.get(p.id)
                     last_price = (latest[1] or latest[0]) if latest else None
                     unavailable[p.site] = {
@@ -387,11 +396,12 @@ def _comparison_rows(
                         "availability_status": p.offer_availability_status,
                         "availability_observed_at": p.availability_observed_at,
                         "pack_size": p.pack_size,
-                        "age_days": _price_age_days(now, p.last_seen_at),
+                        "age_days": age_days,
                         "stale": False,
                         "out_of_stock": True,
                     }
                 continue
+            selling_sites.add(p.site)
             latest = prices_by_pid.get(p.id)
             price = (latest[1] or latest[0]) if latest else None
             if price is not None and price > 0:
@@ -426,10 +436,13 @@ def _comparison_rows(
         # Сайт, где товар есть в продаже, главнее записи «нет в наличии» того
         # же сайта (старый дубль в кластере).
         for site, entry in unavailable.items():
-            prices.setdefault(site, entry)
+            if site not in selling_sites:
+                prices.setdefault(site, entry)
         # Строку держат и сайты, где товар закончился: иначе «у конкурента нет
-        # в наличии» пропадало бы со страницы вместе с товаром.
-        if len(prices) < min_sites:
+        # в наличии» пропадало бы со страницы вместе с товаром. Но хотя бы у
+        # одного сайта товар должен продаваться — строка, где он закончился у
+        # всех, ничего не сравнивает.
+        if sites_with_price == 0 or len(prices) < min_sites:
             continue
         if site_filter and site_filter not in prices:
             continue
