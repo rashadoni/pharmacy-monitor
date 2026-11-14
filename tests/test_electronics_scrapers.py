@@ -1872,6 +1872,52 @@ def test_irshad_price_block_of_a_colour_the_site_does_not_offer_is_skipped():
     assert (failures, unlisted) == (0, ["108719"])
 
 
+def _irshad_card_with_a_colour_left_off_the_switches() -> tuple[str, str]:
+    """Карточка, где у скрытого цвета 108719 нет переключателя, а у остальных есть."""
+    import re
+
+    product_id, card = split_cards(IRSHAD_PAGE)[2]
+    trimmed, count = re.subn(r'<input\s+type="radio"[^>]*value="108719"[^>]*>', "", card)
+    assert count == 1
+    return product_id, trimmed
+
+
+def test_irshad_hidden_colour_without_its_own_switch_is_skipped():
+    # Живой случай 2026-11-14: у карточки чехлов iPhone 105983 пять
+    # переключателей цвета и шесть блоков с ценой; скрытый блок 105988
+    # переключателя не имеет — сайт этот цвет не показывает. Раздел телефонов
+    # из-за четырёх таких карточек был неполон при каждом сборе.
+    product_id, card = _irshad_card_with_a_colour_left_off_the_switches()
+    unlisted: list[str] = []
+    products, failures = build_products(product_id, card, "c", unlisted)
+    assert [p.external_id for p in products] == ["85759"]
+    assert (failures, unlisted) == (0, ["108719"])
+
+
+def test_irshad_hidden_colour_is_a_failure_when_some_switch_is_unreadable():
+    # Переключатель без номера мог быть переключателем этого цвета.
+    product_id, card = _irshad_card_with_a_colour_left_off_the_switches()
+    card = card.replace('value="85759"', 'value=""', 1)
+    unlisted: list[str] = []
+    _, failures = build_products(product_id, card, "c", unlisted)
+    assert (failures, unlisted) == (1, [])
+
+
+def test_irshad_shown_block_without_its_own_switch_is_still_a_failure():
+    product_id, card = _irshad_card_with_a_colour_left_off_the_switches()
+    card = card.replace(
+        'class="product__flex-right " data-selected-id="85759"',
+        'class="product__flex-right  d-none " data-selected-id="85759"',
+    ).replace(
+        'class="product__flex-right  d-none " data-selected-id="108719"',
+        'class="product__flex-right " data-selected-id="108719"',
+    )
+    card = card.replace('class="product__name product-link"', 'class="product__name"')
+    unlisted: list[str] = []
+    _, failures = build_products(product_id, card, "c", unlisted)
+    assert failures == 1
+
+
 def test_irshad_card_title_belongs_to_the_block_the_site_shows():
     # Живой случай 2026-11-13: у карточки 108447 виден блок 108435, а блок с
     # номером самой карточки скрыт. Название и адрес из шапки — товара видимого

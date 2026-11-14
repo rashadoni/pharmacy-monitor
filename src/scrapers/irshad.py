@@ -155,8 +155,16 @@ def build_products(
     переключателя у него нет, открыть его покупателю нечем (замер 2026-11-13,
     MacBook в разделе ноутбуков: у карточки 108447 виден блок 108435 с
     названием из шапки, блок 108447 скрыт и безымянен). Номера пропущенных
-    блоков складываются в ``unlisted``. Видимый блок и предложение при
-    непустом списке цветов по-прежнему обязаны опознаться.
+    блоков складываются в ``unlisted``.
+
+    То же со скрытым блоком, у которого нет своего переключателя, когда у
+    остальных цветов карточки переключатели есть и все читаются: такой цвет
+    сайт тоже не показывает (замер 2026-11-14, чехлы iPhone в разделе
+    телефонов: у карточки 105983 пять переключателей и шесть блоков, блок
+    105988 скрыт и безымянен; так у четырёх карточек раздела, и раздел из-за
+    них был неполон при каждом сборе). Переключатель, у которого номер не
+    читается, мог принадлежать этому блоку — тогда это отказ. Видимый блок и
+    предложение со своим переключателем по-прежнему обязаны опознаться.
     """
     # Кто есть кто: номер товара -> (адрес, название, картинка).
     identities: dict[str, tuple[str, str, str | None]] = {}
@@ -174,9 +182,13 @@ def build_products(
             _text(link.group(2)),
             html_lib.unescape(image.group(1)) if image else None,
         )
+    # Номера всех переключателей цвета; None — переключатель есть, номер не читается.
+    switch_ids: set[str | None] = set()
     for raw_input in _COLOR_INPUT_RE.findall(card_html):
         attrs = dict(_ATTR_RE.findall(raw_input))
         variant_id = attrs.get("value", "")
+        if attrs.get("name", "").startswith("color_"):
+            switch_ids.add(variant_id if variant_id.isdigit() else None)
         url = html_lib.unescape(attrs.get("data-url", "")).strip()
         title = _text(attrs.get("data-title"))
         if variant_id.isdigit() and url and title:
@@ -186,22 +198,28 @@ def build_products(
     blocks = [
         (
             match.group(2),
+            "d-none" in match.group(1).split(),
             card_html[
                 match.start() : opens[i + 1].start() if i + 1 < len(opens) else len(card_html)
             ],
         )
         for i, match in enumerate(opens)
-    ] or [(product_id, card_html)]
+    ] or [(product_id, False, card_html)]
 
     product_type = _text((_TYPE_RE.search(card_html) or [None, None])[1])
     color_lists = _COLORS_LIST_RE.findall(card_html)
     no_colors_offered = bool(color_lists) and not any(body.strip() for body in color_lists)
     products: list[ScrapedProduct] = []
     failures = 0
-    for offer_id, block_html in blocks:
+    for offer_id, hidden, block_html in blocks:
         identity = identities.get(offer_id)
         if identity is None or not identity[0] or not identity[1]:
-            if identity is None and offer_id != shown_id and no_colors_offered:
+            has_no_switch = offer_id not in switch_ids and None not in switch_ids
+            if (
+                identity is None
+                and offer_id != shown_id
+                and (no_colors_offered or (hidden and has_no_switch))
+            ):
                 if unlisted is not None:
                     unlisted.append(offer_id)
                 continue
