@@ -10,7 +10,9 @@ import { api, friendlyError } from "@/lib/api";
 /**
  * Quick Actions dropdown в углу sidebar / страниц. Admin-only действия которые
  * раньше требовали SSH на прод:
- *   - Запустить scan сейчас (через scrape-request очередь)
+ *   - Запустить scan сейчас (через scrape-request очередь) — aptekonline и aloe:
+ *     pharmonline на сервере собирает только ночной сбор через публичный API,
+ *     сбор категорий его не берёт (`_sites_without_pharmonline_catalog_scan`)
  *   - Отправить тестовое утреннее письмо — только нажавшему (ключ текста
  *     `all_subscribers` назван по прежнему поведению: письмо шло всем подписанным)
  */
@@ -77,7 +79,7 @@ export function QuickActions() {
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium">{t("scrape_title")}</div>
                 <div className="text-xs text-muted-foreground">
-                  {t("all_sites")} · {scrapeMut.isPending ? t("starting") : t("now")}
+                  {t("scrape_sites")} · {scrapeMut.isPending ? t("starting") : t("now")}
                 </div>
               </div>
             </DropdownMenu.Item>
