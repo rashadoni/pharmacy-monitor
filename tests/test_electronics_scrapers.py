@@ -1872,12 +1872,17 @@ def test_irshad_price_block_of_a_colour_the_site_does_not_offer_is_skipped():
     assert (failures, unlisted) == (0, ["108719"])
 
 
+def _switch_item_re(offer_id: str) -> str:
+    """Пункт списка цветов (``<li>``) с переключателем этого предложения."""
+    return rf'<li>(?:(?!</li>).)*?value="{offer_id}"(?:(?!</li>).)*?</li>'
+
+
 def _irshad_card_with_a_colour_left_off_the_switches() -> tuple[str, str]:
     """Карточка, где у скрытого цвета 108719 нет переключателя, а у остальных есть."""
     import re
 
     product_id, card = split_cards(IRSHAD_PAGE)[2]
-    trimmed, count = re.subn(r'<input\s+type="radio"[^>]*value="108719"[^>]*>', "", card)
+    trimmed, count = re.subn(_switch_item_re("108719"), "", card, flags=re.DOTALL)
     assert count == 1
     return product_id, trimmed
 
@@ -1901,6 +1906,33 @@ def test_irshad_hidden_colour_is_a_failure_when_some_switch_is_unreadable():
     unlisted: list[str] = []
     _, failures = build_products(product_id, card, "c", unlisted)
     assert (failures, unlisted) == (1, [])
+
+
+def test_irshad_hidden_colour_is_a_failure_when_switches_are_not_recognised():
+    # Сменилась вёрстка переключателей: список цветов есть, переключателей
+    # разбор не видит — скрытый безымянный цвет отказ, а не «не показанный».
+    product_id, card = _irshad_card_with_a_colour_left_off_the_switches()
+    card = card.replace('type="radio"', 'type="radio-v2"')
+    unlisted: list[str] = []
+    _, failures = build_products(product_id, card, "c", unlisted)
+    assert (failures, unlisted) == (1, [])
+
+
+def test_irshad_card_number_block_hidden_without_switch_is_a_failure():
+    import re
+
+    # Видимого блока нет: шапка названа номером карточки, и её скрытый блок
+    # без переключателя и названия — отказ, а не непоказанный цвет.
+    product_id, card = _irshad_card_with_a_colour_left_off_the_switches()
+    card = card.replace(
+        'class="product__flex-right " data-selected-id="85759"',
+        'class="product__flex-right  d-none " data-selected-id="85759"',
+    )
+    card = card.replace('class="product__name product-link"', 'class="product__name"')
+    card = re.sub(_switch_item_re("85759"), "", card, flags=re.DOTALL)
+    unlisted: list[str] = []
+    _, failures = build_products(product_id, card, "c", unlisted)
+    assert failures == 1
 
 
 def test_irshad_shown_block_without_its_own_switch_is_still_a_failure():
