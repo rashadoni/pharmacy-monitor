@@ -929,11 +929,20 @@
     "empty": "Nothing found",
     "more": "Show more",
     "shown": "Showing {shown} of {total}",
-    "matching_note": "Wolt gives no barcodes: products are matched by name, dose and pack size. If a pharmacy has two products under one name, its price is not shown in the row.",
     "error": "Could not load the comparison",
     "loading": "Loading the comparison…",
     "retry": "Retry",
     "price_label": "{venue}: {name} — {price}, opens in a new tab",
-    "updating": "updating…"
+    "updating": "updating…",
+    "how_title": "How the comparison works",
+    "how_collect": "Pharmacy catalogs are collected from Wolt every day at {time} Baku time — in full, with all prices and discounts.",
+    "how_match": "The same product is recognised by name, dose and pack size (Wolt gives no barcodes). A product sold by only one pharmacy is not shown here — there is nothing to compare it with.",
+    "pairs_title": "Products shared by each pair of pharmacies",
+    "pair_name": "{a} and {b}",
+    "pair_common": "{n, plural, one {# shared product} other {# shared products}}",
+    "pair_all_same": "all prices are the same",
+    "pair_same": "same price: {n}",
+    "pair_cheaper": "cheaper at {venue}: {n}",
+    "only_diff_count": "Only with different prices ({differ} of {rows})"
   }
 }

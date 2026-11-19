@@ -1029,10 +1029,21 @@ export type WoltRow = {
   cheapest: string[];
 };
 
+export type WoltPair = {
+  a: string;
+  b: string;
+  common: number;
+  same_price: number;
+  a_cheaper: number;
+  b_cheaper: number;
+};
+
 export type WoltComparison = {
   venues: WoltVenue[];
   rows: WoltRow[];
   totals: { rows: number; differ: number; all_venues: number; suspicious: number };
+  pairs: WoltPair[];
+  daily_sync_baku: string;
 };
 
 export const api = {

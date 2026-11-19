@@ -5,7 +5,13 @@ import { ExternalLink, ShoppingBag } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useEffect, useState } from "react";
 import { QueryErrorState } from "@/components/query-error-state";
-import { api, type WoltOfferPrice, type WoltRow, type WoltVenue } from "@/lib/api";
+import {
+  api,
+  type WoltComparison,
+  type WoltOfferPrice,
+  type WoltRow,
+  type WoltVenue,
+} from "@/lib/api";
 import { cn, formatPrice, formatRelative } from "@/lib/utils";
 
 // Строк бывает ~1 400 — рисуем частями.
@@ -52,6 +58,8 @@ export default function WoltPage() {
         ))}
       </div>
 
+      {data && <HowItWorks data={data} />}
+
       {data && (
         <div className="space-y-1 text-sm">
           <p>
@@ -64,7 +72,6 @@ export default function WoltPage() {
           {data.totals.suspicious > 0 && (
             <p className="text-muted-foreground">{t("suspicious", { n: data.totals.suspicious })}</p>
           )}
-          <p className="text-xs text-muted-foreground">{t("matching_note")}</p>
         </div>
       )}
 
@@ -91,7 +98,9 @@ export default function WoltPage() {
             }}
             className="h-4 w-4"
           />
-          {t("only_diff")}
+          {data
+            ? t("only_diff_count", { differ: data.totals.differ, rows: data.totals.rows })
+            : t("only_diff")}
         </label>
       </div>
 
@@ -186,6 +195,43 @@ export default function WoltPage() {
         </div>
       )}
     </div>
+  );
+}
+
+function HowItWorks({ data }: { data: WoltComparison }) {
+  const t = useTranslations("wolt");
+  const titles = Object.fromEntries(data.venues.map((venue) => [venue.venue, venue.title]));
+  return (
+    <section className="space-y-3 rounded-md border border-border bg-secondary/30 p-4 text-sm">
+      <h2 className="font-semibold">{t("how_title")}</h2>
+      <p>{t("how_collect", { time: data.daily_sync_baku })}</p>
+      <p>{t("how_match")}</p>
+      <div>
+        <h3 className="mb-2 font-medium">{t("pairs_title")}</h3>
+        <ul className="grid grid-cols-1 gap-2 md:grid-cols-3">
+          {data.pairs.map((pair) => {
+            const a = titles[pair.a] ?? pair.a;
+            const b = titles[pair.b] ?? pair.b;
+            const differ = pair.a_cheaper + pair.b_cheaper;
+            return (
+              <li key={`${pair.a}|${pair.b}`} className="rounded-md border border-border bg-background p-3">
+                <div className="font-medium">{t("pair_name", { a, b })}</div>
+                <div className="mt-1 text-muted-foreground">{t("pair_common", { n: pair.common })}</div>
+                {pair.common > 0 && differ === 0 ? (
+                  <div className="mt-1">{t("pair_all_same")}</div>
+                ) : (
+                  <ul className="mt-1 space-y-0.5">
+                    <li>{t("pair_same", { n: pair.same_price })}</li>
+                    <li>{t("pair_cheaper", { venue: a, n: pair.a_cheaper })}</li>
+                    <li>{t("pair_cheaper", { venue: b, n: pair.b_cheaper })}</li>
+                  </ul>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    </section>
   );
 }
 

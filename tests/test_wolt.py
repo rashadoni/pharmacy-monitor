@@ -549,3 +549,50 @@ def test_allow_shrink_needs_a_venue():
 
     assert result.exit_code != 0
     assert "--allow-shrink needs --venue" in result.output
+
+
+# ─── Пояснения для клиента ──────────────────────────────────────────────────
+
+
+def test_pair_summary_explains_why_few_prices_differ(db_session):
+    _seed(
+        db_session,
+        _item(BUTA, "1", "Novofan №60 Tabletlər", 55.8),
+        _item(ALOE, "2", "Novofan №60 Tabletlər", 55.8),
+        _item(KANON, "3", "Novofan N60", 59.2),
+        _item(BUTA, "4", "Keratodrop 10 ml", 17.0),
+        _item(ALOE, "5", "Keratodrop 10 ml", 17.0),
+        _item(ALOE, "6", "Concor 5 mq № 30", 13.0),
+        _item(KANON, "7", "Concor 5 mq N30", 12.0),
+    )
+
+    pairs = {(p["a"], p["b"]): p for p in wolt.comparison(db_session)["pairs"]}
+
+    assert pairs[(BUTA, ALOE)] == {
+        "a": BUTA,
+        "b": ALOE,
+        "common": 2,
+        "same_price": 2,
+        "a_cheaper": 0,
+        "b_cheaper": 0,
+    }
+    assert pairs[(ALOE, KANON)]["common"] == 2
+    assert (pairs[(ALOE, KANON)]["a_cheaper"], pairs[(ALOE, KANON)]["b_cheaper"]) == (1, 1)
+    assert pairs[(BUTA, KANON)]["a_cheaper"] == 1
+
+
+def test_out_of_stock_items_are_not_counted_in_pairs(db_session):
+    gone = _item(KANON, "2", "Keratodrop 10 ml", 18.0)
+    gone.in_stock = False
+    _seed(db_session, _item(BUTA, "1", "Keratodrop 10 ml", 17.0), gone)
+
+    pairs = {(p["a"], p["b"]): p for p in wolt.comparison(db_session)["pairs"]}
+
+    assert pairs[(BUTA, KANON)]["common"] == 0
+
+
+def test_announced_time_matches_the_timer():
+    from pathlib import Path
+
+    timer = Path("infra/systemd/pharmacy-monitor-wolt.timer").read_text()
+    assert f"OnCalendar=*-*-* {wolt.DAILY_SYNC_UTC_HOUR:02d}:00:00 UTC" in timer
