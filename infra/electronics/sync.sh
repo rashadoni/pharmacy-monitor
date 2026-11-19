@@ -137,12 +137,13 @@ else
 fi
 
 # --- проверка ----------------------------------------------------------------
-for _ in $(seq 1 20); do
+# Старт API занимает до ~27 с (замер аптечного прода 2026-11-19): ждём две минуты.
+for _ in $(seq 1 60); do
     if curl -fsS -o /dev/null "http://127.0.0.1:$API_PORT/health"; then
         echo "sync: API отвечает"
         exit 0
     fi
     sleep 2
 done
-echo "sync: API не отвечает на /health за 40 секунд — journalctl -u electro-monitor-api" >&2
+echo "sync: API не отвечает на /health за 2 минуты — journalctl -u electro-monitor-api" >&2
 exit 1

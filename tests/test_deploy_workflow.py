@@ -1542,6 +1542,39 @@ def test_dead_api_fails_the_health_check(pending_migration: Sandbox, api: str) -
     assert result.step(CLEANUP).returncode == 0
 
 
+def test_health_check_waits_longer_than_the_api_takes_to_start(
+    pending_migration: Sandbox,
+) -> None:
+    """Старт API на проде занимает до ~27 с (замер 2026-11-19): ждать с запасом."""
+    sandbox = pending_migration
+
+    result = run_workflow(sandbox, apply_migrations=True)
+
+    assert result.failed_step is None, result.describe()
+    (api_call,) = [
+        event["argv"]
+        for event in sandbox.events()
+        if event["kind"] == "curl" and any(":8080/health" in arg for arg in event["argv"])
+    ]
+    for flag in (
+        "--retry-connrefused",
+        "--retry",
+        "--retry-delay",
+        "--retry-max-time",
+        "--max-time",
+    ):
+        assert flag in api_call, f"{flag} missing from {api_call}"
+    max_time = int(api_call[api_call.index("--retry-max-time") + 1])
+    retries = int(api_call[api_call.index("--retry") + 1])
+    delay = int(api_call[api_call.index("--retry-delay") + 1])
+    attempt_time = int(api_call[api_call.index("--max-time") + 1])
+    # Окно с запасом против замеренных 27 с, но мёртвый API не ждём вечно.
+    assert 60 <= max_time <= 300
+    assert attempt_time < max_time
+    # Ограничивает время, а не число попыток (отказ соединения мгновенный).
+    assert retries * delay >= max_time
+
+
 def test_stand_refuses_a_workflow_key_it_does_not_execute(
     pending_migration: Sandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
