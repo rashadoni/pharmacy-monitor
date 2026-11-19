@@ -3417,6 +3417,28 @@ def dash_price_index(
     ]
 
 
+@app.get("/api/v1/dash/wolt/comparison")
+def dash_wolt_comparison(
+    search: str | None = None,
+    only_diff: bool = False,
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Аптеки на Wolt: один и тот же товар в разных аптеках и его цены.
+
+    Отдельный раздел (src/wolt.py): данные лежат в своих таблицах и не зависят
+    от доверенных цен и эпохи каталога сайтов. Есть только у аптечного
+    экземпляра.
+    """
+    from src import wolt
+
+    if not site_profile.is_pharmacy():
+        raise HTTPException(status_code=404, detail="not available in this instance")
+    if search is not None and len(search) > 200:
+        raise HTTPException(status_code=422, detail="search is too long")
+    return wolt.comparison(db, search=search, only_diff=only_diff)
+
+
 @app.get("/api/v1/dash/category-comparison", response_model=list[CategoryComparisonOut])
 def dash_category_comparison(
     client_site: str = site_profile.CLIENT_SITE,

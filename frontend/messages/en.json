@@ -19,7 +19,8 @@
     "section_settings": "Settings",
     "category_comparison": "Category comparison",
     "category_comparison_short": "Categories",
-    "more": "More"
+    "more": "More",
+    "wolt": "Wolt pharmacies"
   },
   "common": {
     "loading": "Loading…",
@@ -909,5 +910,26 @@
     "listing_rows_unit": "{count, plural, one {listing row} other {listing rows}}",
     "hint": "A product listed in several categories of the site appears in the listing once per category. The main number counts distinct products.",
     "hint_legacy": "Distinct products were not recorded for this run: these are listing rows, and a product listed in several categories is counted several times."
+  },
+  "wolt": {
+    "title": "Pharmacies on Wolt",
+    "subtitle": "The same product in pharmacies on Wolt and its price in each. Separate from the site comparison: own data, own daily collection.",
+    "items": "{n} products",
+    "updated": "updated {when}",
+    "never": "not collected yet",
+    "failed": "last collection failed",
+    "totals": "Products in at least two pharmacies: {rows}. Price differs: {differ}. In all three: {all}.",
+    "suspicious": "{n} hidden: prices differ more than threefold — most likely a different pack size.",
+    "search": "Search by name",
+    "only_diff": "Only with different prices",
+    "product": "Product",
+    "spread": "Difference",
+    "out_of_stock": "out of stock",
+    "cheapest": "cheapest",
+    "empty": "Nothing found",
+    "more": "Show more",
+    "shown": "Showing {shown} of {total}",
+    "matching_note": "Wolt gives no barcodes: products are matched by name, dose and pack size. If a pharmacy has two products under one name, its price is not shown in the row.",
+    "error": "Could not load the comparison"
   }
 }

@@ -1003,6 +1003,38 @@ export interface SystemStatus extends Health {
   };
 }
 
+export type WoltVenue = {
+  venue: string;
+  title: string;
+  url: string;
+  items: number;
+  last_status: "ok" | "failed" | "running" | null;
+  last_ok_at: string | null;
+};
+
+export type WoltOfferPrice = {
+  price: number;
+  original_price: number | null;
+  in_stock: boolean;
+  name: string;
+  url: string;
+};
+
+export type WoltRow = {
+  name: string;
+  prices: Record<string, WoltOfferPrice>;
+  min_price: number;
+  max_price: number;
+  spread_pct: number;
+  cheapest: string[];
+};
+
+export type WoltComparison = {
+  venues: WoltVenue[];
+  rows: WoltRow[];
+  totals: { rows: number; differ: number; all_venues: number; suspicious: number };
+};
+
 export const api = {
   // Auth
   authRequest: (email: string) =>
@@ -1337,6 +1369,13 @@ export const api = {
   },
   forecastMovers: () =>
     request<ForecastMover[]>("/api/v1/dash/forecast/movers"),
+  woltComparison: (search: string, onlyDiff: boolean) => {
+    const q = new URLSearchParams();
+    if (search.trim()) q.set("search", search.trim());
+    if (onlyDiff) q.set("only_diff", "true");
+    const qs = q.toString();
+    return request<WoltComparison>(`/api/v1/dash/wolt/comparison${qs ? `?${qs}` : ""}`);
+  },
   categoryComparison: (client_site?: string, locale?: string) => {
     const q = new URLSearchParams();
     if (client_site) q.set("client_site", client_site);

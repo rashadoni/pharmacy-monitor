@@ -882,6 +882,50 @@ class Category(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class WoltItem(Base):
+    """Товар аптеки на Wolt — отдельный раздел аптечного дашборда (2026-11-19).
+
+    Аптеки Wolt живут в своих таблицах намеренно, а не в ``products``: они не
+    сайты профиля, и всё, что читает каталог сайтов (доверенные цены, эпоха,
+    утреннее письмо, алерты, сопоставление pharmonline), их видеть не должно.
+    Строка — товар одной аптеки (``venue`` — слаг заведения на Wolt,
+    ``item_id`` — номер товара Wolt). Цена — текущая; когда она менялась
+    последний раз, видно по ``price_changed_at``. Товар, которого полный сбор
+    аптеки больше не видит, не удаляется: ``in_catalog`` становится false.
+    """
+
+    __tablename__ = "wolt_items"
+    __table_args__ = (UniqueConstraint("venue", "item_id", name="uq_wolt_items_venue_item"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    venue: Mapped[str] = mapped_column(String(100), index=True)
+    item_id: Mapped[str] = mapped_column(String(64))
+    name: Mapped[str] = mapped_column(String(500))
+    price: Mapped[float] = mapped_column(Float)
+    # Зачёркнутая цена Wolt, если товар со скидкой.
+    original_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    in_stock: Mapped[bool] = mapped_column(Boolean, default=True)
+    in_catalog: Mapped[bool] = mapped_column(Boolean, default=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    price_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class WoltScrape(Base):
+    """Одна попытка собрать каталог одной аптеки Wolt."""
+
+    __tablename__ = "wolt_scrapes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    venue: Mapped[str] = mapped_column(String(100), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # running / ok / failed
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    items: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+
 class SiteRoute(Base):
     """Раздел сайта, который обходит полный сбор.
 
