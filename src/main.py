@@ -143,6 +143,12 @@ _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT = 150
 _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT_ENV = (
     "PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT"
 )
+# Разовый потолок для одного ручного запуска `run --site pharmonline --force
+# --pharmonline-admission-limit N`: всплеск, который человек просмотрел и
+# признал законным (сайт за день завёл больше товаров, чем допускает ночной
+# сбор). Таймер этот флаг не передаёт; переменная окружения его не задаёт.
+_PHARMONLINE_PUBLIC_API_ONE_RUN_ADMISSION_LIMIT_MAX = 500
+_pharmonline_one_run_admission_limit: int | None = None
 _PHARMONLINE_PUBLIC_API_PROOF_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 # One-time bootstrap floor for a catalog that has never been baselined.  It
 # only has to be low enough to reject a truncated first read, so it must stay
@@ -2544,12 +2550,22 @@ def _pharmonline_public_api_scheduled_admission_limit() -> int:
     Переменная окружения может только снизить потолок. Нечитаемое значение
     выключает автодопуск: опечатка в настройке не должна ничего допускать.
     """
+    # Разовый флаг ручного запуска заменяет только потолок по умолчанию.
+    # Переменная окружения по-прежнему может лишь снизить его: сниженный
+    # потолок и рубильник (0) — решение того, кто правил env, и флаг их не
+    # пересиливает.
+    ceiling = _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT
+    if _pharmonline_one_run_admission_limit is not None:
+        ceiling = min(
+            _pharmonline_one_run_admission_limit,
+            _PHARMONLINE_PUBLIC_API_ONE_RUN_ADMISSION_LIMIT_MAX,
+        )
     raw = os.environ.get(_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT_ENV, "").strip()
     if not raw:
-        return _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT
+        return ceiling
     if not (raw.isascii() and raw.isdigit()):
         return 0
-    return min(int(raw), _PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT)
+    return min(int(raw), ceiling)
 
 
 def _admit_pharmonline_public_api_scheduled_identities(
@@ -2612,6 +2628,9 @@ def _admit_pharmonline_public_api_scheduled_identities(
         "existing_native_id": 0,
         "limit": limit,
     }
+    if _pharmonline_one_run_admission_limit is not None and limit:
+        # Видно в run_quality прогона и на /runs: потолок задал человек.
+        summary["limit_set_for_this_run"] = True
     actions, admissions, quarantines, metrics = _pharmonline_public_api_reconciliation_plan(
         session,
         results,
@@ -6398,6 +6417,14 @@ def _sites_due_for_full_scan(
     "немедленно проставляем честный status ok/degraded/failed + run_id, чтобы UI "
     "не ждал медленных matcher/analyzer фаз.",
 )
+@click.option(
+    "--pharmonline-admission-limit",
+    type=click.IntRange(1, _PHARMONLINE_PUBLIC_API_ONE_RUN_ADMISSION_LIMIT_MAX),
+    default=None,
+    help="Только с `--site pharmonline --force`: на ЭТОТ запуск поднять потолок "
+    "автодопуска новых товаров pharmonline (обычно 150). Для всплеска, который "
+    "человек просмотрел; остальные условия допуска прежние.",
+)
 def run_cmd(
     dry_run: bool,
     limit: int | None,
@@ -6408,9 +6435,32 @@ def run_cmd(
     no_alerts: bool,
     force: bool,
     request_id: int | None,
+    pharmonline_admission_limit: int | None = None,
 ) -> None:
     """Полный прогон: scrape → match → analyze → report."""
     sites = list(site) if site else _default_scrape_sites()
+    if pharmonline_admission_limit is not None:
+        # Допуск есть только у сбора каталога public_api; в других режимах
+        # флаг молча ничего бы не сделал.
+        if (
+            sites != ["pharmonline"]
+            or not force
+            or hourly
+            or mode not in {"auto", "public_api"}
+        ):
+            raise click.ClickException(
+                "--pharmonline-admission-limit works only with --site pharmonline --force "
+                "(catalog run, no --hourly)"
+            )
+        global _pharmonline_one_run_admission_limit
+
+        def _reset_one_run_admission_limit() -> None:
+            global _pharmonline_one_run_admission_limit
+            _pharmonline_one_run_admission_limit = None
+
+        # Сначала сброс, потом значение: без контекста флаг не взводится.
+        click.get_current_context().call_on_close(_reset_one_run_admission_limit)
+        _pharmonline_one_run_admission_limit = pharmonline_admission_limit
     # Как режим задал вызывающий — до того, как его перепишут маркер ниже и
     # разбор режима. Нужен гварду ритма: явный public_api идёт мимо него.
     requested_mode = mode

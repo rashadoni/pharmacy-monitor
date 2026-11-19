@@ -1022,6 +1022,111 @@ def test_scheduled_run_with_auto_admission_switched_off_fails_as_before(
     assert scheduled_run.sent == []
 
 
+def test_manual_run_with_a_raised_limit_admits_a_reviewed_burst(
+    db_session, scheduled_run, monkeypatch
+):
+    """Всплеск выше потолка: разовый флаг ручного запуска, таймер его не видит."""
+    monkeypatch.setattr(main_mod, "_PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT", 1)
+    db_session.add(_stored(1, "known"))
+    db_session.commit()
+    catalog = (_api(1, "known"), _api(2, "new-2"), _api(3, "new-3"))
+    unit_args = list(scheduled_run.args)
+
+    result = scheduled_run(*catalog)
+
+    assert result.exit_code != 0
+    assert "limit_exceeded:candidates=2,limit=1" in _latest_run(db_session).error_message
+
+    scheduled_run.args = [*unit_args, "--force", "--pharmonline-admission-limit", "2"]
+    result = scheduled_run(*catalog)
+
+    # Дошёл до сопоставления — значит, проверку личностей и запись прошёл.
+    assert "_AfterPersist" in result.output, result.output
+    admission = _latest_run(db_session).run_quality["pharmonline_identity_admission"]
+    assert admission["status"] == "admitted"
+    assert admission["limit"] == 2
+    assert admission["limit_set_for_this_run"] is True
+    assert len(_admissions(db_session)) == 2
+    # Флаг живёт один запуск: следующий плановый снова со своим потолком.
+    assert main_mod._pharmonline_one_run_admission_limit is None
+    assert main_mod._pharmonline_public_api_scheduled_admission_limit() == 1
+
+
+def test_raised_limit_does_not_override_the_kill_switch(monkeypatch):
+    monkeypatch.setenv(main_mod._PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT_ENV, "0")
+    monkeypatch.setattr(main_mod, "_pharmonline_one_run_admission_limit", 300)
+
+    assert main_mod._pharmonline_public_api_scheduled_admission_limit() == 0
+
+
+def test_lowered_environment_limit_still_wins_over_the_flag(monkeypatch):
+    monkeypatch.setenv(main_mod._PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT_ENV, "20")
+    monkeypatch.setattr(main_mod, "_pharmonline_one_run_admission_limit", 200)
+
+    assert main_mod._pharmonline_public_api_scheduled_admission_limit() == 20
+
+
+def test_kill_switch_run_is_not_marked_as_operator_limit(db_session, monkeypatch):
+    monkeypatch.setenv(main_mod._PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT_ENV, "0")
+    monkeypatch.setattr(main_mod, "_pharmonline_one_run_admission_limit", 200)
+
+    summary, _ = _admit(db_session, _catalog(_api(2, "brand-new")))
+
+    assert summary["reason"] == "disabled:candidates=1"
+    assert "limit_set_for_this_run" not in summary
+
+
+def test_raised_limit_is_capped(monkeypatch):
+    monkeypatch.setenv(main_mod._PHARMONLINE_PUBLIC_API_SCHEDULED_ADMISSION_LIMIT_ENV, "")
+    monkeypatch.setattr(main_mod, "_pharmonline_one_run_admission_limit", 10_000)
+
+    assert (
+        main_mod._pharmonline_public_api_scheduled_admission_limit()
+        == main_mod._PHARMONLINE_PUBLIC_API_ONE_RUN_ADMISSION_LIMIT_MAX
+    )
+
+
+_SCOPE_ERROR = "works only with --site pharmonline --force"
+
+
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        (["--site", "pharmonline", "--pharmonline-admission-limit", "200"], _SCOPE_ERROR),
+        (["--site", "aloe", "--force", "--pharmonline-admission-limit", "200"], _SCOPE_ERROR),
+        (
+            ["--site", "pharmonline", "--site", "aloe", "--force"]
+            + ["--pharmonline-admission-limit", "200"],
+            _SCOPE_ERROR,
+        ),
+        (
+            ["--site", "pharmonline", "--force", "--mode", "category"]
+            + ["--pharmonline-admission-limit", "200"],
+            _SCOPE_ERROR,
+        ),
+        (
+            ["--site", "pharmonline", "--force", "--hourly"]
+            + ["--pharmonline-admission-limit", "200"],
+            _SCOPE_ERROR,
+        ),
+        (["--site", "pharmonline", "--force", "--pharmonline-admission-limit", "501"], "1<=x<=500"),
+        (["--site", "pharmonline", "--force", "--pharmonline-admission-limit", "0"], "1<=x<=500"),
+    ],
+)
+def test_raised_limit_needs_a_forced_pharmonline_only_run(monkeypatch, args, error):
+    # Отказ обязан случиться до любой работы: база и сбор здесь недоступны.
+    def unreachable(*_args, **_kwargs):
+        raise AssertionError("the run went past the flag check")
+
+    monkeypatch.setattr(storage, "init_db", unreachable)
+    monkeypatch.setattr(storage, "make_session", unreachable)
+
+    result = CliRunner().invoke(main_mod.cli, ["run", *args])
+
+    assert result.exit_code != 0
+    assert error in result.output, result.output
+
+
 def test_scheduled_run_without_new_products_sends_no_mail(db_session, scheduled_run):
     db_session.add(_stored(1, "known"))
     db_session.commit()
