@@ -8055,6 +8055,47 @@ def catalog_import(
                 session.commit()
 
 
+@cli.group("wolt")
+def wolt_group() -> None:
+    """Аптеки на Wolt: отдельный раздел сравнения (src/wolt.py)."""
+
+
+@wolt_group.command("sync")
+@click.option(
+    "--venue",
+    "venues",
+    multiple=True,
+    help="Слаг заведения Wolt (можно несколько); без флага — все из src/wolt.py.",
+)
+@click.option(
+    "--allow-shrink",
+    is_flag=True,
+    help="Записать каталог, даже если он меньше половины прошлого (проверено руками).",
+)
+def wolt_sync(venues: tuple[str, ...], allow_shrink: bool) -> None:
+    """Собрать каталоги аптек Wolt. Код 1, если хоть одна аптека не собралась."""
+    from src import site_profile, wolt
+
+    if not site_profile.is_pharmacy():
+        raise click.ClickException("wolt sync belongs to the pharmacy instance")
+    if allow_shrink and not venues:
+        raise click.ClickException("--allow-shrink needs --venue: decide it pharmacy by pharmacy")
+    chosen = list(venues) or list(wolt.VENUES)
+    unknown = [venue for venue in chosen if venue not in wolt.VENUES]
+    if unknown:
+        raise click.ClickException(f"unknown Wolt venue: {', '.join(unknown)}")
+    storage.init_db()
+    failed = []
+    with wolt.make_client() as client, storage.make_session()() as session:
+        for venue in chosen:
+            attempt = wolt.sync_venue(session, venue, client=client, allow_shrink=allow_shrink)
+            click.echo(f"{venue}: {attempt.status} items={attempt.items} {attempt.error or ''}")
+            if attempt.status != "ok":
+                failed.append(venue)
+    if failed:
+        raise click.ClickException(f"Wolt venues not collected: {', '.join(failed)}")
+
+
 @cli.group("routes")
 def routes_group() -> None:
     """Разделы сайта для полного сбора (сайты без колонки в categories)."""

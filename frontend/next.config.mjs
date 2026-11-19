@@ -47,6 +47,7 @@ const nextConfig = {
       "settings/pricing",
       "settings/users",
       "watchlist",
+      "wolt",
     ];
     return [
       {

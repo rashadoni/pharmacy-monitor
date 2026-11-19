@@ -4396,3 +4396,62 @@ workflow после записи сам делает полный сбор и т
 плановых прогонов: свежие проверенные цены, одинаковое число дел при повторе,
 отсутствие цен спорных пар и честные счётчики health. До этих наблюдений нельзя
 утверждать, что повторяемость эксплуатационных сбоев устранена.
+
+## Аптеки на Wolt (раздел `/wolt`, с 2026-11-19)
+
+Что это — CLAUDE.md «Аптеки на Wolt». Код — `src/wolt.py`.
+
+**Включение на сервере** (после выкладки с `apply_migrations=true` — нужна
+миграция `0029_wolt_items`), под root:
+
+```bash
+install -m 0644 /opt/pharmacy-monitor/infra/systemd/pharmacy-monitor-wolt.service /opt/pharmacy-monitor/infra/systemd/pharmacy-monitor-wolt.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now pharmacy-monitor-wolt.timer
+systemctl start --no-block pharmacy-monitor-wolt.service   # первый сбор сразу, несколько минут
+```
+
+**Проверка.** `journalctl -u pharmacy-monitor-wolt -n 20` — по строке
+`wolt_venue_synced venue=… items=…` на аптеку; код выхода 1 и
+`wolt_venue_failed reason=…`, если аптека не собралась (её каталог в базе
+остаётся прежним). В базе (`sudo -u postgres psql -X pharmacy_monitor`):
+
+```sql
+SELECT venue, status, items, error, finished_at FROM wolt_scrapes ORDER BY id DESC LIMIT 6;
+```
+
+Страница `/wolt` показывает у каждой аптеки, когда она собрана последний раз,
+и «последний сбор не удался», если так.
+
+**`catalog_shrank`** — аптека отдала меньше половины прошлого каталога, и он
+не записан. Если на wolt.com у аптеки и правда стало меньше товаров, записать
+один раз руками, под `pm`:
+
+```bash
+sudo -u pm -H bash -lc 'cd /opt/pharmacy-monitor && set -a && . /etc/pharmacy-monitor/env && set +a && .venv/bin/pharmacy-monitor wolt sync --venue <слаг> --allow-shrink'
+```
+
+**Добавить аптеку** — слаг из адреса `wolt.com/…/venue/<слаг>` в
+`wolt.VENUES` (порядок — порядок колонок), обычным PR. Страница рассчитана на
+три колонки, на телефоне — на любое число.
+
+**История цен** — таблица `wolt_price_changes`: строка на появление товара и
+на каждое изменение цены, скидки или наличия.
+
+```sql
+SELECT at, price, original_price, in_stock FROM wolt_price_changes
+WHERE venue = 'aptek5' AND item_id = '<номер товара Wolt>' ORDER BY at;
+```
+
+**Сбор, убитый на середине** (таймаут юнита, перезагрузка), оставляет попытку
+`running`. Следующий сбор той же аптеки помечает такую попытку, если она старше
+двух часов, как `failed` с причиной `interrupted`.
+
+**Откат кода ниже этого раздела** — сначала `systemctl disable --now
+pharmacy-monitor-wolt.timer`: у прежнего кода нет команды `wolt sync`, и таймер
+падал бы каждый день.
+
+**Выключить** — `systemctl disable --now pharmacy-monitor-wolt.timer`.
+Страница останется с последними данными. Таблицы `wolt_*` основной путь не
+читает, их можно не трогать.
+

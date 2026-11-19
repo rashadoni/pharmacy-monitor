@@ -16,6 +16,7 @@ import {
   Pill,
   Search,
   Settings,
+  ShoppingBag,
   Sparkles,
   Star,
   TrendingUp,
@@ -122,6 +123,9 @@ export function SideNav() {
           {NAV_SITES.map((item) => (
             <NavLink key={item.href} href={item.href} icon={item.icon} label={item.label} pathname={pathname} />
           ))}
+          {PROFILE.pharmacyPages && (
+            <NavLink href="/wolt" icon={ShoppingBag} label={t("wolt")} pathname={pathname} />
+          )}
         </NavSection>
 
         <NavSection label={t("section_actions")}>
@@ -188,7 +192,10 @@ export function BottomNav() {
     },
     {
       label: t("section_sites"),
-      items: NAV_SITES.map((item) => ({ href: item.href, label: item.label, icon: item.icon })),
+      items: [
+        ...NAV_SITES.map((item) => ({ href: item.href, label: item.label, icon: item.icon })),
+        ...(PROFILE.pharmacyPages ? [{ href: "/wolt", label: t("wolt"), icon: ShoppingBag }] : []),
+      ],
     },
     {
       label: t("section_actions"),
