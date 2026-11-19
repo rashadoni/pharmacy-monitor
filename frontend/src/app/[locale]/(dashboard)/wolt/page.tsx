@@ -49,7 +49,11 @@ export default function WoltPage() {
         <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
           <ShoppingBag className="h-6 w-6" aria-hidden="true" /> {t("title")}
         </h1>
-        <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{t("subtitle")}</p>
+        {data && (
+          <p className="mt-1 text-sm text-muted-foreground">
+            {t("schedule", { time: data.daily_sync_baku })}
+          </p>
+        )}
       </header>
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -58,22 +62,7 @@ export default function WoltPage() {
         ))}
       </div>
 
-      {data && <HowItWorks data={data} />}
-
-      {data && (
-        <div className="space-y-1 text-sm">
-          <p>
-            {t("totals", {
-              rows: data.totals.rows,
-              differ: data.totals.differ,
-              all: data.totals.all_venues,
-            })}
-          </p>
-          {data.totals.suspicious > 0 && (
-            <p className="text-muted-foreground">{t("suspicious", { n: data.totals.suspicious })}</p>
-          )}
-        </div>
-      )}
+      {data && <Summary data={data} />}
 
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
         <input
@@ -198,40 +187,42 @@ export default function WoltPage() {
   );
 }
 
-function HowItWorks({ data }: { data: WoltComparison }) {
+// Короткие живые цифры последнего сбора: меняются вместе с данными.
+function Summary({ data }: { data: WoltComparison }) {
   const t = useTranslations("wolt");
+  const locale = useLocale();
+  const n = (value: number) => value.toLocaleString(locale === "en" ? "en-GB" : "ru-RU");
+  const found = data.venues.reduce((sum, venue) => sum + venue.items, 0);
   const titles = Object.fromEntries(data.venues.map((venue) => [venue.venue, venue.title]));
+  const tiles = [
+    { label: t("stat_found"), value: found },
+    { label: t("stat_comparable"), value: data.totals.rows },
+    { label: t("stat_everywhere"), value: data.totals.all_venues },
+    { label: t("stat_differ"), value: data.totals.differ },
+  ];
   return (
-    <details open className="group space-y-3 rounded-md border border-border bg-secondary/30 p-4 text-sm">
-      <summary className="cursor-pointer font-semibold">{t("how_title")}</summary>
-      <p>{t("how_collect", { time: data.daily_sync_baku })}</p>
-      <p>{t("how_match")}</p>
-      <div>
-        <h3 className="mb-2 font-medium">{t("pairs_title")}</h3>
-        <ul className="grid grid-cols-1 gap-2 md:grid-cols-3">
-          {data.pairs.map((pair) => {
-            const a = titles[pair.a] ?? pair.a;
-            const b = titles[pair.b] ?? pair.b;
-            const differ = pair.a_cheaper + pair.b_cheaper;
-            return (
-              <li key={`${pair.a}|${pair.b}`} className="rounded-md border border-border bg-background p-3">
-                <div className="font-medium">{t("pair_name", { a, b })}</div>
-                <div className="mt-1 text-muted-foreground">{t("pair_common", { n: pair.common })}</div>
-                {pair.common === 0 ? null : differ === 0 ? (
-                  <div className="mt-1">{t("pair_all_same")}</div>
-                ) : (
-                  <ul className="mt-1 space-y-0.5">
-                    <li>{t("pair_same", { n: pair.same_price })}</li>
-                    <li>{t("pair_cheaper", { venue: a, n: pair.a_cheaper })}</li>
-                    <li>{t("pair_cheaper", { venue: b, n: pair.b_cheaper })}</li>
-                  </ul>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      </div>
-    </details>
+    <section className="space-y-2">
+      <dl className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        {tiles.map((tile) => (
+          <div key={tile.label} className="rounded-md border border-border p-3">
+            <dt className="text-xs text-muted-foreground">{tile.label}</dt>
+            <dd className="mt-1 text-2xl font-semibold tabular-nums">{n(tile.value)}</dd>
+          </div>
+        ))}
+      </dl>
+      <ul className="flex flex-col gap-1 text-sm text-muted-foreground md:flex-row md:flex-wrap md:gap-x-6">
+        {data.pairs.map((pair) => (
+          <li key={`${pair.a}|${pair.b}`}>
+            {t("pair_short", {
+              a: titles[pair.a] ?? pair.a,
+              b: titles[pair.b] ?? pair.b,
+              common: n(pair.common),
+              differ: n(pair.a_cheaper + pair.b_cheaper),
+            })}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

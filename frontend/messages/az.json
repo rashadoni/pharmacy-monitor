@@ -913,13 +913,10 @@
   },
   "wolt": {
     "title": "Wolt-da apteklər",
-    "subtitle": "Wolt-dakı apteklərdə eyni məhsul və hər birində qiyməti. Saytların müqayisəsindən ayrıdır: öz məlumatları, gündə bir dəfə öz yığımı.",
     "items": "{n, plural, other {# məhsul}}",
     "updated": "yeniləndi: {when}",
     "never": "hələ yığılmayıb",
     "failed": "son yığım alınmadı",
-    "totals": "Ən azı iki aptekdə olan məhsullar: {rows}. Qiyməti fərqlənir: {differ}. Bütün apteklərdə: {all}.",
-    "suspicious": "{n} gizlədilib: qiymətlər üç dəfədən çox fərqlənir — çox güman, qablaşdırma fərqlidir.",
     "search": "Adla axtarış",
     "only_diff": "Yalnız fərqli qiymətlilər",
     "product": "Məhsul",
@@ -934,15 +931,12 @@
     "retry": "Yenidən cəhd et",
     "price_label": "{venue}: {name} — {price}, yeni tabda açılacaq",
     "updating": "yenilənir…",
-    "how_title": "Müqayisə necə qurulub",
-    "how_collect": "Aptek kataloqları Wolt-dan hər gün saat {time} (Bakı vaxtı) ətrafında toplanır — tam, bütün qiymət və endirimlərlə.",
-    "how_match": "Eyni məhsul ad, doza və qablaşdırmaya görə tanınır (Wolt barkod vermir). Yalnız bir aptekdə olan məhsul burada göstərilmir — müqayisə ediləcək bir şey yoxdur. Aptekdə eyni adla iki fərqli məhsul varsa, onun xanası boş qalır: hansının eyni məhsul olduğunu addan bilmək olmur.",
-    "pairs_title": "Aptek cütləri üzrə ümumi məhsullar (hər ikisində stokda)",
-    "pair_name": "{a} və {b}",
-    "pair_common": "{n, plural, other {# ümumi məhsul}}",
-    "pair_all_same": "bütün ümumi məhsulların qiyməti eynidir",
-    "pair_same": "eyni qiymət: {n}",
-    "pair_cheaper": "{venue} daha ucuzdur: {n}",
-    "only_diff_count": "Yalnız fərqli qiymətlilər ({rows} məhsuldan {differ})"
+    "only_diff_count": "Yalnız fərqli qiymətlilər ({rows} məhsuldan {differ})",
+    "schedule": "Hər gün saat {time} (Bakı vaxtı) ətrafında yenilənir.",
+    "stat_found": "Tapılan məhsullar",
+    "stat_comparable": "2+ aptekdə var",
+    "stat_everywhere": "Hər üçündə",
+    "stat_differ": "Qiyməti fərqlənir",
+    "pair_short": "{a} — {b}: ümumi {common}, qiyməti fərqli {differ}"
   }
 }
