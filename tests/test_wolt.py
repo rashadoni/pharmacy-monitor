@@ -362,3 +362,121 @@ def test_unit_runs_the_sync_as_pm():
     assert "User=pm" in unit
     timer = Path("infra/systemd/pharmacy-monitor-wolt.timer").read_text()
     assert "Unit=pharmacy-monitor-wolt.service" in timer
+
+
+# ─── Замечания разбора ───────────────────────────────────────────────────────
+
+
+def test_database_failure_on_write_marks_the_attempt_failed(db_session, monkeypatch):
+    """Каталог уходит в базу на commit; его отказ — сбой сбора, а не «running»."""
+    wolt.store_catalog(db_session, BUTA, [_offer("a", "A", 1.0)])
+    db_session.commit()
+    transport, _ = _catalog_transport(
+        [{"slug": "x", "subcategories": []}], {"x": [[_raw("b", "B", 100)]]}
+    )
+
+    def store_a_duplicate(session, venue, offers, **kwargs):
+        session.add(storage.WoltItem(venue=venue, item_id="a", name="dup", price=1.0))
+        return {"new": 1, "price_changed": 0, "gone": 0}
+
+    monkeypatch.setattr(wolt, "store_catalog", store_a_duplicate)
+
+    attempt = wolt.sync_venue(db_session, BUTA, client=_client(transport), sleep=lambda _s: None)
+
+    assert attempt.status == "failed"
+    assert attempt.finished_at is not None
+    assert attempt.error == "IntegrityError"
+    assert set(_items(db_session, BUTA)) == {"a"}
+
+
+def test_allow_shrink_writes_a_smaller_catalog(db_session):
+    db_session.add(storage.WoltScrape(venue=BUTA, status="ok", items=10, finished_at=utcnow()))
+    db_session.commit()
+
+    wolt.store_catalog(db_session, BUTA, [_offer("a", "A", 1.0)], allow_shrink=True)
+    db_session.commit()
+
+    assert set(_items(db_session, BUTA)) == {"a"}
+
+
+def test_repeated_page_token_fails_instead_of_looping():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if urlsplit(str(request.url)).path.endswith("/assortment"):
+            return httpx.Response(200, json={"categories": [{"slug": "x"}]})
+        return httpx.Response(
+            200, json={"items": [_raw("a", "A", 100)], "metadata": {"next_page_token": "same"}}
+        )
+
+    with pytest.raises(wolt.WoltScrapeError, match="page_token_invalid"):
+        wolt.fetch_venue(BUTA, client=_client(httpx.MockTransport(handler)), sleep=lambda _s: None)
+
+
+def test_metadata_that_is_not_an_object_ends_the_category():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if urlsplit(str(request.url)).path.endswith("/assortment"):
+            return httpx.Response(200, json={"categories": [{"slug": "x"}]})
+        return httpx.Response(200, json={"items": [_raw("a", "A", 100)], "metadata": []})
+
+    offers = wolt.fetch_venue(
+        BUTA, client=_client(httpx.MockTransport(handler)), sleep=lambda _s: None
+    )
+
+    assert [o.item_id for o in offers] == ["a"]
+
+
+def test_out_of_stock_offer_is_shown_but_not_compared(db_session):
+    cheap_but_gone = _item(BUTA, "1", "Ketonal Forte N20", 5.0)
+    cheap_but_gone.in_stock = False
+    _seed(
+        db_session,
+        cheap_but_gone,
+        _item(ALOE, "2", "Ketonal Forte N20", 6.5),
+        _item(KANON, "3", "Ketonal Forte N20", 7.0),
+    )
+
+    (row,) = wolt.comparison(db_session)["rows"]
+
+    assert row["min_price"] == 6.5
+    assert row["cheapest"] == [ALOE]
+    assert row["prices"][BUTA]["in_stock"] is False
+
+
+def test_equal_prices_have_no_cheapest(db_session):
+    _seed(
+        db_session,
+        _item(BUTA, "1", "Enfekderm 15 q", 7.49),
+        _item(ALOE, "2", "Enfekderm 15 q", 7.49),
+    )
+
+    (row,) = wolt.comparison(db_session)["rows"]
+
+    assert row["cheapest"] == []
+
+
+def test_search_by_dose_alone_still_filters(db_session):
+    _seed(
+        db_session,
+        _item(BUTA, "1", "Duspatalin 200 mq N30", 17.0),
+        _item(KANON, "2", "Duspatalin 200 mq N30", 17.5),
+        _item(BUTA, "3", "Betadin 10% 30 ml", 6.6),
+        _item(ALOE, "4", "Betadin 10% 30 ml", 9.3),
+    )
+
+    assert [r["name"] for r in wolt.comparison(db_session, search="200 mq")["rows"]] == [
+        "Duspatalin 200 mq N30"
+    ]
+
+
+def test_long_name_is_cut_to_the_column():
+    assert len(wolt.parse_item(_raw("a", "X" * 900, 100)).name) == 500
+
+
+def test_api_is_absent_in_another_profile(client, monkeypatch):
+    from src import site_profile
+
+    monkeypatch.setattr(site_profile, "is_pharmacy", lambda: False)
+    monkeypatch.setitem(
+        api_module.app.dependency_overrides, api_module.require_user, lambda: object()
+    )
+
+    assert client.get("/api/v1/dash/wolt/comparison").status_code == 404

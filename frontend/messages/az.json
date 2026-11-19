@@ -914,11 +914,11 @@
   "wolt": {
     "title": "Wolt-da apteklər",
     "subtitle": "Wolt-dakı apteklərdə eyni məhsul və hər birində qiyməti. Saytların müqayisəsindən ayrıdır: öz məlumatları, gündə bir dəfə öz yığımı.",
-    "items": "{n} məhsul",
+    "items": "{n, plural, other {# məhsul}}",
     "updated": "yeniləndi: {when}",
     "never": "hələ yığılmayıb",
     "failed": "son yığım alınmadı",
-    "totals": "Ən azı iki aptekdə olan məhsullar: {rows}. Qiyməti fərqlənir: {differ}. Hər üçündə: {all}.",
+    "totals": "Ən azı iki aptekdə olan məhsullar: {rows}. Qiyməti fərqlənir: {differ}. Bütün apteklərdə: {all}.",
     "suspicious": "{n} gizlədilib: qiymətlər üç dəfədən çox fərqlənir — çox güman, qablaşdırma fərqlidir.",
     "search": "Adla axtarış",
     "only_diff": "Yalnız fərqli qiymətlilər",
@@ -930,6 +930,10 @@
     "more": "Daha çox göstər",
     "shown": "{total} məhsuldan {shown} göstərilir",
     "matching_note": "Wolt barkod vermir: məhsullar ad, doza və qablaşdırmaya görə birləşdirilir. Aptekdə eyni adla iki məhsul varsa, onun qiyməti sətirdə göstərilmir.",
-    "error": "Müqayisə yüklənmədi"
+    "error": "Müqayisə yüklənmədi",
+    "loading": "Müqayisə yüklənir…",
+    "retry": "Yenidən cəhd et",
+    "price_label": "{venue}: {name} — {price}, yeni tabda açılacaq",
+    "updating": "yenilənir…"
   }
 }

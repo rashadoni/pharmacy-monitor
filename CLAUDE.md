@@ -190,7 +190,7 @@ Aloe Aptek — Ağ Şəhər, Kanon Aptek — Torgovaya) разделом вну�
   профиля. Доверенные цены, эпоха, сопоставление pharmonline, утреннее письмо,
   алерты и health их не читают. Не переносить их в `products` и не добавлять в
   `site_profile` без слова владельца: это поменяло бы основное сравнение.
-- **Сбор** — `pharmacy-monitor wolt sync` (юнит `pharmacy-monitor-wolt`, 04:00
+- **Сбор** — `pharmacy-monitor wolt sync` (юнит `pharmacy-monitor-wolt`, 06:00
   UTC), открытый API страницы заведения wolt.com, без прокси; robots.txt Wolt
   ничего не запрещает. Аптека собирается целиком или не записывается; каталог
   вдвое меньше прошлого не пишется.

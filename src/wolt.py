@@ -136,7 +136,7 @@ def parse_item(raw: dict) -> WoltOffer | None:
     )
     return WoltOffer(
         item_id=item_id.strip(),
-        name=" ".join(name.split()),
+        name=" ".join(name.split())[:500],
         price=price,
         original_price=original if original is not None and original > price else None,
         in_stock=in_stock,
@@ -191,6 +191,7 @@ def fetch_venue(
     offers: dict[str, WoltOffer] = {}
     for slug in slugs:
         token: str | None = None
+        seen_tokens: set[str] = set()
         for _page in range(MAX_PAGES_PER_CATEGORY):
             sleep(REQUEST_DELAY_SEC)
             url = f"{base}/assortment/categories/slug/{quote(slug, safe='-')}?language={LANGUAGE}"
@@ -203,9 +204,14 @@ def fetch_venue(
             for raw in items:
                 if isinstance(raw, dict) and (offer := parse_item(raw)) is not None:
                     offers.setdefault(offer.item_id, offer)
-            token = (page.get("metadata") or {}).get("next_page_token")
+            metadata = page.get("metadata")
+            token = metadata.get("next_page_token") if isinstance(metadata, dict) else None
             if not token:
                 break
+            if not isinstance(token, str) or token in seen_tokens:
+                # Тот же токен второй раз — страницы пошли по кругу.
+                raise WoltScrapeError("page_token_invalid")
+            seen_tokens.add(token)
         else:
             raise WoltScrapeError("too_many_pages")
     if not offers:
@@ -223,12 +229,21 @@ def _previous_full_count(session: Session, venue: str) -> int | None:
 
 
 def store_catalog(
-    session: Session, venue: str, offers: list[WoltOffer], *, now: datetime | None = None
+    session: Session,
+    venue: str,
+    offers: list[WoltOffer],
+    *,
+    now: datetime | None = None,
+    allow_shrink: bool = False,
 ) -> dict[str, int]:
-    """Записать полный каталог аптеки. Commit — за вызывающим."""
+    """Записать полный каталог аптеки. Commit — за вызывающим.
+
+    ``allow_shrink`` — человек проверил, что аптека и правда убрала больше
+    половины товаров (RUNBOOK «Аптеки на Wolt»).
+    """
     now = now or utcnow()
     previous = _previous_full_count(session, venue)
-    if previous and len(offers) < previous * MIN_SHARE_OF_PREVIOUS:
+    if not allow_shrink and previous and len(offers) < previous * MIN_SHARE_OF_PREVIOUS:
         raise WoltScrapeError(f"catalog_shrank:{len(offers)}<{previous}*{MIN_SHARE_OF_PREVIOUS}")
     existing = {
         row.item_id: row
@@ -277,35 +292,41 @@ def sync_venue(
     *,
     client: httpx.Client,
     sleep: Callable[[float], None] = time.sleep,
+    allow_shrink: bool = False,
 ) -> storage.WoltScrape:
-    """Собрать и записать одну аптеку; исход — строка ``wolt_scrapes``."""
+    """Собрать и записать одну аптеку; исход — строка ``wolt_scrapes``.
+
+    Любой сбой — сеть, неполный каталог, отказ базы на записи — оставляет
+    прежний каталог аптеки и строку попытки со статусом failed. Исключение
+    наружу не летит: следующая аптека собирается своим чередом.
+    """
     if venue not in VENUES:
         raise ValueError(f"unknown Wolt venue: {venue!r}")
     attempt = storage.WoltScrape(venue=venue, started_at=utcnow(), status="running")
     session.add(attempt)
     session.commit()
+    attempt_id = attempt.id
     try:
         offers = fetch_venue(venue, client=client, sleep=sleep)
-        counts = store_catalog(session, venue, offers)
-    except WoltScrapeError as exc:
-        session.rollback()
-        attempt.status = "failed"
-        attempt.error = str(exc)[:500]
+        counts = store_catalog(session, venue, offers, allow_shrink=allow_shrink)
+        # Запись каталога уходит в базу только здесь (сессии без autoflush):
+        # её сбой — такой же сбой сбора, как сетевой.
+        attempt.status = "ok"
+        attempt.items = len(offers)
         attempt.finished_at = utcnow()
         session.commit()
-        log.warning("wolt_venue_failed", venue=venue, reason=attempt.error)
-        return attempt
     except Exception as exc:
         session.rollback()
-        attempt.status = "failed"
-        attempt.error = type(exc).__name__
-        attempt.finished_at = utcnow()
+        # Текст ошибки базы может нести данные строки — пишем только класс.
+        reason = str(exc) if isinstance(exc, WoltScrapeError) else type(exc).__name__
+        failed = session.get(storage.WoltScrape, attempt_id)
+        failed.status = "failed"
+        failed.items = None
+        failed.error = reason[:500]
+        failed.finished_at = utcnow()
         session.commit()
-        raise
-    attempt.status = "ok"
-    attempt.items = len(offers)
-    attempt.finished_at = utcnow()
-    session.commit()
+        log.warning("wolt_venue_failed", venue=venue, reason=failed.error)
+        return failed
     log.info("wolt_venue_synced", venue=venue, items=len(offers), **counts)
     return attempt
 
@@ -425,8 +446,14 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int]]:
     totals = {"rows": 0, "differ": 0, "all_venues": 0, "suspicious": 0}
     rows: list[dict] = []
     for group in group_items(items):
-        prices = [item.price for item in group.values()]
-        low, high = min(prices), max(prices)
+        # Сравниваются цены того, что можно купить; товар «нет в наличии»
+        # показывается, но в разницу и «дешевле всех» не идёт.
+        prices = [item.price for item in group.values() if item.in_stock]
+        if len(prices) < 2:
+            prices = prices or [item.price for item in group.values()]
+            low = high = min(prices)
+        else:
+            low, high = min(prices), max(prices)
         if high > low * MAX_PRICE_RATIO:
             totals["suspicious"] += 1
             continue
@@ -450,9 +477,18 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int]]:
                 "min_price": low,
                 "max_price": high,
                 "spread_pct": round((high - low) / low * 100, 1) if low else 0.0,
-                "cheapest": sorted(v for v, item in group.items() if item.price == low),
+                "cheapest": sorted(
+                    v for v, item in group.items() if item.in_stock and item.price == low
+                )
+                if low != high
+                else [],
                 "_search": " ".join(
-                    fold_spelling(normalize_name(item.name)) for item in group.values()
+                    part
+                    for item in group.values()
+                    for part in (
+                        fold_spelling(normalize_name(item.name)),
+                        fold_spelling(item.name.lower()),
+                    )
                 ),
             }
         )
@@ -463,15 +499,20 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int]]:
 def comparison(session: Session, *, search: str | None = None, only_diff: bool = False) -> dict:
     """Строки сравнения аптек Wolt, самые большие разницы — первыми."""
     key = _cache_key(session)
+    # Строит один запрос, остальные ждут его: после нового сбора страница
+    # шлёт запрос на каждую клавишу, и каждый строил бы то же самое.
     with _cache_lock:
         cached = _rows_cache.get(key)
-    if cached is None:
-        cached = _build_rows(session)
-        with _cache_lock:
+        if cached is None:
+            cached = _build_rows(session)
             _rows_cache.clear()
             _rows_cache[key] = cached
     rows, totals = cached
-    needle = fold_spelling(normalize_name(search)) if search and search.strip() else ""
+    needle = ""
+    if search and search.strip():
+        # normalize_name выбрасывает дозу и форму («100 mq» → пусто): тогда
+        # ищем по свёрнутому тексту как есть.
+        needle = fold_spelling(normalize_name(search)) or fold_spelling(search.lower())
     shown = [
         {k: v for k, v in row.items() if k != "_search"}
         for row in rows

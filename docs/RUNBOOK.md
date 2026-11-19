@@ -4408,13 +4408,13 @@ workflow после записи сам делает полный сбор и т
 install -m 0644 /opt/pharmacy-monitor/infra/systemd/pharmacy-monitor-wolt.service /opt/pharmacy-monitor/infra/systemd/pharmacy-monitor-wolt.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now pharmacy-monitor-wolt.timer
-systemctl start pharmacy-monitor-wolt.service   # первый сбор сразу, несколько минут
+systemctl start --no-block pharmacy-monitor-wolt.service   # первый сбор сразу, несколько минут
 ```
 
 **Проверка.** `journalctl -u pharmacy-monitor-wolt -n 20` — по строке
 `wolt_venue_synced venue=… items=…` на аптеку; код выхода 1 и
 `wolt_venue_failed reason=…`, если аптека не собралась (её каталог в базе
-остаётся прежним). В базе:
+остаётся прежним). В базе (`sudo -u postgres psql -X pharmacy_monitor`):
 
 ```sql
 SELECT venue, status, items, error, finished_at FROM wolt_scrapes ORDER BY id DESC LIMIT 6;
@@ -4422,6 +4422,14 @@ SELECT venue, status, items, error, finished_at FROM wolt_scrapes ORDER BY id DE
 
 Страница `/wolt` показывает у каждой аптеки, когда она собрана последний раз,
 и «последний сбор не удался», если так.
+
+**`catalog_shrank`** — аптека отдала меньше половины прошлого каталога, и он
+не записан. Если на wolt.com у аптеки и правда стало меньше товаров, записать
+один раз руками, под `pm`:
+
+```bash
+sudo -u pm -H bash -lc 'cd /opt/pharmacy-monitor && set -a && . /etc/pharmacy-monitor/env && set +a && .venv/bin/pharmacy-monitor wolt sync --venue <слаг> --allow-shrink'
+```
 
 **Добавить аптеку** — слаг из адреса `wolt.com/…/venue/<слаг>` в
 `wolt.VENUES` (порядок — порядок колонок), обычным PR. Страница рассчитана на

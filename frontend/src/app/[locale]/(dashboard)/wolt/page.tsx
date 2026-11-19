@@ -3,7 +3,8 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { ExternalLink, ShoppingBag } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
-import { useDeferredValue, useState } from "react";
+import { useEffect, useState } from "react";
+import { QueryErrorState } from "@/components/query-error-state";
 import { api, type WoltOfferPrice, type WoltRow, type WoltVenue } from "@/lib/api";
 import { cn, formatPrice, formatRelative } from "@/lib/utils";
 
@@ -16,13 +17,21 @@ export default function WoltPage() {
   const [search, setSearch] = useState("");
   const [onlyDiff, setOnlyDiff] = useState(true);
   const [limit, setLimit] = useState(PAGE);
-  const deferredSearch = useDeferredValue(search);
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  // Запрос — после паузы в наборе, а не на каждую клавишу.
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search.trim()), 300);
+    return () => clearTimeout(timer);
+  }, [search]);
 
   const q = useQuery({
-    queryKey: ["wolt-comparison", deferredSearch.trim(), onlyDiff],
-    queryFn: () => api.woltComparison(deferredSearch, onlyDiff),
+    queryKey: ["wolt-comparison", debouncedSearch, onlyDiff],
+    queryFn: () => api.woltComparison(debouncedSearch, onlyDiff),
     placeholderData: keepPreviousData,
   });
+  // Пока идёт новый запрос, на экране — ответ на прошлый: «ничего не найдено»
+  // относилось бы не к тому, что набрано сейчас.
+  const stale = q.isPlaceholderData || debouncedSearch !== search.trim();
   const data = q.data;
   const venues = data?.venues ?? [];
   const rows = data?.rows ?? [];
@@ -86,11 +95,15 @@ export default function WoltPage() {
         </label>
       </div>
 
-      {q.isError && <p className="text-sm text-destructive">{t("error")}</p>}
-      {data && rows.length === 0 && <p className="text-sm text-muted-foreground">{t("empty")}</p>}
+      {q.isPending && <p className="text-sm text-muted-foreground" role="status">{t("loading")}</p>}
+      {q.isError && (
+        <QueryErrorState message={t("error")} retryLabel={t("retry")} onRetry={() => void q.refetch()} />
+      )}
+      {stale && data && <p className="text-xs text-muted-foreground" role="status">{t("updating")}</p>}
+      {data && !stale && rows.length === 0 && <p className="text-sm text-muted-foreground">{t("empty")}</p>}
 
       {rows.length > 0 && (
-        <>
+        <div className={cn("space-y-3", stale && "opacity-60")}>
           {/* Таблица — от md, на телефоне — карточки. */}
           <div className="hidden overflow-x-auto rounded-md border border-border md:block">
             <table className="w-full text-sm">
@@ -113,7 +126,8 @@ export default function WoltPage() {
                       <td key={venue.venue} className="px-3 py-2 text-right">
                         <PriceCell
                           offer={row.prices[venue.venue]}
-                          cheapest={row.cheapest.includes(venue.venue) && row.min_price !== row.max_price}
+                          venueTitle={venue.title}
+                          cheapest={row.cheapest.includes(venue.venue)}
                           locale={locale}
                         />
                       </td>
@@ -145,7 +159,8 @@ export default function WoltPage() {
                       <dd>
                         <PriceCell
                           offer={row.prices[venue.venue]}
-                          cheapest={row.cheapest.includes(venue.venue) && row.min_price !== row.max_price}
+                          venueTitle={venue.title}
+                          cheapest={row.cheapest.includes(venue.venue)}
                           locale={locale}
                         />
                       </dd>
@@ -168,7 +183,7 @@ export default function WoltPage() {
               </button>
             )}
           </div>
-        </>
+        </div>
       )}
     </div>
   );
@@ -207,21 +222,25 @@ function VenueCard({ venue, locale }: { venue: WoltVenue; locale: string }) {
 
 function PriceCell({
   offer,
+  venueTitle,
   cheapest,
   locale,
 }: {
   offer: WoltOfferPrice | undefined;
+  venueTitle: string;
   cheapest: boolean;
   locale: string;
 }) {
   const t = useTranslations("wolt");
   if (!offer) return <span className="text-muted-foreground">—</span>;
+  const price = formatPrice(offer.price, locale);
   return (
     <a
       href={offer.url}
       target="_blank"
       rel="noopener noreferrer"
       title={offer.name}
+      aria-label={t("price_label", { venue: venueTitle, name: offer.name, price })}
       className={cn(
         "inline-flex flex-col items-end tabular-nums hover:underline",
         cheapest && "font-semibold text-success",
@@ -229,7 +248,7 @@ function PriceCell({
       )}
     >
       <span>
-        {formatPrice(offer.price, locale)}
+        {price}
         {cheapest && <span className="sr-only"> ({t("cheapest")})</span>}
       </span>
       {offer.original_price != null && (

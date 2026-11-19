@@ -914,11 +914,11 @@
   "wolt": {
     "title": "Pharmacies on Wolt",
     "subtitle": "The same product in pharmacies on Wolt and its price in each. Separate from the site comparison: own data, own daily collection.",
-    "items": "{n} products",
+    "items": "{n, plural, one {# product} other {# products}}",
     "updated": "updated {when}",
     "never": "not collected yet",
     "failed": "last collection failed",
-    "totals": "Products in at least two pharmacies: {rows}. Price differs: {differ}. In all three: {all}.",
+    "totals": "Products in at least two pharmacies: {rows}. Price differs: {differ}. In every pharmacy: {all}.",
     "suspicious": "{n} hidden: prices differ more than threefold — most likely a different pack size.",
     "search": "Search by name",
     "only_diff": "Only with different prices",
@@ -930,6 +930,10 @@
     "more": "Show more",
     "shown": "Showing {shown} of {total}",
     "matching_note": "Wolt gives no barcodes: products are matched by name, dose and pack size. If a pharmacy has two products under one name, its price is not shown in the row.",
-    "error": "Could not load the comparison"
+    "error": "Could not load the comparison",
+    "loading": "Loading the comparison…",
+    "retry": "Retry",
+    "price_label": "{venue}: {name} — {price}, opens in a new tab",
+    "updating": "updating…"
   }
 }

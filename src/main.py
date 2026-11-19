@@ -8067,7 +8067,12 @@ def wolt_group() -> None:
     multiple=True,
     help="Слаг заведения Wolt (можно несколько); без флага — все из src/wolt.py.",
 )
-def wolt_sync(venues: tuple[str, ...]) -> None:
+@click.option(
+    "--allow-shrink",
+    is_flag=True,
+    help="Записать каталог, даже если он меньше половины прошлого (проверено руками).",
+)
+def wolt_sync(venues: tuple[str, ...], allow_shrink: bool) -> None:
     """Собрать каталоги аптек Wolt. Код 1, если хоть одна аптека не собралась."""
     from src import site_profile, wolt
 
@@ -8081,7 +8086,7 @@ def wolt_sync(venues: tuple[str, ...]) -> None:
     failed = []
     with wolt.make_client() as client, storage.make_session()() as session:
         for venue in chosen:
-            attempt = wolt.sync_venue(session, venue, client=client)
+            attempt = wolt.sync_venue(session, venue, client=client, allow_shrink=allow_shrink)
             click.echo(f"{venue}: {attempt.status} items={attempt.items} {attempt.error or ''}")
             if attempt.status != "ok":
                 failed.append(venue)

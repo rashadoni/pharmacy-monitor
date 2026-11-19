@@ -1,9 +1,11 @@
 [Unit]
-Description=Wolt pharmacies catalog — daily 04:00 UTC (08:00 Asia/Baku)
+Description=Wolt pharmacies catalog — daily 06:00 UTC (10:00 Asia/Baku)
 
 [Timer]
 # Отдельно от ночных сборов сайтов: свои таблицы, замка сбора не берёт.
-OnCalendar=*-*-* 04:00:00 UTC
+# Днём, когда аптеки открыты: закрытая аптека может отдавать товары как
+# недоступные (не проверено), и всё стало бы «нет в наличии».
+OnCalendar=*-*-* 06:00:00 UTC
 RandomizedDelaySec=300
 Persistent=true
 Unit=pharmacy-monitor-wolt.service
