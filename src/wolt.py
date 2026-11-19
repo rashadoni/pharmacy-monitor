@@ -157,11 +157,16 @@ def _leaf_category_slugs(categories: Iterable[dict]) -> list[str]:
     return list(dict.fromkeys(slugs))
 
 
-def _get_json(client: httpx.Client, url: str, sleep: Callable[[float], None]) -> dict:
+def _get_json(
+    client: httpx.Client,
+    url: str,
+    sleep: Callable[[float], None],
+    params: dict[str, str] | None = None,
+) -> dict:
     last: str = ""
     for attempt in range(1, ATTEMPTS + 1):
         try:
-            response = client.get(url)
+            response = client.get(url, params={"language": LANGUAGE, **(params or {})})
             if response.status_code == 200:
                 data = response.json()
                 if isinstance(data, dict):
@@ -184,7 +189,7 @@ def fetch_venue(
 ) -> list[WoltOffer]:
     """Весь каталог аптеки; неполный проход — WoltScrapeError."""
     base = API_BASE + quote(venue, safe="-")
-    tree = _get_json(client, f"{base}/assortment?language={LANGUAGE}", sleep)
+    tree = _get_json(client, f"{base}/assortment", sleep)
     slugs = _leaf_category_slugs(tree.get("categories") or [])
     if not slugs:
         raise WoltScrapeError("no_categories")
@@ -194,10 +199,9 @@ def fetch_venue(
         seen_tokens: set[str] = set()
         for _page in range(MAX_PAGES_PER_CATEGORY):
             sleep(REQUEST_DELAY_SEC)
-            url = f"{base}/assortment/categories/slug/{quote(slug, safe='-')}?language={LANGUAGE}"
-            if token:
-                url += "&page_token=" + quote(token, safe="")
-            page = _get_json(client, url, sleep)
+            url = f"{base}/assortment/categories/slug/{quote(slug, safe='-')}"
+            # Номер страницы Wolt, а не учётные данные; параметром, а не строкой.
+            page = _get_json(client, url, sleep, {"page_token": token} if token else None)
             items = page.get("items")
             if not isinstance(items, list):
                 raise WoltScrapeError("items_missing")
