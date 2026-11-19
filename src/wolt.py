@@ -77,6 +77,10 @@ ATTEMPTS = 3
 RETRY_DELAY_SEC = 5.0
 # Страниц в одном разделе больше этого — что-то не так с подачей страниц.
 MAX_PAGES_PER_CATEGORY = 200
+# Когда идёт ежедневный сбор — час по Баку (UTC+4, без перехода на летнее
+# время). Страница называет его клиенту; tests/test_wolt.py сверяет с таймером.
+DAILY_SYNC_UTC_HOUR = 6
+BAKU_UTC_OFFSET_HOURS = 4
 # Каталог меньше этой доли прошлого полного не записывается.
 MIN_SHARE_OF_PREVIOUS = 0.5
 # Цены одного «товара» в разных аптеках расходятся больше чем во столько раз —
@@ -471,7 +475,7 @@ def group_items(rows: Iterable[storage.WoltItem]) -> list[dict[str, storage.Wolt
 # Группы пересчитываются только после нового удачного сбора: сопоставление
 # ~10 тыс. товаров идёт секунды, а страница спрашивает его на каждый ввод.
 # Свой у каждого процесса API; ключ — последний удачный сбор каждой аптеки.
-_rows_cache: dict[tuple, tuple[list[dict], dict[str, int]]] = {}
+_rows_cache: dict[tuple, tuple[list[dict], dict[str, int], list[dict]]] = {}
 _cache_lock = threading.Lock()
 
 
@@ -486,7 +490,41 @@ def _cache_key(session: Session) -> tuple:
     )
 
 
-def _build_rows(session: Session) -> tuple[list[dict], dict[str, int]]:
+def _pair_summary(groups: list[dict[str, storage.WoltItem]]) -> list[dict]:
+    """Каждая пара аптек: сколько общих товаров и у кого дешевле.
+
+    Считаются только товары, которые есть в наличии у обеих аптек пары, —
+    то же, что сравнивает таблица. Это ответ на вопрос «почему разных цен так
+    мало»: у пары может быть тысяча общих товаров и ни одной разной цены.
+    """
+    summary = []
+    for a, b in itertools.combinations(VENUES, 2):
+        common = same = a_cheaper = b_cheaper = 0
+        for group in groups:
+            ia, ib = group.get(a), group.get(b)
+            if ia is None or ib is None or not (ia.in_stock and ib.in_stock):
+                continue
+            common += 1
+            if ia.price == ib.price:
+                same += 1
+            elif ia.price < ib.price:
+                a_cheaper += 1
+            else:
+                b_cheaper += 1
+        summary.append(
+            {
+                "a": a,
+                "b": b,
+                "common": common,
+                "same_price": same,
+                "a_cheaper": a_cheaper,
+                "b_cheaper": b_cheaper,
+            }
+        )
+    return summary
+
+
+def _build_rows(session: Session) -> tuple[list[dict], dict[str, int], list[dict]]:
     items = list(
         session.scalars(
             select(storage.WoltItem).where(
@@ -497,6 +535,7 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int]]:
     )
     totals = {"rows": 0, "differ": 0, "all_venues": 0, "suspicious": 0}
     rows: list[dict] = []
+    shown_groups: list[dict[str, storage.WoltItem]] = []
     for group in group_items(items):
         # Сравниваются цены того, что можно купить; товар «нет в наличии»
         # показывается, но в разницу и «дешевле всех» не идёт.
@@ -509,6 +548,7 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int]]:
         if high > low * MAX_PRICE_RATIO:
             totals["suspicious"] += 1
             continue
+        shown_groups.append(group)
         totals["rows"] += 1
         totals["differ"] += low != high
         totals["all_venues"] += len(group) == len(VENUES)
@@ -545,7 +585,7 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int]]:
             }
         )
     rows.sort(key=lambda r: (-r["spread_pct"], r["name"].lower()))
-    return rows, totals
+    return rows, totals, _pair_summary(shown_groups)
 
 
 def comparison(session: Session, *, search: str | None = None, only_diff: bool = False) -> dict:
@@ -559,7 +599,7 @@ def comparison(session: Session, *, search: str | None = None, only_diff: bool =
             cached = _build_rows(session)
             _rows_cache.clear()
             _rows_cache[key] = cached
-    rows, totals = cached
+    rows, totals, pairs = cached
     needle = ""
     if search and search.strip():
         # normalize_name выбрасывает дозу и форму («100 mq» → пусто): тогда
@@ -571,7 +611,13 @@ def comparison(session: Session, *, search: str | None = None, only_diff: bool =
         if not (only_diff and row["min_price"] == row["max_price"])
         and (not needle or needle in row["_search"])
     ]
-    return {"venues": venue_status(session), "rows": shown, "totals": dict(totals)}
+    return {
+        "venues": venue_status(session),
+        "rows": shown,
+        "totals": dict(totals),
+        "pairs": pairs,
+        "daily_sync_baku": f"{(DAILY_SYNC_UTC_HOUR + BAKU_UTC_OFFSET_HOURS) % 24:02d}:00",
+    }
 
 
 def venue_status(session: Session) -> list[dict]:

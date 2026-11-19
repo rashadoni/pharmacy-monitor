@@ -5,7 +5,13 @@ import { ExternalLink, ShoppingBag } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useEffect, useState } from "react";
 import { QueryErrorState } from "@/components/query-error-state";
-import { api, type WoltOfferPrice, type WoltRow, type WoltVenue } from "@/lib/api";
+import {
+  api,
+  type WoltComparison,
+  type WoltOfferPrice,
+  type WoltRow,
+  type WoltVenue,
+} from "@/lib/api";
 import { cn, formatPrice, formatRelative } from "@/lib/utils";
 
 // Строк бывает ~1 400 — рисуем частями.
@@ -43,7 +49,11 @@ export default function WoltPage() {
         <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
           <ShoppingBag className="h-6 w-6" aria-hidden="true" /> {t("title")}
         </h1>
-        <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{t("subtitle")}</p>
+        {data && (
+          <p className="mt-1 text-sm text-muted-foreground">
+            {t("schedule", { time: data.daily_sync_baku })}
+          </p>
+        )}
       </header>
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -52,21 +62,7 @@ export default function WoltPage() {
         ))}
       </div>
 
-      {data && (
-        <div className="space-y-1 text-sm">
-          <p>
-            {t("totals", {
-              rows: data.totals.rows,
-              differ: data.totals.differ,
-              all: data.totals.all_venues,
-            })}
-          </p>
-          {data.totals.suspicious > 0 && (
-            <p className="text-muted-foreground">{t("suspicious", { n: data.totals.suspicious })}</p>
-          )}
-          <p className="text-xs text-muted-foreground">{t("matching_note")}</p>
-        </div>
-      )}
+      {data && <Summary data={data} />}
 
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
         <input
@@ -91,7 +87,9 @@ export default function WoltPage() {
             }}
             className="h-4 w-4"
           />
-          {t("only_diff")}
+          {data
+            ? t("only_diff_count", { differ: data.totals.differ, rows: data.totals.rows })
+            : t("only_diff")}
         </label>
       </div>
 
@@ -186,6 +184,45 @@ export default function WoltPage() {
         </div>
       )}
     </div>
+  );
+}
+
+// Короткие живые цифры последнего сбора: меняются вместе с данными.
+function Summary({ data }: { data: WoltComparison }) {
+  const t = useTranslations("wolt");
+  const locale = useLocale();
+  const n = (value: number) => value.toLocaleString(locale === "en" ? "en-GB" : "ru-RU");
+  const found = data.venues.reduce((sum, venue) => sum + venue.items, 0);
+  const titles = Object.fromEntries(data.venues.map((venue) => [venue.venue, venue.title]));
+  const tiles = [
+    { label: t("stat_found"), value: found },
+    { label: t("stat_comparable"), value: data.totals.rows },
+    { label: t("stat_everywhere"), value: data.totals.all_venues },
+    { label: t("stat_differ"), value: data.totals.differ },
+  ];
+  return (
+    <section className="space-y-2">
+      <dl className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        {tiles.map((tile) => (
+          <div key={tile.label} className="rounded-md border border-border p-3">
+            <dt className="text-xs text-muted-foreground">{tile.label}</dt>
+            <dd className="mt-1 text-2xl font-semibold tabular-nums">{n(tile.value)}</dd>
+          </div>
+        ))}
+      </dl>
+      <ul className="flex flex-col gap-1 text-sm text-muted-foreground md:flex-row md:flex-wrap md:gap-x-6">
+        {data.pairs.map((pair) => (
+          <li key={`${pair.a}|${pair.b}`}>
+            {t("pair_short", {
+              a: titles[pair.a] ?? pair.a,
+              b: titles[pair.b] ?? pair.b,
+              common: n(pair.common),
+              differ: n(pair.a_cheaper + pair.b_cheaper),
+            })}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
