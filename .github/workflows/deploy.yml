@@ -599,9 +599,12 @@ jobs:
             # On a line of its own: as the left side of `&&` a failing curl
             # does not stop a `set -e` script, and a dead API passed this step
             # as long as the frontend answered. The retries give uvicorn the
-            # time it needs to come up after the restart.
-            curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 10 \
-              http://127.0.0.1:8080/health >/dev/null
+            # time it needs to come up after the restart: measured on prod,
+            # 57 restarts since 2026-10-01 took 5-27 s to "Application startup
+            # complete", and the old ~17 s window failed the 2026-11-19 deploy
+            # of a healthy API. Wait up to two minutes.
+            curl -fsS --retry 40 --retry-delay 3 --retry-max-time 120 --retry-connrefused \
+              --max-time 10 http://127.0.0.1:8080/health >/dev/null
             echo "API ok"
             curl -fsSL -o /dev/null -w "frontend HTTP %{http_code}\n" http://127.0.0.1:3000/ru/login
             curl -fsSL http://127.0.0.1:3000/ru/login | grep -q "<html lang=\"ru\""'
