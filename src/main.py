@@ -8078,6 +8078,8 @@ def wolt_sync(venues: tuple[str, ...], allow_shrink: bool) -> None:
 
     if not site_profile.is_pharmacy():
         raise click.ClickException("wolt sync belongs to the pharmacy instance")
+    if allow_shrink and not venues:
+        raise click.ClickException("--allow-shrink needs --venue: decide it pharmacy by pharmacy")
     chosen = list(venues) or list(wolt.VENUES)
     unknown = [venue for venue in chosen if venue not in wolt.VENUES]
     if unknown:

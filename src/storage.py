@@ -911,6 +911,22 @@ class WoltItem(Base):
     price_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class WoltPriceChange(Base):
+    """Журнал цен аптек Wolt: строка на появление товара и на каждое изменение
+    цены, скидки или наличия (как ``price_snapshots`` — только при изменении)."""
+
+    __tablename__ = "wolt_price_changes"
+    __table_args__ = (Index("ix_wolt_price_changes_venue_item", "venue", "item_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    venue: Mapped[str] = mapped_column(String(100))
+    item_id: Mapped[str] = mapped_column(String(64))
+    price: Mapped[float] = mapped_column(Float)
+    original_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    in_stock: Mapped[bool] = mapped_column(Boolean)
+    at: Mapped[datetime] = mapped_column(DateTime)
+
+
 class WoltScrape(Base):
     """Одна попытка собрать каталог одной аптеки Wolt."""
 

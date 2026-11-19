@@ -36,7 +36,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 
 import httpx
@@ -255,10 +255,25 @@ def store_catalog(
     }
     counts = {"new": 0, "price_changed": 0, "gone": 0}
     seen: set[str] = set()
+
+    def remember(offer: WoltOffer) -> None:
+        # Журнал цен: строка на каждое изменение цены, скидки или наличия.
+        session.add(
+            storage.WoltPriceChange(
+                venue=venue,
+                item_id=offer.item_id,
+                price=offer.price,
+                original_price=offer.original_price,
+                in_stock=offer.in_stock,
+                at=now,
+            )
+        )
+
     for offer in offers:
         seen.add(offer.item_id)
         row = existing.get(offer.item_id)
         if row is None:
+            remember(offer)
             session.add(
                 storage.WoltItem(
                     venue=venue,
@@ -274,6 +289,12 @@ def store_catalog(
             )
             counts["new"] += 1
             continue
+        if (row.price, row.original_price, row.in_stock) != (
+            offer.price,
+            offer.original_price,
+            offer.in_stock,
+        ):
+            remember(offer)
         if row.price != offer.price:
             row.price = offer.price
             row.price_changed_at = now
@@ -288,6 +309,32 @@ def store_catalog(
             row.in_catalog = False
             counts["gone"] += 1
     return counts
+
+
+# Попытка дольше этого — процесс убит (таймаут юнита, перезагрузка) и
+# закончить её некому. Юнит даёт сбору 30 минут.
+INTERRUPTED_AFTER = timedelta(hours=2)
+
+
+def _close_interrupted_attempts(session: Session, venue: str) -> None:
+    """Попытки, которые убитый процесс оставил «running», — неудачные."""
+    cutoff = utcnow() - INTERRUPTED_AFTER
+    stale = list(
+        session.scalars(
+            select(storage.WoltScrape).where(
+                storage.WoltScrape.venue == venue,
+                storage.WoltScrape.status == "running",
+                storage.WoltScrape.started_at < cutoff,
+            )
+        )
+    )
+    for attempt in stale:
+        attempt.status = "failed"
+        attempt.error = "interrupted"
+        attempt.finished_at = utcnow()
+    if stale:
+        session.commit()
+        log.warning("wolt_interrupted_attempts_closed", venue=venue, count=len(stale))
 
 
 def sync_venue(
@@ -306,6 +353,7 @@ def sync_venue(
     """
     if venue not in VENUES:
         raise ValueError(f"unknown Wolt venue: {venue!r}")
+    _close_interrupted_attempts(session, venue)
     attempt = storage.WoltScrape(venue=venue, started_at=utcnow(), status="running")
     session.add(attempt)
     session.commit()

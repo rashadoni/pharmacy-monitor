@@ -1,4 +1,4 @@
-"""Pharmacies on Wolt: their own items and scrape attempts.
+"""Pharmacies on Wolt: their own items, price log and scrape attempts.
 
 Revision ID: 0029_wolt_items
 Revises: 0028_site_routes
@@ -12,9 +12,7 @@ down_revision = "0028_site_routes"
 branch_labels = None
 depends_on = None
 
-PREVIOUS_RELEASE_COMPATIBLE = (
-    "Upgrade only creates two new empty tables. The previous release neither reads nor writes them."
-)
+PREVIOUS_RELEASE_COMPATIBLE = "Upgrade only creates three new empty tables. The previous release neither reads nor writes them."
 
 
 def upgrade():
@@ -38,6 +36,20 @@ def upgrade():
             sa.UniqueConstraint("venue", "item_id", name="uq_wolt_items_venue_item"),
         )
         op.create_index("ix_wolt_items_venue", "wolt_items", ["venue"])
+    if not inspector.has_table("wolt_price_changes"):
+        op.create_table(
+            "wolt_price_changes",
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column("venue", sa.String(100), nullable=False),
+            sa.Column("item_id", sa.String(64), nullable=False),
+            sa.Column("price", sa.Float(), nullable=False),
+            sa.Column("original_price", sa.Float(), nullable=True),
+            sa.Column("in_stock", sa.Boolean(), nullable=False),
+            sa.Column("at", sa.DateTime(), nullable=False),
+        )
+        op.create_index(
+            "ix_wolt_price_changes_venue_item", "wolt_price_changes", ["venue", "item_id"]
+        )
     if not inspector.has_table("wolt_scrapes"):
         op.create_table(
             "wolt_scrapes",
@@ -58,6 +70,9 @@ def downgrade():
     if inspector.has_table("wolt_scrapes"):
         op.drop_index("ix_wolt_scrapes_venue", table_name="wolt_scrapes")
         op.drop_table("wolt_scrapes")
+    if inspector.has_table("wolt_price_changes"):
+        op.drop_index("ix_wolt_price_changes_venue_item", table_name="wolt_price_changes")
+        op.drop_table("wolt_price_changes")
     if inspector.has_table("wolt_items"):
         op.drop_index("ix_wolt_items_venue", table_name="wolt_items")
         op.drop_table("wolt_items")

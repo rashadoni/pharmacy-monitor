@@ -480,3 +480,72 @@ def test_api_is_absent_in_another_profile(client, monkeypatch):
     )
 
     assert client.get("/api/v1/dash/wolt/comparison").status_code == 404
+
+
+# ─── Замечания архитектора ──────────────────────────────────────────────────
+
+
+def _price_log(db, venue):
+    db.expire_all()
+    return [
+        (row.item_id, row.price, row.original_price, row.in_stock)
+        for row in db.scalars(
+            select(storage.WoltPriceChange)
+            .where(storage.WoltPriceChange.venue == venue)
+            .order_by(storage.WoltPriceChange.id)
+        )
+    ]
+
+
+def test_price_log_records_appearance_and_changes_only(db_session):
+    wolt.store_catalog(db_session, BUTA, [_offer("a", "A", 1.0), _offer("b", "B", 2.0)])
+    db_session.commit()
+    # Ничего не изменилось — новых строк нет.
+    wolt.store_catalog(db_session, BUTA, [_offer("a", "A", 1.0), _offer("b", "B", 2.0)])
+    db_session.commit()
+    wolt.store_catalog(
+        db_session,
+        BUTA,
+        [_offer("a", "A", 1.5), _offer("b", "B", 2.0, in_stock=False)],
+    )
+    db_session.commit()
+
+    assert _price_log(db_session, BUTA) == [
+        ("a", 1.0, None, True),
+        ("b", 2.0, None, True),
+        ("a", 1.5, None, True),
+        ("b", 2.0, None, False),
+    ]
+
+
+def test_killed_attempt_is_closed_by_the_next_sync(db_session):
+    from datetime import timedelta
+
+    killed = storage.WoltScrape(
+        venue=BUTA, status="running", started_at=utcnow() - timedelta(hours=3)
+    )
+    recent = storage.WoltScrape(venue=ALOE, status="running", started_at=utcnow())
+    db_session.add_all([killed, recent])
+    db_session.commit()
+    transport, _ = _catalog_transport(
+        [{"slug": "x", "subcategories": []}], {"x": [[_raw("a", "A", 100)]]}
+    )
+
+    wolt.sync_venue(db_session, BUTA, client=_client(transport), sleep=lambda _s: None)
+
+    db_session.expire_all()
+    assert (killed.status, killed.error) == ("failed", "interrupted")
+    assert killed.finished_at is not None
+    # Чужая аптека и свежая попытка не трогаются.
+    assert recent.status == "running"
+
+
+def test_allow_shrink_needs_a_venue():
+    from click.testing import CliRunner
+
+    from src import main as main_mod
+
+    result = CliRunner().invoke(main_mod.cli, ["wolt", "sync", "--allow-shrink"])
+
+    assert result.exit_code != 0
+    assert "--allow-shrink needs --venue" in result.output

@@ -4435,6 +4435,22 @@ sudo -u pm -H bash -lc 'cd /opt/pharmacy-monitor && set -a && . /etc/pharmacy-mo
 `wolt.VENUES` (порядок — порядок колонок), обычным PR. Страница рассчитана на
 три колонки, на телефоне — на любое число.
 
+**История цен** — таблица `wolt_price_changes`: строка на появление товара и
+на каждое изменение цены, скидки или наличия.
+
+```sql
+SELECT at, price, original_price, in_stock FROM wolt_price_changes
+WHERE venue = 'aptek5' AND item_id = '<номер товара Wolt>' ORDER BY at;
+```
+
+**Сбор, убитый на середине** (таймаут юнита, перезагрузка), оставляет попытку
+`running`. Следующий сбор той же аптеки помечает такую попытку, если она старше
+двух часов, как `failed` с причиной `interrupted`.
+
+**Откат кода ниже этого раздела** — сначала `systemctl disable --now
+pharmacy-monitor-wolt.timer`: у прежнего кода нет команды `wolt sync`, и таймер
+падал бы каждый день.
+
 **Выключить** — `systemctl disable --now pharmacy-monitor-wolt.timer`.
 Страница останется с последними данными. Таблицы `wolt_*` основной путь не
 читает, их можно не трогать.

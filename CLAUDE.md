@@ -186,7 +186,7 @@ Aloe Aptek — Ağ Şəhər, Kanon Aptek — Torgovaya) разделом вну�
 заведений — `wolt.VENUES`.
 
 - **Изоляция.** Товары Wolt лежат в своих таблицах (`wolt_items`,
-  `wolt_scrapes`, миграция 0029), а не в `products`; аптеки Wolt — не сайты
+  `wolt_price_changes` — журнал цен, `wolt_scrapes`; миграция 0029), а не в `products`; аптеки Wolt — не сайты
   профиля. Доверенные цены, эпоха, сопоставление pharmonline, утреннее письмо,
   алерты и health их не читают. Не переносить их в `products` и не добавлять в
   `site_profile` без слова владельца: это поменяло бы основное сравнение.
