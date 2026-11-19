@@ -602,7 +602,9 @@ jobs:
             # time it needs to come up after the restart: measured on prod,
             # 57 restarts since 2026-10-01 took 5-27 s to "Application startup
             # complete", and the old ~17 s window failed the 2026-11-19 deploy
-            # of a healthy API. Wait up to two minutes.
+            # of a healthy API. Retries stop after 120 s; the last attempt may
+            # add up to its own 10 s. A healthy deploy can still print a few
+            # "curl: (7) Failed to connect" lines while uvicorn starts.
             curl -fsS --retry 40 --retry-delay 3 --retry-max-time 120 --retry-connrefused \
               --max-time 10 http://127.0.0.1:8080/health >/dev/null
             echo "API ok"

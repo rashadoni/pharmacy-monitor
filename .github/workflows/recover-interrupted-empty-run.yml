@@ -192,7 +192,9 @@ jobs:
             'set -euo pipefail
              sudo -n /usr/bin/systemctl restart pharmacy-monitor-api.service
              sleep 5
-             curl --fail --silent --show-error --max-time 30 http://127.0.0.1:8080/health >/dev/null'
+             # API start takes 5-27 s on prod (2026-11-19): retry like deploy.yml.
+             curl --fail --silent --show-error --retry 40 --retry-delay 3 --retry-max-time 120 \
+               --retry-connrefused --max-time 10 http://127.0.0.1:8080/health >/dev/null'
 
           python - <<'PY'
           import json
