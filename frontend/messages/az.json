@@ -935,14 +935,14 @@
     "price_label": "{venue}: {name} — {price}, yeni tabda açılacaq",
     "updating": "yenilənir…",
     "how_title": "Müqayisə necə qurulub",
-    "how_collect": "Aptek kataloqları Wolt-dan hər gün Bakı vaxtı ilə {time}-da toplanır — tam, bütün qiymət və endirimlərlə.",
-    "how_match": "Eyni məhsul ad, doza və qablaşdırmaya görə tanınır (Wolt barkod vermir). Yalnız bir aptekdə olan məhsul burada göstərilmir — onu müqayisə etməyə bir şey yoxdur.",
-    "pairs_title": "Aptek cütləri üzrə ümumi məhsullar",
+    "how_collect": "Aptek kataloqları Wolt-dan hər gün saat {time} (Bakı vaxtı) ətrafında toplanır — tam, bütün qiymət və endirimlərlə.",
+    "how_match": "Eyni məhsul ad, doza və qablaşdırmaya görə tanınır (Wolt barkod vermir). Yalnız bir aptekdə olan məhsul burada göstərilmir — müqayisə ediləcək bir şey yoxdur. Aptekdə eyni adla iki fərqli məhsul varsa, onun xanası boş qalır: hansının eyni məhsul olduğunu addan bilmək olmur.",
+    "pairs_title": "Aptek cütləri üzrə ümumi məhsullar (hər ikisində stokda)",
     "pair_name": "{a} və {b}",
     "pair_common": "{n, plural, other {# ümumi məhsul}}",
-    "pair_all_same": "bütün qiymətlər eynidir",
+    "pair_all_same": "bütün ümumi məhsulların qiyməti eynidir",
     "pair_same": "eyni qiymət: {n}",
-    "pair_cheaper": "daha ucuz ({venue}): {n}",
-    "only_diff_count": "Yalnız fərqli qiymətlilər ({differ}/{rows})"
+    "pair_cheaper": "{venue} daha ucuzdur: {n}",
+    "only_diff_count": "Yalnız fərqli qiymətlilər ({rows} məhsuldan {differ})"
   }
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -15,6 +16,7 @@ from src import api as api_module
 from src import storage, tenants, wolt
 from src._time import utcnow
 
+ROOT = Path(__file__).resolve().parents[1]
 BUTA, ALOE, KANON = list(wolt.VENUES)
 
 
@@ -355,12 +357,10 @@ def test_api_returns_the_comparison(client, db_session):
 
 
 def test_unit_runs_the_sync_as_pm():
-    from pathlib import Path
-
-    unit = Path("infra/systemd/pharmacy-monitor-wolt.service").read_text()
+    unit = (ROOT / "infra/systemd/pharmacy-monitor-wolt.service").read_text()
     assert "ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor wolt sync\n" in unit
     assert "User=pm" in unit
-    timer = Path("infra/systemd/pharmacy-monitor-wolt.timer").read_text()
+    timer = (ROOT / "infra/systemd/pharmacy-monitor-wolt.timer").read_text()
     assert "Unit=pharmacy-monitor-wolt.service" in timer
 
 
@@ -591,8 +591,18 @@ def test_out_of_stock_items_are_not_counted_in_pairs(db_session):
     assert pairs[(BUTA, KANON)]["common"] == 0
 
 
-def test_announced_time_matches_the_timer():
-    from pathlib import Path
+def test_suspicious_group_is_not_counted_in_pairs(db_session):
+    _seed(
+        db_session,
+        _item(ALOE, "1", "Viaqra 100 mq N4", 9.43),
+        _item(KANON, "2", "Viaqra 100 mq N4", 68.03),
+    )
 
-    timer = Path("infra/systemd/pharmacy-monitor-wolt.timer").read_text()
+    pairs = {(p["a"], p["b"]): p for p in wolt.comparison(db_session)["pairs"]}
+
+    assert pairs[(ALOE, KANON)]["common"] == 0
+
+
+def test_announced_time_matches_the_timer():
+    timer = (ROOT / "infra/systemd/pharmacy-monitor-wolt.timer").read_text()
     assert f"OnCalendar=*-*-* {wolt.DAILY_SYNC_UTC_HOUR:02d}:00:00 UTC" in timer

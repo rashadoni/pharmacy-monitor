@@ -202,8 +202,8 @@ function HowItWorks({ data }: { data: WoltComparison }) {
   const t = useTranslations("wolt");
   const titles = Object.fromEntries(data.venues.map((venue) => [venue.venue, venue.title]));
   return (
-    <section className="space-y-3 rounded-md border border-border bg-secondary/30 p-4 text-sm">
-      <h2 className="font-semibold">{t("how_title")}</h2>
+    <details open className="group space-y-3 rounded-md border border-border bg-secondary/30 p-4 text-sm">
+      <summary className="cursor-pointer font-semibold">{t("how_title")}</summary>
       <p>{t("how_collect", { time: data.daily_sync_baku })}</p>
       <p>{t("how_match")}</p>
       <div>
@@ -217,7 +217,7 @@ function HowItWorks({ data }: { data: WoltComparison }) {
               <li key={`${pair.a}|${pair.b}`} className="rounded-md border border-border bg-background p-3">
                 <div className="font-medium">{t("pair_name", { a, b })}</div>
                 <div className="mt-1 text-muted-foreground">{t("pair_common", { n: pair.common })}</div>
-                {pair.common > 0 && differ === 0 ? (
+                {pair.common === 0 ? null : differ === 0 ? (
                   <div className="mt-1">{t("pair_all_same")}</div>
                 ) : (
                   <ul className="mt-1 space-y-0.5">
@@ -231,7 +231,7 @@ function HowItWorks({ data }: { data: WoltComparison }) {
           })}
         </ul>
       </div>
-    </section>
+    </details>
   );
 }
 
