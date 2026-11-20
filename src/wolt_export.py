@@ -298,7 +298,7 @@ def _write_summary(
         line += 1
     line += 1
     _write_text(ws.cell(row=line, column=1), t["info_rule"])
-    for column, width in zip("ABCDE", (60, 14, 18, 16, 16), strict=True):
+    for column, width in zip("ABCDE", (60, 14, 18, 22, 22), strict=True):
         ws.column_dimensions[column].width = width
 
 

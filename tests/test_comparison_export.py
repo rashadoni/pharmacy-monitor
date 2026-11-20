@@ -275,3 +275,99 @@ def test_difference_counts_follow_the_tenants_client_site():
     assert comparison_export.difference_counts([row])["competitor_cheaper"] == 1
     assert comparison_export.difference_counts([row], "aloe")["client_cheapest"] == 1
     assert comparison_export.difference_counts([row], "aptekonline")["no_client_price"] == 1
+
+
+# ─── Сводка по парам сайтов (как у Wolt) ─────────────────────────────────────
+
+
+def test_pair_summary_counts_only_comparable_prices():
+    rows = [
+        _row("A", {"pharmonline": _price(5.0), "aptekonline": _price(6.0), "aloe": _price(5.0)}),
+        _row("B", {"pharmonline": _price(9.0), "aptekonline": _price(8.0)}),
+        # Устаревшая цена и «нет в наличии» в пару не идут.
+        _row("C", {"pharmonline": _price(3.0), "aloe": _price(1.0, stale=True)}),
+        _row("D", {"pharmonline": _price(3.0), "aptekonline": _price(2.0, out_of_stock=True)}),
+    ]
+
+    pairs = {(p["a"], p["b"]): p for p in comparison_export.pair_summary(rows)}
+
+    assert pairs[("pharmonline", "aptekonline")] == {
+        "a": "pharmonline",
+        "b": "aptekonline",
+        "common": 2,
+        "same_price": 0,
+        "a_cheaper": 1,
+        "b_cheaper": 1,
+    }
+    assert pairs[("pharmonline", "aloe")]["common"] == 1
+    assert pairs[("pharmonline", "aloe")]["same_price"] == 1
+    assert pairs[("aptekonline", "aloe")]["b_cheaper"] == 1
+
+
+def test_pair_summary_compares_unit_prices_when_packs_differ():
+    row = _row(
+        "Unit",
+        {
+            "pharmonline": _price(10.0, unit_price=0.5),
+            "aptekonline": _price(6.0, unit_price=0.6),
+        },
+        basis="unit",
+    )
+
+    (pair, *_rest) = comparison_export.pair_summary([row])
+
+    assert (pair["a_cheaper"], pair["b_cheaper"]) == (1, 0)
+
+
+def test_info_sheet_has_the_pair_table_client_first():
+    rows = [_row("A", {"pharmonline": _price(5.0), "aptekonline": _price(6.0)})]
+
+    ws = _open(rows)["О файле"]
+    cells = [[c.value for c in row] for row in ws.iter_rows()]
+    header = next(i for i, r in enumerate(cells) if r[0] == "Пара")
+
+    assert cells[header - 1][0] == "По парам сайтов (сравнимая цена у обоих)"
+    assert cells[header][:5] == [
+        "Пара",
+        "Общих",
+        "Цена одинаковая",
+        "Дешевле у первого",
+        "Дешевле у второго",
+    ]
+    assert cells[header + 1][:5] == ["Pharmonline — Aptekonline", 1, 0, 1, 0]
+    # Чьими глазами файл — тот первым в паре.
+    other = _open(rows, client_site="aptekonline")["О файле"]
+    first_cells = [row[0].value for row in other.iter_rows()]
+    assert first_cells[first_cells.index("Пара") + 1] == "Aptekonline — Pharmonline"
+
+
+def test_pair_table_says_when_the_file_has_only_different_prices():
+    rows = [_row("B", {"pharmonline": _price(5.0), "aptekonline": _price(6.0)})]
+
+    ws = _open(rows, diff_only=True)["О файле"]
+    first_cells = [row[0].value for row in ws.iter_rows()]
+
+    assert "По парам сайтов — только среди товаров с разной ценой" in first_cells
+
+
+@pytest.mark.parametrize(("locale", "header"), [("az", "Cüt"), ("en", "Pair")])
+def test_pair_table_in_other_languages(locale, header):
+    rows = [_row("A", {"pharmonline": _price(5.0), "aptekonline": _price(6.0)})]
+
+    info = _open(rows, locale=locale).worksheets[-1]
+
+    assert header in [row[0].value for row in info.iter_rows()]
+
+
+def test_two_site_pair_agrees_with_the_letter_counts():
+    rows = [
+        _row("A", {"pharmonline": _price(5.0), "aptekonline": _price(5.0)}),
+        _row("B", {"pharmonline": _price(5.0), "aptekonline": _price(6.0)}),
+        _row("C", {"pharmonline": _price(7.0), "aptekonline": _price(6.0)}),
+    ]
+
+    (pair, *_rest) = comparison_export.pair_summary(rows)
+    counts = comparison_export.difference_counts(rows)
+
+    assert pair["same_price"] == counts["same_price"]
+    assert pair["a_cheaper"] + pair["b_cheaper"] == counts["differing"]
