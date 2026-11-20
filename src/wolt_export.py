@@ -66,6 +66,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         "info_differ": "Из них с разной ценой",
         "info_everywhere": "Есть везде",
         "info_pairs": "По парам (товары в наличии у обеих)",
+        "info_pairs_all": "По парам, по всем товарам без поиска (в наличии у обеих)",
         "pair": "Пара",
         "common": "Общих",
         "same": "Цена одинаковая",
@@ -74,7 +75,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         "info_rule": (
             "Один и тот же товар узнаётся по названию, дозировке и фасовке. Цена "
             "Pharmonline — с его сайта, цены аптек — с Wolt. Зелёным — самая "
-            "низкая цена в строке, красным — самая высокая."
+            "низкая цена в строке, красным — самая высокая, серым — нет в "
+            "наличии (в сравнение цен не идёт)."
         ),
     },
     "az": {
@@ -101,6 +103,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         "info_differ": "Onlardan qiyməti fərqli",
         "info_everywhere": "Hamısında var",
         "info_pairs": "Cütlər üzrə (hər ikisində stokda olan məhsullar)",
+        "info_pairs_all": "Cütlər üzrə, axtarışsız bütün məhsullar (hər ikisində stokda)",
         "pair": "Cüt",
         "common": "Ümumi",
         "same": "Eyni qiymət",
@@ -109,7 +112,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         "info_rule": (
             "Eyni məhsul ad, doza və qablaşdırmaya görə tanınır. Pharmonline-ın "
             "qiyməti onun saytından, apteklərin qiymətləri Wolt-dan götürülür. "
-            "Yaşıl — sətirdə ən aşağı qiymət, qırmızı — ən yüksək."
+            "Yaşıl — sətirdə ən aşağı qiymət, qırmızı — ən yüksək, boz — stokda "
+            "yoxdur (qiymət müqayisəsinə daxil deyil)."
         ),
     },
     "en": {
@@ -136,6 +140,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         "info_differ": "Of them with a different price",
         "info_everywhere": "Everywhere",
         "info_pairs": "By pair (products in stock at both)",
+        "info_pairs_all": "By pair, all products regardless of the search (in stock at both)",
         "pair": "Pair",
         "common": "Shared",
         "same": "Same price",
@@ -144,7 +149,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         "info_rule": (
             "The same product is recognised by name, dose and pack size. "
             "Pharmonline's price comes from its site, the pharmacies' prices "
-            "from Wolt. Green is the lowest price in the row, red the highest."
+            "from Wolt. Green is the lowest price in the row, red the highest, "
+            "grey is out of stock (not compared)."
         ),
     },
 }
@@ -206,7 +212,7 @@ def _write_rows(ws: Any, rows: list[dict], venues: list[dict], t: dict[str, str]
                     value=t["open"] if offer["in_stock"] else t["out_of_stock"],
                 )
                 link.hyperlink = url
-                link.font = _LINK_FONT
+                link.font = _LINK_FONT if offer["in_stock"] else _MUTED_FONT
         _write_text(
             ws.cell(row=index, column=cheapest_col),
             # В порядке колонок, а не по алфавиту ключей.
@@ -230,7 +236,14 @@ def _write_summary(
     ws: Any, data: dict, t: dict[str, str], *, generated_at: datetime, search: str | None
 ) -> None:
     titles = {v["venue"]: v["title"] for v in data["venues"]}
-    totals = data["totals"]
+    # Итоги — по строкам этого файла: с поиском они про найденное, а не про всё.
+    rows = data["rows"]
+    keys = [v["venue"] for v in data["venues"]]
+    totals = {
+        "rows": len(rows),
+        "differ": sum(row["min_price"] != row["max_price"] for row in rows),
+        "all_venues": sum(all(k in row["prices"] for k in keys) for row in rows),
+    }
     line = 1
 
     def put(label: str, value: Any = "", *, bold: bool = False) -> None:
@@ -267,7 +280,7 @@ def _write_summary(
         line += 1
     line += 1
 
-    put(t["info_pairs"], bold=True)
+    put(t["info_pairs"] if not search else t["info_pairs_all"], bold=True)
     for col, text in enumerate(
         [t["pair"], t["common"], t["same"], t["cheaper_first"], t["cheaper_second"]], start=1
     ):
@@ -292,17 +305,16 @@ def _write_summary(
 def build_workbook(
     data: dict,
     *,
-    all_rows: list[dict],
     locale: str,
     generated_at: datetime,
     search: str | None = None,
 ) -> bytes:
-    """Собрать .xlsx из ответа `wolt.comparison`.
+    """Собрать .xlsx из ответа `wolt.comparison` (все строки, без `only_diff`).
 
-    `all_rows` — все строки (с одинаковой ценой тоже), `data` — тот же ответ;
-    первый лист — только строки с разной ценой.
+    Первый лист — только строки с разной ценой, второй — все.
     """
     t = strings(locale)
+    all_rows = data["rows"]
     differing = [row for row in all_rows if row["min_price"] != row["max_price"]]
     wb = Workbook()
     ws = wb.active

@@ -3460,7 +3460,7 @@ def dash_wolt_export(
     data = wolt.comparison(db, search=query)
     generated_at = utcnow()
     content = wolt_export.build_workbook(
-        data, all_rows=data["rows"], locale=locale, generated_at=generated_at, search=query
+        data, locale=locale, generated_at=generated_at, search=query
     )
     log.info("wolt_export", user_id=user.id, rows=len(data["rows"]), bytes=len(content))
     return Response(

@@ -51,7 +51,8 @@ export default function WoltPage() {
     setExporting(true);
     setExportFailed(false);
     try {
-      const { blob, filename } = await api.woltExport(debouncedSearch, locale);
+      // Текущий текст поиска, а не отложенный: нажатие сразу после ввода.
+      const { blob, filename } = await api.woltExport(search, locale);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
