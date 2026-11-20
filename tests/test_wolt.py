@@ -284,7 +284,8 @@ def test_comparison_rows_totals_and_filters(db_session):
     assert [r["name"] for r in wolt.comparison(db_session, search="duspatal")["rows"]] == [
         "Duspatalin 200 mq N30"
     ]
-    assert [v["venue"] for v in result["venues"]] == list(wolt.VENUES)
+    assert [v["venue"] for v in result["venues"]] == [wolt.OWNER, *wolt.VENUES]
+    assert [v["is_owner"] for v in result["venues"]] == [True, False, False, False]
 
 
 def test_new_scrape_refreshes_the_cached_rows(db_session):
@@ -606,3 +607,68 @@ def test_suspicious_group_is_not_counted_in_pairs(db_session):
 def test_announced_time_matches_the_timer():
     timer = (ROOT / "infra/systemd/pharmacy-monitor-wolt.timer").read_text()
     assert f"OnCalendar=*-*-* {wolt.DAILY_SYNC_UTC_HOUR:02d}:00:00 UTC" in timer
+
+
+# ─── Владелец первой колонкой ───────────────────────────────────────────────
+
+
+def _owner_product(db, name, price, *, discount=None, seen_days_ago=0):
+    from datetime import timedelta
+
+    run = db.query(storage.Run).first()
+    if run is None:
+        run = storage.Run(status="ok")
+        db.add(run)
+        db.flush()
+    product = storage.Product(
+        tenant_id=1,
+        site=wolt.OWNER,
+        external_id=f"ext-{name}",
+        url=f"https://pharmonline.az/product/{name.lower().replace(' ', '-')}",
+        name=name,
+        name_normalized=name.lower(),
+        last_seen_at=utcnow() - timedelta(days=seen_days_ago),
+    )
+    db.add(product)
+    db.flush()
+    db.add(
+        storage.PriceSnapshot(
+            run_id=run.id, product_id=product.id, price=price, discount_price=discount
+        )
+    )
+    db.commit()
+    return product
+
+
+def test_owner_site_is_the_first_column_with_its_current_price(db_session):
+    owner = _owner_product(db_session, "Betadin 10% 30 ml", 8.0, discount=6.0)
+    _seed(db_session, _item(ALOE, "2", "Betadin 10% 30 ml", 9.3))
+
+    result = wolt.comparison(db_session)
+
+    (row,) = result["rows"]
+    offer = row["prices"][wolt.OWNER]
+    assert (offer["price"], offer["original_price"]) == (6.0, 8.0)
+    assert offer["url"] == owner.url
+    assert row["cheapest"] == [wolt.OWNER]
+    assert result["venues"][0]["items"] == 1
+    pairs = {(p["a"], p["b"]): p for p in result["pairs"]}
+    assert pairs[(wolt.OWNER, ALOE)]["a_cheaper"] == 1
+
+
+def test_owner_product_not_seen_lately_is_left_out(db_session):
+    _owner_product(db_session, "Betadin 10% 30 ml", 6.0, seen_days_ago=wolt.OWNER_FRESH_DAYS + 1)
+    _seed(db_session, _item(ALOE, "2", "Betadin 10% 30 ml", 9.3))
+
+    assert wolt.comparison(db_session)["rows"] == []
+
+
+def test_new_owner_prices_refresh_the_cache(db_session):
+    _seed(db_session, _item(ALOE, "2", "Betadin 10% 30 ml", 9.3))
+    assert wolt.comparison(db_session)["rows"] == []
+
+    _owner_product(db_session, "Betadin 10% 30 ml", 6.0)
+    db_session.add(storage.Run(status="ok"))
+    db_session.commit()
+
+    assert len(wolt.comparison(db_session)["rows"]) == 1

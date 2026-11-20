@@ -44,7 +44,7 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from src import matcher, storage
+from src import matcher, site_profile, storage
 from src._time import utcnow
 from src.normalize import (
     extract_dosage,
@@ -475,12 +475,66 @@ def group_items(rows: Iterable[storage.WoltItem]) -> list[dict[str, storage.Wolt
 # Группы пересчитываются только после нового удачного сбора: сопоставление
 # ~10 тыс. товаров идёт секунды, а страница спрашивает его на каждый ввод.
 # Свой у каждого процесса API; ключ — последний удачный сбор каждой аптеки.
+# ─── Владелец: сайт клиента первой колонкой ─────────────────────────────────
+# Решение владельца 2026-11-20: рядом с аптеками Wolt — его собственные цены,
+# первой колонкой. На Wolt своего заведения у клиента нет, поэтому цена — с
+# его сайта, из ночного сбора (`products` и `price_snapshots`, только чтение):
+# действующая (со скидкой, если она есть), у товаров, которые сайт показывал
+# последние OWNER_FRESH_DAYS дней. Основной путь таблицы Wolt по-прежнему не
+# читает; зависимость односторонняя.
+OWNER = site_profile.CLIENT_SITE
+OWNER_TITLE = site_profile.SITE_TITLES[OWNER]
+OWNER_URL = "https://pharmonline.az"
+OWNER_FRESH_DAYS = 3
+# Колонки страницы: владелец, потом аптеки Wolt.
+COLUMNS: tuple[str, ...] = (OWNER, *VENUES)
+
+
+def _owner_items(session: Session) -> tuple[list[storage.WoltItem], dict[str, str]]:
+    """Товары сайта клиента в виде строк Wolt (без сессии) и их адреса."""
+    cutoff = utcnow() - timedelta(days=OWNER_FRESH_DAYS)
+    products = list(
+        session.scalars(
+            select(storage.Product).where(
+                storage.Product.site == OWNER,
+                storage.Product.tenant_id == 1,
+                storage.Product.last_seen_at >= cutoff,
+                storage.Product.url_dead_at.is_(None),
+                storage.Product.identity_conflicted.is_(False),
+            )
+        )
+    )
+    snapshots = storage.latest_snapshots_per_product(session, [p.id for p in products])
+    rows: list[storage.WoltItem] = []
+    urls: dict[str, str] = {}
+    for product in products:
+        snap = snapshots.get(product.id)
+        price = (snap.discount_price or snap.price) if snap else None
+        if not price or price <= 0 or not product.name:
+            continue
+        regular = snap.price if snap.discount_price and snap.price else None
+        item_id = str(product.id)
+        rows.append(
+            storage.WoltItem(
+                venue=OWNER,
+                item_id=item_id,
+                name=" ".join(product.name.split()),
+                price=round(float(price), 2),
+                original_price=round(float(regular), 2) if regular and regular > price else None,
+                in_stock=True,
+                in_catalog=True,
+            )
+        )
+        urls[item_id] = product.url
+    return rows, urls
+
+
 _rows_cache: dict[tuple, tuple[list[dict], dict[str, int], list[dict]]] = {}
 _cache_lock = threading.Lock()
 
 
 def _cache_key(session: Session) -> tuple:
-    return tuple(
+    wolt = tuple(
         session.execute(
             select(storage.WoltScrape.venue, func.max(storage.WoltScrape.id))
             .where(storage.WoltScrape.status == "ok")
@@ -488,6 +542,9 @@ def _cache_key(session: Session) -> tuple:
             .order_by(storage.WoltScrape.venue)
         ).all()
     )
+    # Цены владельца меняет любой прогон сбора сайтов; и срок свежести — день.
+    owner = (session.scalar(select(func.max(storage.Run.id))), utcnow().date())
+    return wolt, owner
 
 
 def _pair_summary(groups: list[dict[str, storage.WoltItem]]) -> list[dict]:
@@ -498,7 +555,7 @@ def _pair_summary(groups: list[dict[str, storage.WoltItem]]) -> list[dict]:
     мало»: у пары может быть тысяча общих товаров и ни одной разной цены.
     """
     summary = []
-    for a, b in itertools.combinations(VENUES, 2):
+    for a, b in itertools.combinations(COLUMNS, 2):
         common = same = a_cheaper = b_cheaper = 0
         for group in groups:
             ia, ib = group.get(a), group.get(b)
@@ -525,7 +582,8 @@ def _pair_summary(groups: list[dict[str, storage.WoltItem]]) -> list[dict]:
 
 
 def _build_rows(session: Session) -> tuple[list[dict], dict[str, int], list[dict]]:
-    items = list(
+    owner_items, owner_urls = _owner_items(session)
+    items = owner_items + list(
         session.scalars(
             select(storage.WoltItem).where(
                 storage.WoltItem.in_catalog.is_(True),
@@ -551,7 +609,7 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int], list[dict
         shown_groups.append(group)
         totals["rows"] += 1
         totals["differ"] += low != high
-        totals["all_venues"] += len(group) == len(VENUES)
+        totals["all_venues"] += len(group) == len(COLUMNS)
         title = min(group.values(), key=lambda item: (len(item.name), item.venue)).name
         rows.append(
             {
@@ -562,7 +620,9 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int], list[dict
                         "original_price": item.original_price,
                         "in_stock": item.in_stock,
                         "name": item.name,
-                        "url": item_url(venue, item.item_id),
+                        "url": owner_urls[item.item_id]
+                        if venue == OWNER
+                        else item_url(venue, item.item_id),
                     }
                     for venue, item in group.items()
                 },
@@ -620,8 +680,28 @@ def comparison(session: Session, *, search: str | None = None, only_diff: bool =
     }
 
 
+def _owner_status(session: Session) -> dict:
+    cutoff = utcnow() - timedelta(days=OWNER_FRESH_DAYS)
+    fresh = (
+        storage.Product.site == OWNER,
+        storage.Product.tenant_id == 1,
+        storage.Product.last_seen_at >= cutoff,
+    )
+    items = session.scalar(select(func.count()).select_from(storage.Product).where(*fresh))
+    last_seen = session.scalar(select(func.max(storage.Product.last_seen_at)).where(*fresh))
+    return {
+        "venue": OWNER,
+        "title": OWNER_TITLE,
+        "url": OWNER_URL,
+        "items": items or 0,
+        "last_status": "ok" if last_seen else None,
+        "last_ok_at": last_seen.isoformat() if last_seen else None,
+        "is_owner": True,
+    }
+
+
 def venue_status(session: Session) -> list[dict]:
-    status = []
+    status = [_owner_status(session)]
     for venue, title in VENUES.items():
         last = session.scalar(
             select(storage.WoltScrape)
@@ -647,6 +727,7 @@ def venue_status(session: Session) -> list[dict]:
                 "items": items or 0,
                 "last_status": last.status if last else None,
                 "last_ok_at": last_ok.isoformat() if last_ok else None,
+                "is_owner": False,
             }
         )
     return status

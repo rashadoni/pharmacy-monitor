@@ -935,8 +935,10 @@
     "schedule": "Updated every day at about {time} (Baku).",
     "stat_found": "Products found",
     "stat_comparable": "In 2+ pharmacies",
-    "stat_everywhere": "In all three",
+    "stat_everywhere": "In all at once",
     "stat_differ": "Price differs",
-    "pair_short": "{a} — {b}: {common} shared, {differ} with a different price"
+    "pair_short": "{a} — {b}: {common} shared, {differ} with a different price",
+    "owner_badge": "Your site",
+    "owner_pair": "{owner} vs {other}: {common} shared — {owner} cheaper on {cheaper}, dearer on {dearer}, same on {same}"
   }
 }

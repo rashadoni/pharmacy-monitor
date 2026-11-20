@@ -935,8 +935,10 @@
     "schedule": "Обновляется каждый день около {time} (Баку).",
     "stat_found": "Найдено товаров",
     "stat_comparable": "Есть в 2+ аптеках",
-    "stat_everywhere": "Во всех трёх",
+    "stat_everywhere": "Во всех сразу",
     "stat_differ": "Цена различается",
-    "pair_short": "{a} — {b}: общих {common}, с разной ценой {differ}"
+    "pair_short": "{a} — {b}: общих {common}, с разной ценой {differ}",
+    "owner_badge": "Ваш сайт",
+    "owner_pair": "{owner} и {other}: общих {common} — у {owner} дешевле {cheaper}, дороже {dearer}, одинаково {same}"
   }
 }
