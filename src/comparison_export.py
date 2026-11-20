@@ -19,6 +19,7 @@ from __future__ import annotations
 from src import site_profile
 
 import io
+import itertools
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -72,6 +73,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ən böyük fərqdən başlayaraq.",
         "info_colors": "Yaşıl — ən aşağı qiymət, qırmızı — ən yüksək.",
         "info_pairs": "Sayt cütləri üzrə (hər ikisində müqayisə olunan qiymət)",
+        "info_pairs_diff": "Sayt cütləri üzrə — yalnız qiyməti fərqli məhsullar arasında",
         "pair": "Cüt",
         "common": "Ümumi",
         "same": "Eyni qiymət",
@@ -116,6 +118,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         "начиная с самой большой разницы.",
         "info_colors": "Зелёным — самая низкая цена, красным — самая высокая.",
         "info_pairs": "По парам сайтов (сравнимая цена у обоих)",
+        "info_pairs_diff": "По парам сайтов — только среди товаров с разной ценой",
         "pair": "Пара",
         "common": "Общих",
         "same": "Цена одинаковая",
@@ -160,6 +163,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         "across sites, largest difference first.",
         "info_colors": "Green — lowest price, red — highest.",
         "info_pairs": "By pair of sites (comparable price at both)",
+        "info_pairs_diff": "By pair of sites — only among products with different prices",
         "pair": "Pair",
         "common": "Shared",
         "same": "Same price",
@@ -357,8 +361,6 @@ def pair_summary(
     сравнивается за единицу). Первый в паре — тот, кто раньше в колонках:
     «свой» сайт первым.
     """
-    import itertools
-
     summary = []
     for a, b in itertools.combinations(sites, 2):
         common = same = a_cheaper = b_cheaper = 0
@@ -558,7 +560,9 @@ def build_workbook(
 
     # Сводка по парам — как в файле раздела Wolt: по строкам этого файла.
     line = len(lines) + 2
-    _write_text(info.cell(row=line, column=1), t["info_pairs"])
+    # С галочкой «только с разной ценой» в файле нет строк с одинаковой
+    # ценой — подпись говорит, среди чего считали.
+    _write_text(info.cell(row=line, column=1), t["info_pairs_diff" if diff_only else "info_pairs"])
     info.cell(row=line, column=1).font = Font(bold=True)
     line += 1
     headers = [t["pair"], t["common"], t["same"], t["cheaper_first"], t["cheaper_second"]]
@@ -566,6 +570,7 @@ def build_workbook(
         cell = info.cell(row=line, column=column)
         _write_text(cell, text)
         cell.font = Font(bold=True)
+        cell.alignment = _HEADER_ALIGN
     for pair in pair_summary(rows, sites):
         line += 1
         _write_text(
@@ -579,7 +584,7 @@ def build_workbook(
     info.column_dimensions["A"].width = 44
     info.column_dimensions["B"].width = 40
     for column in "CDE":
-        info.column_dimensions[column].width = 18
+        info.column_dimensions[column].width = 22
 
     buffer = io.BytesIO()
     wb.save(buffer)
