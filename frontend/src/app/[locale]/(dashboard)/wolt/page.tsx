@@ -124,7 +124,10 @@ export default function WoltPage() {
                   <tr key={rowKey(row)} className="border-t border-border align-top">
                     <td className="px-3 py-2">{row.name}</td>
                     {venues.map((venue) => (
-                      <td key={venue.venue} className="px-3 py-2 text-right">
+                      <td
+                        key={venue.venue}
+                        className={cn("px-3 py-2 text-right", venue.is_owner && "bg-primary/5")}
+                      >
                         <PriceCell
                           offer={row.prices[venue.venue]}
                           venueTitle={venue.title}
@@ -155,7 +158,13 @@ export default function WoltPage() {
                 </div>
                 <dl className="mt-2 space-y-1">
                   {venues.map((venue) => (
-                    <div key={venue.venue} className="flex items-center justify-between gap-3 text-sm">
+                    <div
+                      key={venue.venue}
+                      className={cn(
+                        "flex items-center justify-between gap-3 text-sm",
+                        venue.is_owner && "-mx-1 rounded bg-primary/5 px-1 font-medium",
+                      )}
+                    >
                       <dt className="text-muted-foreground">{venue.title}</dt>
                       <dd>
                         <PriceCell
@@ -195,7 +204,10 @@ function Summary({ data }: { data: WoltComparison }) {
   const t = useTranslations("wolt");
   const locale = useLocale();
   const n = (value: number) => value.toLocaleString(locale === "en" ? "en-GB" : "ru-RU");
-  const found = data.venues.reduce((sum, venue) => sum + venue.items, 0);
+  // Найдено на Wolt: каталог владельца — его сайт, он в этой плитке не нужен.
+  const found = data.venues
+    .filter((venue) => !venue.is_owner)
+    .reduce((sum, venue) => sum + venue.items, 0);
   const titles = Object.fromEntries(data.venues.map((venue) => [venue.venue, venue.title]));
   // Сервер ставит владельца первым в паре (`a`), если он в ней есть.
   const owner = data.venues.find((venue) => venue.is_owner)?.venue;

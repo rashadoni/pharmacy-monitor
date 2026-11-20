@@ -23,8 +23,10 @@ BUTA, ALOE, KANON = list(wolt.VENUES)
 @pytest.fixture(autouse=True)
 def _fresh_cache():
     wolt._rows_cache.clear()
+    wolt._last_rows = None
     yield
     wolt._rows_cache.clear()
+    wolt._last_rows = None
 
 
 def _raw(item_id: str, name: str, price: int, **extra) -> dict:
@@ -612,7 +614,7 @@ def test_announced_time_matches_the_timer():
 # ─── Владелец первой колонкой ───────────────────────────────────────────────
 
 
-def _owner_product(db, name, price, *, discount=None, seen_days_ago=0):
+def _owner_product(db, name, price, *, discount=None, seen_days_ago=0, external_id=None, **extra):
     from datetime import timedelta
 
     run = db.query(storage.Run).first()
@@ -623,11 +625,12 @@ def _owner_product(db, name, price, *, discount=None, seen_days_ago=0):
     product = storage.Product(
         tenant_id=1,
         site=wolt.OWNER,
-        external_id=f"ext-{name}",
+        external_id=external_id or f"ext-{name}",
         url=f"https://pharmonline.az/product/{name.lower().replace(' ', '-')}",
         name=name,
         name_normalized=name.lower(),
         last_seen_at=utcnow() - timedelta(days=seen_days_ago),
+        **extra,
     )
     db.add(product)
     db.flush()
@@ -635,7 +638,7 @@ def _owner_product(db, name, price, *, discount=None, seen_days_ago=0):
         storage.PriceSnapshot(
             run_id=run.id, product_id=product.id, price=price, discount_price=discount
         )
-    )
+    ) if price is not None else None
     db.commit()
     return product
 
@@ -663,12 +666,97 @@ def test_owner_product_not_seen_lately_is_left_out(db_session):
     assert wolt.comparison(db_session)["rows"] == []
 
 
-def test_new_owner_prices_refresh_the_cache(db_session):
+def test_owner_prices_written_during_a_running_collection_refresh_the_cache(db_session):
+    """Сбор пишет цены пачками по ходу прогона; страница, открытая посреди него,
+    не должна застрять на половине."""
+    db_session.add(storage.Run(status="running"))
+    db_session.commit()
     _seed(db_session, _item(ALOE, "2", "Betadin 10% 30 ml", 9.3))
     assert wolt.comparison(db_session)["rows"] == []
 
     _owner_product(db_session, "Betadin 10% 30 ml", 6.0)
-    db_session.add(storage.Run(status="ok"))
-    db_session.commit()
 
     assert len(wolt.comparison(db_session)["rows"]) == 1
+
+
+def test_owner_out_of_stock_is_grey_and_not_compared(db_session):
+    _owner_product(db_session, "Betadin 10% 30 ml", 5.0, offer_availability_status="out_of_stock")
+    _seed(
+        db_session,
+        _item(ALOE, "2", "Betadin 10% 30 ml", 9.3),
+        _item(KANON, "3", "Betadin 10% 30 ml", 9.5),
+    )
+
+    (row,) = wolt.comparison(db_session)["rows"]
+    pairs = {(p["a"], p["b"]): p for p in wolt.comparison(db_session)["pairs"]}
+
+    assert row["prices"][wolt.OWNER]["in_stock"] is False
+    assert row["cheapest"] == [ALOE]
+    assert pairs[(wolt.OWNER, ALOE)]["common"] == 0
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"url_dead_at": utcnow()},
+        {"identity_conflicted": True},
+        {"availability_source": "pharmonline_identity_retirement"},
+    ],
+)
+def test_unusable_owner_cards_are_left_out(db_session, extra):
+    _owner_product(db_session, "Betadin 10% 30 ml", 6.0, **extra)
+    _seed(db_session, _item(ALOE, "2", "Betadin 10% 30 ml", 9.3))
+
+    assert wolt.comparison(db_session)["rows"] == []
+
+
+def test_owner_card_without_a_price_is_left_out(db_session):
+    _owner_product(db_session, "Betadin 10% 30 ml", None)
+    _seed(db_session, _item(ALOE, "2", "Betadin 10% 30 ml", 9.3))
+
+    result = wolt.comparison(db_session)
+
+    assert result["rows"] == []
+    assert result["venues"][0]["items"] == 0
+
+
+def test_owner_that_is_a_different_product_does_not_hide_the_wolt_row(db_session):
+    _owner_product(db_session, "Ursosan 250 mq Kapsul", 30.0)
+    _seed(
+        db_session,
+        _item(BUTA, "1", "Ursosan 250 mq Həblər", 9.0),
+        _item(ALOE, "2", "Ursosan 250 mq Həblər", 9.5),
+    )
+
+    (row,) = wolt.comparison(db_session)["rows"]
+
+    assert set(row["prices"]) == {BUTA, ALOE}
+
+
+def test_owner_price_three_times_off_does_not_hide_the_wolt_row(db_session):
+    _owner_product(db_session, "Keratodrop 10 ml", 60.0)
+    _seed(
+        db_session,
+        _item(BUTA, "1", "Keratodrop 10 ml", 17.0),
+        _item(ALOE, "2", "Keratodrop 10 ml", 18.0),
+    )
+
+    result = wolt.comparison(db_session)
+
+    (row,) = result["rows"]
+    assert set(row["prices"]) == {BUTA, ALOE}
+    assert result["totals"]["suspicious"] == 0
+
+
+def test_two_owner_cards_under_one_name_leave_its_cell_empty(db_session):
+    _owner_product(db_session, "Keratodrop 10 ml", 17.0, external_id="a")
+    _owner_product(db_session, "Keratodrop 10 ml", 16.0, external_id="b")
+    _seed(
+        db_session,
+        _item(BUTA, "1", "Keratodrop 10 ml", 17.0),
+        _item(ALOE, "2", "Keratodrop 10 ml", 18.0),
+    )
+
+    (row,) = wolt.comparison(db_session)["rows"]
+
+    assert set(row["prices"]) == {BUTA, ALOE}

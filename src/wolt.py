@@ -442,13 +442,19 @@ def _as_product(row: storage.WoltItem) -> storage.Product:
     )
 
 
-def group_items(rows: Iterable[storage.WoltItem]) -> list[dict[str, storage.WoltItem]]:
+def group_items(
+    rows: Iterable[storage.WoltItem], *, optional: frozenset[str] = frozenset()
+) -> list[dict[str, storage.WoltItem]]:
     """Один и тот же товар в разных аптеках: {аптека: строка}, минимум две.
 
     Ключ — свёрнутое нормализованное название, доза и фасовка. У аптеки,
     где под одним ключом лежат два товара, место в группе пустое: какой из
     них тот самый, по названию не решить. Группа, где хоть одна пара
     признана разными товарами, не показывается вовсе.
+
+    ``optional`` — колонки, которые пристёгиваются к группе остальных, но
+    сами её не ломают (владелец): спорная строка такой колонки выпадает из
+    группы, а группа аптек Wolt остаётся какой была бы без неё.
     """
     buckets: dict[tuple, dict[str, list[tuple[storage.WoltItem, storage.Product]]]] = defaultdict(
         lambda: defaultdict(list)
@@ -462,26 +468,33 @@ def group_items(rows: Iterable[storage.WoltItem]) -> list[dict[str, storage.Wolt
     groups: list[dict[str, storage.WoltItem]] = []
     for by_venue in buckets.values():
         picked = {venue: found[0] for venue, found in by_venue.items() if len(found) == 1}
-        if len(picked) < 2:
-            continue
+        core = {venue: pair for venue, pair in picked.items() if venue not in optional}
         if any(
-            _different_products(a[1], b[1]) for a, b in itertools.combinations(picked.values(), 2)
+            _different_products(a[1], b[1]) for a, b in itertools.combinations(core.values(), 2)
         ):
             continue
-        groups.append({venue: pair[0] for venue, pair in picked.items()})
+        group = dict(core)
+        for venue, pair in picked.items():
+            if venue in optional and not any(
+                _different_products(pair[1], other[1]) for other in group.values()
+            ):
+                group[venue] = pair
+        if len(group) < 2:
+            continue
+        groups.append({venue: pair[0] for venue, pair in group.items()})
     return groups
 
 
-# Группы пересчитываются только после нового удачного сбора: сопоставление
-# ~10 тыс. товаров идёт секунды, а страница спрашивает его на каждый ввод.
-# Свой у каждого процесса API; ключ — последний удачный сбор каждой аптеки.
 # ─── Владелец: сайт клиента первой колонкой ─────────────────────────────────
 # Решение владельца 2026-11-20: рядом с аптеками Wolt — его собственные цены,
 # первой колонкой. На Wolt своего заведения у клиента нет, поэтому цена — с
 # его сайта, из ночного сбора (`products` и `price_snapshots`, только чтение):
-# действующая (со скидкой, если она есть), у товаров, которые сайт показывал
-# последние OWNER_FRESH_DAYS дней. Основной путь таблицы Wolt по-прежнему не
-# читает; зависимость односторонняя.
+# действующая (со скидкой, если она есть) по тому же правилу, что основная
+# страница сравнения (`comparison_rows`): в эпоху доверенного каталога —
+# только проверенные цены. Товары — те, что сайт показывал последние
+# OWNER_FRESH_DAYS дней, без мёртвых ссылок, изолированных и архивных
+# карточек; наличие — как пишет сайт. Основной путь таблицы Wolt по-прежнему
+# не читает; зависимость односторонняя.
 OWNER = site_profile.CLIENT_SITE
 OWNER_TITLE = site_profile.SITE_TITLES[OWNER]
 OWNER_URL = "https://pharmonline.az"
@@ -492,27 +505,39 @@ COLUMNS: tuple[str, ...] = (OWNER, *VENUES)
 
 def _owner_items(session: Session) -> tuple[list[storage.WoltItem], dict[str, str]]:
     """Товары сайта клиента в виде строк Wolt (без сессии) и их адреса."""
+    from src import product_policy
+    from src.comparison_rows import _trusted_snapshot_lineage_available
+
     cutoff = utcnow() - timedelta(days=OWNER_FRESH_DAYS)
     products = list(
-        session.scalars(
-            select(storage.Product).where(
+        session.execute(
+            select(
+                storage.Product.id,
+                storage.Product.name,
+                storage.Product.url,
+                storage.Product.offer_availability_status,
+            ).where(
                 storage.Product.site == OWNER,
                 storage.Product.tenant_id == 1,
                 storage.Product.last_seen_at >= cutoff,
                 storage.Product.url_dead_at.is_(None),
-                storage.Product.identity_conflicted.is_(False),
+                product_policy.source_identity_eligible_sql(storage.Product),
             )
         )
     )
-    snapshots = storage.latest_snapshots_per_product(session, [p.id for p in products])
+    prices = storage.latest_prices_per_product(
+        session,
+        [row.id for row in products],
+        financially_eligible_only=_trusted_snapshot_lineage_available(session),
+    )
     rows: list[storage.WoltItem] = []
     urls: dict[str, str] = {}
     for product in products:
-        snap = snapshots.get(product.id)
-        price = (snap.discount_price or snap.price) if snap else None
+        regular, discount, _on_sale = prices.get(product.id, (None, None, False))
+        price = discount or regular
         if not price or price <= 0 or not product.name:
             continue
-        regular = snap.price if snap.discount_price and snap.price else None
+        regular = regular if discount and regular else None
         item_id = str(product.id)
         rows.append(
             storage.WoltItem(
@@ -521,7 +546,7 @@ def _owner_items(session: Session) -> tuple[list[storage.WoltItem], dict[str, st
                 name=" ".join(product.name.split()),
                 price=round(float(price), 2),
                 original_price=round(float(regular), 2) if regular and regular > price else None,
-                in_stock=True,
+                in_stock=product.offer_availability_status != product_policy.OFFER_OUT_OF_STOCK,
                 in_catalog=True,
             )
         )
@@ -529,8 +554,14 @@ def _owner_items(session: Session) -> tuple[list[storage.WoltItem], dict[str, st
     return rows, urls
 
 
+# Строки пересчитываются, только когда сменились данные: сопоставление ~20 тыс.
+# товаров идёт секунды, а страница спрашивает его на каждый ввод. Свой у
+# каждого процесса API. Пока один запрос пересобирает, остальные получают
+# прошлый результат, а не ждут.
 _rows_cache: dict[tuple, tuple[list[dict], dict[str, int], list[dict]]] = {}
+_last_rows: tuple[list[dict], dict[str, int], list[dict]] | None = None
 _cache_lock = threading.Lock()
+_build_lock = threading.Lock()
 
 
 def _cache_key(session: Session) -> tuple:
@@ -542,8 +573,14 @@ def _cache_key(session: Session) -> tuple:
             .order_by(storage.WoltScrape.venue)
         ).all()
     )
-    # Цены владельца меняет любой прогон сбора сайтов; и срок свежести — день.
-    owner = (session.scalar(select(func.max(storage.Run.id))), utcnow().date())
+    # Цены владельца: последняя записанная цена (сбор пишет их пачками по ходу
+    # прогона) и конец последнего прогона (меняет доверенную эпоху); срок
+    # свежести товаров — сутки.
+    owner = (
+        session.scalar(select(func.max(storage.PriceSnapshot.id))),
+        session.scalar(select(func.max(storage.Run.finished_at))),
+        utcnow().date(),
+    )
     return wolt, owner
 
 
@@ -581,9 +618,19 @@ def _pair_summary(groups: list[dict[str, storage.WoltItem]]) -> list[dict]:
     return summary
 
 
+def _price_range(group: dict[str, storage.WoltItem]) -> tuple[float, float]:
+    # Сравниваются цены того, что можно купить; товар «нет в наличии»
+    # показывается, но в разницу и «дешевле всех» не идёт.
+    prices = [item.price for item in group.values() if item.in_stock]
+    if len(prices) < 2:
+        low = min(prices or [item.price for item in group.values()])
+        return low, low
+    return min(prices), max(prices)
+
+
 def _build_rows(session: Session) -> tuple[list[dict], dict[str, int], list[dict]]:
     owner_items, owner_urls = _owner_items(session)
-    items = owner_items + list(
+    wolt_items = list(
         session.scalars(
             select(storage.WoltItem).where(
                 storage.WoltItem.in_catalog.is_(True),
@@ -591,18 +638,25 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int], list[dict
             )
         )
     )
-    totals = {"rows": 0, "differ": 0, "all_venues": 0, "suspicious": 0}
+    totals = {
+        "rows": 0,
+        "differ": 0,
+        "all_venues": 0,
+        "suspicious": 0,
+        "owner_items": len(owner_items),
+    }
     rows: list[dict] = []
     shown_groups: list[dict[str, storage.WoltItem]] = []
-    for group in group_items(items):
-        # Сравниваются цены того, что можно купить; товар «нет в наличии»
-        # показывается, но в разницу и «дешевле всех» не идёт.
-        prices = [item.price for item in group.values() if item.in_stock]
-        if len(prices) < 2:
-            prices = prices or [item.price for item in group.values()]
-            low = high = min(prices)
-        else:
-            low, high = min(prices), max(prices)
+    for group in group_items(owner_items + wolt_items, optional=frozenset({OWNER})):
+        low, high = _price_range(group)
+        if high > low * MAX_PRICE_RATIO and OWNER in group:
+            # Цена владельца втрое от остальных — его карточка, скорее всего,
+            # не тот товар; строку аптек Wolt она не прячет.
+            group = {venue: item for venue, item in group.items() if venue != OWNER}
+            if len(group) < 2:
+                totals["suspicious"] += 1
+                continue
+            low, high = _price_range(group)
         if high > low * MAX_PRICE_RATIO:
             totals["suspicious"] += 1
             continue
@@ -650,15 +704,28 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int], list[dict
 
 def comparison(session: Session, *, search: str | None = None, only_diff: bool = False) -> dict:
     """Строки сравнения аптек Wolt, самые большие разницы — первыми."""
+    global _last_rows
     key = _cache_key(session)
-    # Строит один запрос, остальные ждут его: после нового сбора страница
-    # шлёт запрос на каждую клавишу, и каждый строил бы то же самое.
     with _cache_lock:
         cached = _rows_cache.get(key)
-        if cached is None:
-            cached = _build_rows(session)
-            _rows_cache.clear()
-            _rows_cache[key] = cached
+        stale = _last_rows
+    if cached is None:
+        # Строит один запрос; остальные получают прошлый результат, а ждут
+        # только тогда, когда прошлого ещё нет (первый запрос процесса).
+        if _build_lock.acquire(blocking=stale is None):
+            try:
+                with _cache_lock:
+                    cached = _rows_cache.get(key)
+                if cached is None:
+                    cached = _build_rows(session)
+                    with _cache_lock:
+                        _rows_cache.clear()
+                        _rows_cache[key] = cached
+                        _last_rows = cached
+            finally:
+                _build_lock.release()
+        else:
+            cached = stale
     rows, totals, pairs = cached
     needle = ""
     if search and search.strip():
@@ -671,10 +738,13 @@ def comparison(session: Session, *, search: str | None = None, only_diff: bool =
         if not (only_diff and row["min_price"] == row["max_price"])
         and (not needle or needle in row["_search"])
     ]
+    venues = venue_status(session)
+    # На карточке владельца — столько товаров, сколько пошло в сравнение.
+    venues[0]["items"] = totals["owner_items"]
     return {
-        "venues": venue_status(session),
+        "venues": venues,
         "rows": shown,
-        "totals": dict(totals),
+        "totals": {k: v for k, v in totals.items() if k != "owner_items"},
         "pairs": pairs,
         "daily_sync_baku": f"{(DAILY_SYNC_UTC_HOUR + BAKU_UTC_OFFSET_HOURS) % 24:02d}:00",
     }
