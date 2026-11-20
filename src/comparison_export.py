@@ -71,6 +71,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         "info_rule": "«Fərqli qiymətlər» vərəqi: saytlarda qiyməti eyni olmayan bütün məhsullar, "
         "ən böyük fərqdən başlayaraq.",
         "info_colors": "Yaşıl — ən aşağı qiymət, qırmızı — ən yüksək.",
+        "info_pairs": "Sayt cütləri üzrə (hər ikisində müqayisə olunan qiymət)",
+        "pair": "Cüt",
+        "common": "Ümumi",
+        "same": "Eyni qiymət",
+        "cheaper_first": "Birincidə ucuzdur",
+        "cheaper_second": "İkincidə ucuzdur",
         "yes": "bəli",
         "all": "hamısı",
         "filename": "qiymet-ferqleri",
@@ -109,6 +115,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         "info_rule": "Лист «Разные цены»: все товары, у которых цена на сайтах не совпадает, "
         "начиная с самой большой разницы.",
         "info_colors": "Зелёным — самая низкая цена, красным — самая высокая.",
+        "info_pairs": "По парам сайтов (сравнимая цена у обоих)",
+        "pair": "Пара",
+        "common": "Общих",
+        "same": "Цена одинаковая",
+        "cheaper_first": "Дешевле у первого",
+        "cheaper_second": "Дешевле у второго",
         "yes": "да",
         "all": "все",
         "filename": "raznye-ceny",
@@ -147,6 +159,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         "info_rule": "Sheet “Price differences”: every product whose price is not the same "
         "across sites, largest difference first.",
         "info_colors": "Green — lowest price, red — highest.",
+        "info_pairs": "By pair of sites (comparable price at both)",
+        "pair": "Pair",
+        "common": "Shared",
+        "same": "Same price",
+        "cheaper_first": "Cheaper at the first",
+        "cheaper_second": "Cheaper at the second",
         "yes": "yes",
         "all": "all",
         "filename": "price-differences",
@@ -329,6 +347,48 @@ def difference_counts(rows: list[dict[str, Any]], client_site: str = CLIENT_SITE
     return counts
 
 
+def pair_summary(
+    rows: list[dict[str, Any]], sites: tuple[str, ...] = SITES
+) -> list[dict[str, Any]]:
+    """Каждая пара сайтов: общих товаров, у скольких цена одинаковая, где дешевле.
+
+    Считаются строки, где у обоих сайтов цена сравнимая (свежая и в наличии) —
+    по тому же значению, что колонка разницы (за единицу, если строка
+    сравнивается за единицу). Первый в паре — тот, кто раньше в колонках:
+    «свой» сайт первым.
+    """
+    import itertools
+
+    summary = []
+    for a, b in itertools.combinations(sites, 2):
+        common = same = a_cheaper = b_cheaper = 0
+        for row in rows:
+            ea, eb = row["prices"].get(a), row["prices"].get(b)
+            if ea is None or eb is None or not (_comparable(ea) and _comparable(eb)):
+                continue
+            if ea.get("price") is None or eb.get("price") is None:
+                continue
+            va, vb = _compared_value(row, ea), _compared_value(row, eb)
+            common += 1
+            if va == vb:
+                same += 1
+            elif va < vb:
+                a_cheaper += 1
+            else:
+                b_cheaper += 1
+        summary.append(
+            {
+                "a": a,
+                "b": b,
+                "common": common,
+                "same_price": same,
+                "a_cheaper": a_cheaper,
+                "b_cheaper": b_cheaper,
+            }
+        )
+    return summary
+
+
 def _position(row: dict[str, Any], t: dict[str, str], client_site: str = CLIENT_SITE) -> str:
     position = client_position(row, client_site)
     return t[f"pos_{position}"] if position else ""
@@ -495,8 +555,31 @@ def build_workbook(
         else:
             _write_text(info.cell(row=index, column=2), value)
     info["A1"].font = Font(bold=True, size=13)
+
+    # Сводка по парам — как в файле раздела Wolt: по строкам этого файла.
+    line = len(lines) + 2
+    _write_text(info.cell(row=line, column=1), t["info_pairs"])
+    info.cell(row=line, column=1).font = Font(bold=True)
+    line += 1
+    headers = [t["pair"], t["common"], t["same"], t["cheaper_first"], t["cheaper_second"]]
+    for column, text in enumerate(headers, start=1):
+        cell = info.cell(row=line, column=column)
+        _write_text(cell, text)
+        cell.font = Font(bold=True)
+    for pair in pair_summary(rows, sites):
+        line += 1
+        _write_text(
+            info.cell(row=line, column=1),
+            f"{SITE_TITLES[pair['a']]} — {SITE_TITLES[pair['b']]}",
+        )
+        info.cell(row=line, column=2, value=pair["common"])
+        info.cell(row=line, column=3, value=pair["same_price"])
+        info.cell(row=line, column=4, value=pair["a_cheaper"])
+        info.cell(row=line, column=5, value=pair["b_cheaper"])
     info.column_dimensions["A"].width = 44
     info.column_dimensions["B"].width = 40
+    for column in "CDE":
+        info.column_dimensions[column].width = 18
 
     buffer = io.BytesIO()
     wb.save(buffer)
