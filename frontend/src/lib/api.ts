@@ -1010,6 +1010,8 @@ export type WoltVenue = {
   items: number;
   last_status: "ok" | "failed" | "running" | null;
   last_ok_at: string | null;
+  // Сайт клиента: первая колонка, цена с его сайта, а не с Wolt.
+  is_owner: boolean;
 };
 
 export type WoltOfferPrice = {

@@ -56,7 +56,7 @@ export default function WoltPage() {
         )}
       </header>
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {venues.map((venue) => (
           <VenueCard key={venue.venue} venue={venue} locale={locale} />
         ))}
@@ -109,7 +109,10 @@ export default function WoltPage() {
                 <tr>
                   <th className="px-3 py-2 font-medium">{t("product")}</th>
                   {venues.map((venue) => (
-                    <th key={venue.venue} className="px-3 py-2 text-right font-medium">
+                    <th
+                      key={venue.venue}
+                      className={cn("px-3 py-2 text-right font-medium", venue.is_owner && "bg-primary/10 text-foreground")}
+                    >
                       {venue.title}
                     </th>
                   ))}
@@ -121,7 +124,10 @@ export default function WoltPage() {
                   <tr key={rowKey(row)} className="border-t border-border align-top">
                     <td className="px-3 py-2">{row.name}</td>
                     {venues.map((venue) => (
-                      <td key={venue.venue} className="px-3 py-2 text-right">
+                      <td
+                        key={venue.venue}
+                        className={cn("px-3 py-2 text-right", venue.is_owner && "bg-primary/5")}
+                      >
                         <PriceCell
                           offer={row.prices[venue.venue]}
                           venueTitle={venue.title}
@@ -152,7 +158,13 @@ export default function WoltPage() {
                 </div>
                 <dl className="mt-2 space-y-1">
                   {venues.map((venue) => (
-                    <div key={venue.venue} className="flex items-center justify-between gap-3 text-sm">
+                    <div
+                      key={venue.venue}
+                      className={cn(
+                        "flex items-center justify-between gap-3 text-sm",
+                        venue.is_owner && "-mx-1 rounded bg-primary/5 px-1 font-medium",
+                      )}
+                    >
                       <dt className="text-muted-foreground">{venue.title}</dt>
                       <dd>
                         <PriceCell
@@ -192,8 +204,15 @@ function Summary({ data }: { data: WoltComparison }) {
   const t = useTranslations("wolt");
   const locale = useLocale();
   const n = (value: number) => value.toLocaleString(locale === "en" ? "en-GB" : "ru-RU");
-  const found = data.venues.reduce((sum, venue) => sum + venue.items, 0);
+  // Найдено на Wolt: каталог владельца — его сайт, он в этой плитке не нужен.
+  const found = data.venues
+    .filter((venue) => !venue.is_owner)
+    .reduce((sum, venue) => sum + venue.items, 0);
   const titles = Object.fromEntries(data.venues.map((venue) => [venue.venue, venue.title]));
+  // Сервер ставит владельца первым в паре (`a`), если он в ней есть.
+  const owner = data.venues.find((venue) => venue.is_owner)?.venue;
+  const ownerPairs = data.pairs.filter((pair) => pair.a === owner);
+  const otherPairs = data.pairs.filter((pair) => pair.a !== owner);
   const tiles = [
     { label: t("stat_found"), value: found },
     { label: t("stat_comparable"), value: data.totals.rows },
@@ -210,8 +229,22 @@ function Summary({ data }: { data: WoltComparison }) {
           </div>
         ))}
       </dl>
-      <ul className="flex flex-col gap-1 text-sm text-muted-foreground md:flex-row md:flex-wrap md:gap-x-6">
-        {data.pairs.map((pair) => (
+      <ul className="space-y-1 text-sm">
+        {ownerPairs.map((pair) => (
+          <li key={`${pair.a}|${pair.b}`}>
+            {t("owner_pair", {
+              owner: titles[pair.a] ?? pair.a,
+              other: titles[pair.b] ?? pair.b,
+              common: n(pair.common),
+              cheaper: n(pair.a_cheaper),
+              dearer: n(pair.b_cheaper),
+              same: n(pair.same_price),
+            })}
+          </li>
+        ))}
+      </ul>
+      <ul className="flex flex-col gap-1 text-xs text-muted-foreground md:flex-row md:flex-wrap md:gap-x-6">
+        {otherPairs.map((pair) => (
           <li key={`${pair.a}|${pair.b}`}>
             {t("pair_short", {
               a: titles[pair.a] ?? pair.a,
@@ -235,7 +268,8 @@ function rowKey(row: WoltRow): string {
 function VenueCard({ venue, locale }: { venue: WoltVenue; locale: string }) {
   const t = useTranslations("wolt");
   return (
-    <div className="rounded-md border border-border p-3">
+    <div className={cn("rounded-md border p-3", venue.is_owner ? "border-primary bg-primary/5" : "border-border")}>
+      {venue.is_owner && <div className="mb-1 text-xs font-medium text-primary">{t("owner_badge")}</div>}
       <a
         href={venue.url}
         target="_blank"
