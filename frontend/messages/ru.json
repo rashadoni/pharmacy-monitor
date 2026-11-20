@@ -939,6 +939,9 @@
     "stat_differ": "Цена различается",
     "pair_short": "{a} — {b}: общих {common}, с разной ценой {differ}",
     "owner_badge": "Ваш сайт",
-    "owner_pair": "{owner} и {other}: общих {common} — у {owner} дешевле {cheaper}, дороже {dearer}, одинаково {same}"
+    "owner_pair": "{owner} и {other}: общих {common} — у {owner} дешевле {cheaper}, дороже {dearer}, одинаково {same}",
+    "export": "Скачать Excel",
+    "exporting": "Готовлю файл…",
+    "export_failed": "Не удалось выгрузить Excel"
   }
 }

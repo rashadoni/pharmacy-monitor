@@ -1389,6 +1389,19 @@ export const api = {
     const qs = q.toString();
     return request<WoltComparison>(`/api/v1/dash/wolt/comparison${qs ? `?${qs}` : ""}`);
   },
+  woltExport: async (search: string, locale: string): Promise<{ blob: Blob; filename: string }> => {
+    const q = new URLSearchParams({ locale });
+    if (search.trim()) q.set("search", search.trim());
+    const res = await fetch(`${BASE}/api/v1/dash/wolt/export.xlsx?${q}`, {
+      credentials: "include",
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new ApiError(res.status, text || res.statusText);
+    }
+    const named = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") ?? "");
+    return { blob: await res.blob(), filename: named?.[1] ?? "wolt.xlsx" };
+  },
   categoryComparison: (client_site?: string, locale?: string) => {
     const q = new URLSearchParams();
     if (client_site) q.set("client_site", client_site);

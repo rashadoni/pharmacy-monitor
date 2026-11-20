@@ -939,6 +939,9 @@
     "stat_differ": "Qiyməti fərqlənir",
     "pair_short": "{a} — {b}: ümumi {common}, qiyməti fərqli {differ}",
     "owner_badge": "Sizin sayt",
-    "owner_pair": "{owner} və {other}: ümumi {common} — {owner} daha ucuz: {cheaper}, daha baha: {dearer}, eyni: {same}"
+    "owner_pair": "{owner} və {other}: ümumi {common} — {owner} daha ucuz: {cheaper}, daha baha: {dearer}, eyni: {same}",
+    "export": "Excel yüklə",
+    "exporting": "Fayl hazırlanır…",
+    "export_failed": "Excel yüklənmədi"
   }
 }
