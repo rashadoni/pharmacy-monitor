@@ -1167,7 +1167,7 @@ def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthI
     if error_type is not None:
         if mailing.accepted:
             outcome = (
-                f"ушло без отчёта о разнице цен и без файла ({mailing.accepted} из "
+                f"ушло без отчёта о разнице цен сайтов и без его файла ({mailing.accepted} из "
                 f"{mailing.recipients} получателей)"
             )
         elif mailing.recipients:
@@ -1185,7 +1185,7 @@ def _check_daily_letter(session: Session, *, tenant_id: int = 1) -> list[HealthI
         )
     elif skipped is not None and mailing.report != daily_letter_state.REPORT_NO_RECIPIENTS:
         outcome = (
-            "письмо ушло без чисел и без файла"
+            "письмо ушло без чисел и файла сравнения сайтов"
             if mailing.recipients
             else "письма не было вовсе — событий за сутки тоже нет"
         )

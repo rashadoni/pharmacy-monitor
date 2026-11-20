@@ -580,7 +580,8 @@ class DigestOutcome:
             error_type = type(self.report_failure).__name__
             if self.recipients:
                 found.append(
-                    f"отчёт о разнице цен не собрался ({error_type}) — письмо без чисел и без файла"
+                    f"отчёт о разнице цен не собрался ({error_type}) — письмо без чисел и "
+                    "файла сравнения сайтов"
                 )
             else:
                 found.append(str(DailyLetterNotSent(error_type)))
@@ -759,21 +760,48 @@ def _send_digest(
         log.info("digest_no_events", kind=kind, tenant=tenant_id)
         return DigestOutcome(report=report_state, dry_run=dry_run, report_failure=report_failure)
 
+    # Раздел «Аптеки на Wolt» — только письму, которое уходит: сам он письма не
+    # вызывает. Сборка и отрисовка — под одной защитой: сломанный раздел письмо
+    # не останавливает, оно уходит без него. Сторож (`daily_letter_state`) этого
+    # не видит — только журнал (`digest_wolt_report_failed`).
+    wolt_report: _WoltReport | None = None
+    wolt_html = ""
+    if kind == "daily":
+        try:
+            with session.begin_nested():
+                wolt_report = _wolt_report(session, tenant_id, locale=locale)
+            if wolt_report is not None:
+                wolt_html = _render_wolt_report(wolt_report)
+        except Exception as exc:
+            wolt_report, wolt_html = None, ""
+            log.exception(
+                "digest_wolt_report_failed",
+                kind=kind,
+                tenant=tenant_id,
+                error_type=type(exc).__name__,
+            )
+
     # Письмо одно на всех получателей. «Порог email-уведомлений» получателя
     # (`email_severity_min`) на дайджест не действует — решение владельца
     # 2026-10-07: размер держат потолки, а с порогом `warning` из почты совсем
     # пропали бы названия товаров из «Можно поднять цену».
     if report is None:
-        html = _render_digest_email(events, kind=kind, since=since)
+        html = _render_digest_email(events, kind=kind, since=since, wolt_html=wolt_html)
         subject = _digest_subject(events, kind)
-        # Без отчёта письмо шлётся и пишется в журнал теми же аргументами, что раньше.
+        # Без отчёта сайтов письмо шлётся теми же аргументами, что раньше; файл
+        # Wolt, если раздел есть, добавляется ниже.
         with_file: dict = {}
         file_size: dict = {}
     else:
-        html = _render_digest_email(events, kind=kind, since=since, price_report=report)
+        html = _render_digest_email(
+            events, kind=kind, since=since, price_report=report, wolt_html=wolt_html
+        )
         subject = _price_letter_subject(report)
         with_file = {"attachments": [report.attachment]}
         file_size = {"attachment_kb": round(len(report.attachment[1]) / 1024, 1)}
+    if wolt_report is not None:
+        with_file = {"attachments": [*with_file.get("attachments", []), wolt_report.attachment]}
+        file_size["wolt_attachment_kb"] = round(len(wolt_report.attachment[1]) / 1024, 1)
     sent = 0
     accepted = 0
     for user in users:
@@ -1034,6 +1062,258 @@ def _price_report(
         reason = "no_comparison_rows"
     log.info("digest_price_report_skipped", tenant=tenant_id, reason=reason)
     return None, daily_letter_state.report_skipped(reason)
+
+
+# ─── Аптеки на Wolt в утреннем письме ───────────────────────────────────────
+# Решение владельца 2026-11-20: сравнение аптек Wolt приходит тем же утренним
+# письмом — разделом под разницей цен сайтов и вторым файлом во вложении.
+# Отдельной рассылки и отдельной галочки нет: письмо получают те, у кого
+# включён «Ежедневный дайджест».
+
+# Каталоги Wolt собираются раз в сутки (`wolt.DAILY_SYNC_UTC_HOUR`, 06:00 UTC),
+# письмо уходит в 05:00 UTC — обычно данным около 23 часов. Старше 30 — сбор
+# пропущен, и письмо об этом говорит.
+_WOLT_MAX_AGE_HOURS = 30
+# Все каталоги Wolt старше трёх суток — сбор остановлен (таймер выключен или
+# сломан надолго): раздел не показывается совсем, а не шлёт клиенту каждое
+# утро всё более старые цены с предупреждением.
+_WOLT_DROP_AFTER_HOURS = 72
+# Рубильник раздела без выкладки кода: DAILY_LETTER_WOLT=0 в env убирает его
+# из письма со следующего утра.
+_WOLT_SWITCH_ENV = "DAILY_LETTER_WOLT"
+
+
+@dataclass(frozen=True)
+class _WoltVenueAge:
+    title: str
+    # Конец последнего удачного сбора (UTC без пояса); None — сбора не было.
+    collected_at: datetime | None
+    overdue: bool
+
+
+@dataclass(frozen=True)
+class _WoltPair:
+    """Владелец и одна аптека Wolt: товары, которые есть в наличии у обоих."""
+
+    title: str
+    common: int
+    owner_cheaper: int
+    venue_cheaper: int
+    same_price: int
+
+
+@dataclass(frozen=True)
+class _WoltReport:
+    generated_at: datetime
+    # Числа — `wolt_export.difference_counts`, определения там же.
+    counts: dict[str, int]
+    pairs: tuple[_WoltPair, ...]
+    venues: tuple[_WoltVenueAge, ...]
+    # Строки, где цены расходятся больше чем втрое: в сравнении их нет.
+    suspicious: int
+    attachment: tuple[str, bytes, str]
+
+
+def _wolt_switched_off() -> bool:
+    return os.environ.get(_WOLT_SWITCH_ENV, "1").strip().lower() in {"0", "false", "off", "no"}
+
+
+def _wolt_skip_reason(collected: dict[str, datetime | None], now: datetime) -> str | None:
+    if not any(collected.values()):
+        return "no_wolt_catalog"
+    if all(
+        moment is None or now - moment > timedelta(hours=_WOLT_DROP_AFTER_HOURS)
+        for moment in collected.values()
+    ):
+        return "wolt_catalog_too_old"
+    return None
+
+
+def _wolt_report(session: Session, tenant_id: int, *, locale: str) -> _WoltReport | None:
+    """Раздел «Аптеки на Wolt» утреннего письма; None — раздела нет.
+
+    Строки — те же, что показывает раздел `/wolt` без фильтров
+    (`wolt.comparison`). Раздела нет у неаптечного экземпляра, у арендатора,
+    кроме первого (колонка владельца — цены его сайта, `wolt._owner_items`),
+    при `DAILY_LETTER_WOLT=0` (или false/off/no), пока ни одна аптека Wolt не
+    собрана, когда все каталоги старше `_WOLT_DROP_AFTER_HOURS` и когда
+    сравнивать нечего; причина — в журнале (`digest_wolt_report_skipped`).
+    Исключение значит, что раздел сломан; ловит его вызывающий.
+    """
+    from src import site_profile, wolt, wolt_export
+
+    if not site_profile.is_pharmacy():
+        return _wolt_skipped(tenant_id, "not_a_pharmacy_instance")
+    if tenant_id != 1:
+        return _wolt_skipped(tenant_id, "not_the_wolt_tenant")
+    if _wolt_switched_off():
+        return _wolt_skipped(tenant_id, "switched_off")
+    now = utcnow()
+    # Возраст каталогов — до сборки строк: она стоит секунд, а при старых
+    # каталогах раздела всё равно не будет.
+    collected = {
+        venue["venue"]: datetime.fromisoformat(venue["last_ok_at"]) if venue["last_ok_at"] else None
+        for venue in wolt.venue_status(session)
+        if not venue["is_owner"]
+    }
+    reason = _wolt_skip_reason(collected, now)
+    if reason is not None:
+        return _wolt_skipped(tenant_id, reason)
+    # wait=True: письму — строки по текущим данным, а не прошлую сборку,
+    # которую кэш процесса API отдаёт, пока другой запрос пересобирает.
+    result = wolt.comparison(session, wait=True)
+    if not result["rows"]:
+        return _wolt_skipped(tenant_id, "no_comparison_rows")
+    pairs = {(pair["a"], pair["b"]): pair for pair in result["pairs"]}
+    report = _WoltReport(
+        generated_at=now,
+        counts=wolt_export.difference_counts(result["rows"]),
+        pairs=tuple(
+            _WoltPair(
+                title=wolt.VENUES[venue],
+                common=pairs[(wolt.OWNER, venue)]["common"],
+                owner_cheaper=pairs[(wolt.OWNER, venue)]["a_cheaper"],
+                venue_cheaper=pairs[(wolt.OWNER, venue)]["b_cheaper"],
+                same_price=pairs[(wolt.OWNER, venue)]["same_price"],
+            )
+            for venue in wolt.VENUES
+        ),
+        venues=tuple(
+            _WoltVenueAge(
+                title=wolt.VENUES[venue],
+                collected_at=collected.get(venue),
+                overdue=collected.get(venue) is None
+                or now - collected[venue] > timedelta(hours=_WOLT_MAX_AGE_HOURS),
+            )
+            for venue in wolt.VENUES
+        ),
+        suspicious=result["totals"]["suspicious"],
+        attachment=(
+            wolt_export.filename(locale, now),
+            wolt_export.build_workbook(
+                result["rows"], locale=locale, generated_at=now, collected_at=collected
+            ),
+            comparison_export.XLSX_MEDIA_TYPE,
+        ),
+    )
+    log.info(
+        "digest_wolt_report",
+        tenant=tenant_id,
+        locale=locale,
+        attachment_kb=round(len(report.attachment[1]) / 1024, 1),
+        overdue_venues=[age.title for age in report.venues if age.overdue],
+        **report.counts,
+    )
+    return report
+
+
+def _wolt_skipped(tenant_id: int, reason: str) -> None:
+    log.info("digest_wolt_report_skipped", tenant=tenant_id, reason=reason)
+    return None
+
+
+def _render_wolt_report(report: _WoltReport) -> str:
+    """Раздел письма «Аптеки на Wolt»: числа, владелец против каждой аптеки, свежесть."""
+    from src import wolt
+
+    owner = wolt.OWNER_TITLE
+    venues = [age.title for age in report.venues]
+    rivals = ", ".join(venues[:-1]) + f" и {venues[-1]}" if len(venues) > 1 else venues[0]
+    counts = report.counts
+
+    count_rows = [
+        _price_count_row("Товаров в сравнении", counts["compared"]),
+        _price_count_row("Цена различается", counts["differing"], strong=True),
+        _price_count_row(
+            f"в одной из аптек Wolt дешевле, чем на {owner}", counts["rival_cheaper"], part=True
+        ),
+        _price_count_row(f"на {owner} цена самая низкая", counts["owner_cheapest"], part=True),
+        _price_count_row(
+            f"{owner} в сравнение не вошёл — различаются цены аптек Wolt",
+            counts["no_owner_price"],
+            part=True,
+        ),
+        _price_count_row("Цена одинаковая", counts["same_price"]),
+    ]
+    if counts["not_comparable"]:
+        count_rows.append(
+            _price_count_row(
+                "Сравнить не с чем: товар в наличии меньше чем в двух местах",
+                counts["not_comparable"],
+            )
+        )
+
+    # Строкой, а не таблицей: на телефоне таблица из пяти колонок ломает
+    # названия аптек в три строки, а текст переносится сам.
+    pair_rows = [
+        f"""<div style="padding:6px 0;border-top:1px solid #f4f4f5;">
+          <div style="font-size:13px;font-weight:600;color:#18181b;">{escape(pair.title, quote=False)}</div>
+          <div style="font-size:13px;color:#52525b;">общих {_num(pair.common)} · дешевле на {owner} {_num(pair.owner_cheaper)} · дешевле в аптеке {_num(pair.venue_cheaper)} · поровну {_num(pair.same_price)}</div>
+        </div>"""
+        for pair in report.pairs
+    ]
+
+    age_rows = []
+    warnings = []
+    for age in report.venues:
+        title = escape(age.title, quote=False)
+        if age.collected_at is None:
+            when = "—"
+            warnings.append(f"{age.title}: каталог на Wolt ещё ни разу не собран.")
+        else:
+            collected = comparison_export.baku_time(age.collected_at)
+            when = f"{collected:%d.%m.%Y %H:%M}"
+            if age.overdue:
+                warnings.append(
+                    f"Каталог {age.title} — от {collected:%d.%m.%Y}: с тех пор сбор на Wolt "
+                    "не прошёл, цены этой аптеки могут быть устаревшими."
+                )
+        age_rows.append(
+            f'<tr><td style="padding:2px 0;">{title}</td>'
+            f'<td style="text-align:right;white-space:nowrap;">{when}</td></tr>'
+        )
+    warning_rows = "".join(
+        f"""
+    <tr><td style="padding:10px 24px;background:#fffbeb;border-top:1px solid #e4e4e7;font-size:13px;color:#52525b;">
+      {escape(text, quote=False)}
+    </td></tr>"""
+        for text in warnings
+    )
+    suspicious = (
+        f" Строк, где цены расходятся больше чем втрое, в сравнении нет — скорее всего, это "
+        f"разные товары ({_num(report.suspicious)})."
+        if report.suspicious
+        else ""
+    )
+    public = os.environ.get("PHARMACY_PUBLIC_URL", "")
+    file_name = escape(report.attachment[0], quote=False)
+    return f"""
+    <tr><td style="padding:20px 24px 8px;border-top:1px solid #e4e4e7;">
+      <div style="font-size:18px;font-weight:600;color:#18181b;">Аптеки на Wolt</div>
+      <div style="font-size:13px;color:#71717a;margin-top:4px;">{owner} (цены сайта) в сравнении с {escape(rivals, quote=False)}</div>
+    </td></tr>
+    <tr><td style="padding:8px 24px 4px;">
+      <table style="width:100%;border-collapse:collapse;">
+        {chr(10).join(count_rows)}
+      </table>
+      <div style="font-size:12px;color:#71717a;margin-top:8px;">
+        Сравниваются цены товаров в наличии. Одинаковые товары узнаются по названию, дозе и фасовке.{suspicious}
+      </div>
+    </td></tr>
+    <tr><td style="padding:12px 24px;border-top:1px solid #f4f4f5;">
+      <div style="font-size:13px;font-weight:600;color:#18181b;margin-bottom:4px;">{owner} и каждая аптека: общие товары в наличии</div>
+      {chr(10).join(pair_rows)}
+    </td></tr>
+    <tr><td style="padding:12px 24px;border-top:1px solid #f4f4f5;font-size:13px;color:#52525b;">
+      <div style="font-weight:600;color:#18181b;margin-bottom:4px;">Когда собраны каталоги Wolt (время бакинское)</div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;color:#52525b;">
+        {chr(10).join(age_rows)}
+      </table>
+    </td></tr>{warning_rows}
+    <tr><td style="padding:12px 24px 16px;border-top:1px solid #f4f4f5;font-size:13px;color:#52525b;">
+      Все товары — в приложенном файле {file_name}: на первом листе товары с разной ценой, на втором — всё сравнение.
+      <a href="{escape(public)}/wolt" style="color:#3b82f6;">Открыть в дашборде →</a>
+    </td></tr>"""
 
 
 def _price_letter_title(report: _PriceReport) -> str:
@@ -1438,11 +1718,14 @@ def _render_digest_email(
     since: datetime,
     *,
     price_report: _PriceReport | None = None,
+    wolt_html: str = "",
 ) -> str:
     """Письмо-дайджест: сводка по типам, затем списки с потолком.
 
     С `price_report` письмо начинается отчётом о разнице цен, а события идут под
-    ним; если событий нет, вместо их сводки — одна строка об этом.
+    ним; если событий нет, вместо их сводки — одна строка об этом. Раздел
+    `wolt_html` (аптеки на Wolt, готовый `_render_wolt_report`) стоит за
+    отчётом о ценах сайтов, перед событиями.
     """
     events = list(events)
     total = len(events)
@@ -1483,16 +1766,22 @@ def _render_digest_email(
       <div style="font-size:22px;font-weight:600;color:#18181b;">Дайджест за {period_name}</div>
       <div style="font-size:13px;color:#71717a;margin-top:4px;">{period} · {totals}</div>
     </td></tr>"""
+        if wolt_html:
+            # Иначе сводка событий читалась бы как продолжение раздела Wolt.
+            header += f"""{wolt_html}
+    <tr><td style="padding:20px 24px 12px;border-top:1px solid #e4e4e7;">
+      <div style="font-size:18px;font-weight:600;color:#18181b;">События за {period_name}</div>
+    </td></tr>"""
     elif events:
         title = _price_letter_title(price_report)
-        header = f"""{_render_price_report(price_report)}
+        header = f"""{_render_price_report(price_report)}{wolt_html}
     <tr><td style="padding:20px 24px 12px;border-top:1px solid #e4e4e7;">
       <div style="font-size:18px;font-weight:600;color:#18181b;">События за {period_name}</div>
       <div style="font-size:13px;color:#71717a;margin-top:4px;">{period} · {totals}</div>
     </td></tr>"""
     else:
         title = _price_letter_title(price_report)
-        header = f"""{_render_price_report(price_report)}
+        header = f"""{_render_price_report(price_report)}{wolt_html}
     <tr><td style="padding:16px 24px;border-top:1px solid #e4e4e7;font-size:13px;color:#52525b;">
       {_NO_EVENTS_LINE}
     </td></tr>"""
