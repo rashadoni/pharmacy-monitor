@@ -1,7 +1,7 @@
 "use client";
 
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { ExternalLink, ShoppingBag } from "lucide-react";
+import { Download, ExternalLink, ShoppingBag } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { useEffect, useState } from "react";
 import { QueryErrorState } from "@/components/query-error-state";
@@ -42,6 +42,28 @@ export default function WoltPage() {
   const venues = data?.venues ?? [];
   const rows = data?.rows ?? [];
   const visible = rows.slice(0, limit);
+
+  // Excel собирает сервер: лист с разной ценой, все товары, сводка по аптекам.
+  // Поиск, если набран, сужает файл так же, как страницу.
+  const [exporting, setExporting] = useState(false);
+  const [exportFailed, setExportFailed] = useState(false);
+  async function handleExport() {
+    setExporting(true);
+    setExportFailed(false);
+    try {
+      const { blob, filename } = await api.woltExport(debouncedSearch, locale);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setExportFailed(true);
+    } finally {
+      setExporting(false);
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -91,8 +113,22 @@ export default function WoltPage() {
             ? t("only_diff_count", { differ: data.totals.differ, rows: data.totals.rows })
             : t("only_diff")}
         </label>
+        <button
+          type="button"
+          onClick={() => void handleExport()}
+          disabled={exporting || !data}
+          className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md border border-border px-3 text-sm hover:bg-secondary disabled:opacity-50 sm:ml-auto md:min-h-9"
+        >
+          <Download className="h-4 w-4" aria-hidden="true" />
+          {exporting ? t("exporting") : t("export")}
+        </button>
       </div>
 
+      {exportFailed && (
+        <p className="text-sm text-destructive" role="alert">
+          {t("export_failed")}
+        </p>
+      )}
       {q.isPending && <p className="text-sm text-muted-foreground" role="status">{t("loading")}</p>}
       {q.isError && (
         <QueryErrorState message={t("error")} retryLabel={t("retry")} onRetry={() => void q.refetch()} />

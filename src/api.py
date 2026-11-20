@@ -3439,6 +3439,42 @@ def dash_wolt_comparison(
     return wolt.comparison(db, search=search, only_diff=only_diff)
 
 
+@app.get("/api/v1/dash/wolt/export.xlsx")
+def dash_wolt_export(
+    search: str | None = Query(None, max_length=200),
+    locale: str = "ru",
+    user: storage.TenantUser = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Excel раздела «Аптеки на Wolt» — отдельно от Excel сравнения сайтов.
+
+    Лист 1 — товары с разной ценой, лист 2 — все, лист 3 — сводка по аптекам и
+    парам. Строки — те же, что на странице (`wolt.comparison`).
+    """
+    from src import wolt, wolt_export
+
+    if not site_profile.is_pharmacy():
+        raise HTTPException(status_code=404, detail="not available in this instance")
+    locale = _normalize_locale(locale)
+    query = (search or "").strip() or None
+    data = wolt.comparison(db, search=query)
+    generated_at = utcnow()
+    content = wolt_export.build_workbook(
+        data, all_rows=data["rows"], locale=locale, generated_at=generated_at, search=query
+    )
+    log.info("wolt_export", user_id=user.id, rows=len(data["rows"]), bytes=len(content))
+    return Response(
+        content=content,
+        media_type=wolt_export.XLSX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{wolt_export.filename(locale, generated_at)}"'
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @app.get("/api/v1/dash/category-comparison", response_model=list[CategoryComparisonOut])
 def dash_category_comparison(
     client_site: str = site_profile.CLIENT_SITE,

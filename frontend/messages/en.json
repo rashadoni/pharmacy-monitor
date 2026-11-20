@@ -939,6 +939,9 @@
     "stat_differ": "Price differs",
     "pair_short": "{a} — {b}: {common} shared, {differ} with a different price",
     "owner_badge": "Your site",
-    "owner_pair": "{owner} vs {other}: {common} shared — {owner} cheaper on {cheaper}, dearer on {dearer}, same on {same}"
+    "owner_pair": "{owner} vs {other}: {common} shared — {owner} cheaper on {cheaper}, dearer on {dearer}, same on {same}",
+    "export": "Download Excel",
+    "exporting": "Preparing the file…",
+    "export_failed": "Could not export to Excel"
   }
 }
