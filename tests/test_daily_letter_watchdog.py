@@ -462,7 +462,7 @@ def test_letter_everyone_received_is_healthy(setup, at_eight):
 @pytest.mark.parametrize(
     ("recipients", "accepted", "severity", "says"),
     [
-        (2, 2, "warning", "ушло без отчёта о разнице цен и без файла (2 из 2 получателей)"),
+        (2, 2, "warning", "ушло без отчёта о разнице цен сайтов и без его файла (2 из 2 получателей)"),
         (2, 0, "critical", "осталось без отчёта о разнице цен, и почтовый сервер его не принял"),
         (0, 0, "critical", "не отправлено: отчёта о разнице цен нет, а событий за сутки не было"),
     ],
@@ -505,7 +505,7 @@ def test_run_that_had_nobody_to_mail_is_not_an_incident(setup, at_eight):
 @pytest.mark.parametrize(
     ("recipients", "outcome"),
     [
-        (2, "письмо ушло без чисел и без файла"),
+        (2, "письмо ушло без чисел и файла сравнения сайтов"),
         (0, "письма не было вовсе — событий за сутки тоже нет"),
     ],
     ids=["events-letter-went", "no-letter-at-all"],

@@ -290,3 +290,185 @@ def test_weekly_digest_has_no_wolt_part(letter_db):
     assert "Kreon 25000" in call.kwargs["html_body"]
     assert "Аптеки на Wolt" not in call.kwargs["html_body"]
     assert "attachments" not in call.kwargs
+
+
+# ─── Ветки, которыми письмо уходит на самом деле ────────────────────────────
+
+
+def test_usual_morning_reads_sites_then_wolt_then_events(letter_db):
+    s = letter_db
+    _event(s, _wolt_catalog(s))
+
+    call = _send(s)
+
+    letter = _text(call.kwargs["html_body"])
+    assert (
+        letter.index("Цена на сайтах различается")
+        < letter.index("Аптеки на Wolt")
+        < letter.index("События за сутки")
+        < letter.index("Kreon 25000")
+    )
+    assert [name.split("-")[0] for name, _, _ in call.kwargs["attachments"]] == ["raznye", "wolt"]
+
+
+def test_events_letter_without_the_sites_report_still_has_the_wolt_part(letter_db, monkeypatch):
+    s = letter_db
+    _event(s, _wolt_catalog(s))
+    monkeypatch.setattr(
+        notifications, "_price_report", lambda *a, **kw: (None, "skipped:no_successful_run")
+    )
+
+    call = _send(s)
+
+    letter = _text(call.kwargs["html_body"])
+    assert "Цена на сайтах различается" not in letter
+    # Сводка событий не читается как продолжение раздела Wolt: у неё свой заголовок.
+    assert (
+        letter.index("Аптеки на Wolt")
+        < letter.index("События за сутки")
+        < letter.index("Kreon 25000")
+    )
+    ((name, _, _),) = call.kwargs["attachments"]
+    assert name.startswith("wolt-apteki-")
+
+
+def test_wolt_part_alone_does_not_send_a_letter(letter_db, monkeypatch):
+    s = letter_db
+    _wolt_catalog(s)
+    monkeypatch.setattr(
+        notifications, "_price_report", lambda *a, **kw: (None, "skipped:no_successful_run")
+    )
+
+    with capture_logs() as logs, patch("src.notifier.send_email") as mock_email:
+        assert notifications.send_daily_digest(s, tenant_id=1) == 0
+
+    assert not mock_email.called
+    # И не собирается: писать его некуда.
+    assert not [e for e in logs if e["event"].startswith("digest_wolt_report")]
+
+
+@pytest.mark.parametrize("where", ["query", "render"])
+def test_failure_in_the_wolt_part_leaves_the_rest_of_the_letter(letter_db, monkeypatch, where):
+    s = letter_db
+    _event(s, _wolt_catalog(s))
+    if where == "query":
+        # Настоящая ошибка базы внутри раздела: точка сохранения её откатывает,
+        # и события ниже читаются как обычно.
+        from sqlalchemy import text
+
+        monkeypatch.setattr(
+            wolt, "_cache_key", lambda session: session.execute(text("SELECT * FROM no_such"))
+        )
+    else:
+
+        def broken(report):
+            raise ValueError("render")
+
+        monkeypatch.setattr(notifications, "_render_wolt_report", broken)
+
+    with capture_logs() as logs:
+        call = _send(s)
+
+    letter = _text(call.kwargs["html_body"])
+    assert "Цена на сайтах различается" in letter and "Kreon 25000" in letter
+    assert "Аптеки на Wolt" not in letter
+    assert len(call.kwargs["attachments"]) == 1
+    assert [e["event"] for e in logs].count("digest_wolt_report_failed") == 1
+
+
+def test_switch_in_env_removes_the_wolt_part(letter_db, monkeypatch):
+    s = letter_db
+    _wolt_catalog(s)
+    monkeypatch.setenv("DAILY_LETTER_WOLT", "0")
+
+    with capture_logs() as logs:
+        call = _send(s)
+
+    assert "Аптеки на Wolt" not in call.kwargs["html_body"]
+    skipped = [e["reason"] for e in logs if e["event"] == "digest_wolt_report_skipped"]
+    assert skipped == ["switched_off"]
+
+
+def test_wolt_part_disappears_when_every_catalog_is_three_days_old(letter_db):
+    s = letter_db
+    old = utcnow() - timedelta(days=4)
+    _wolt_catalog(s, collected={venue: old for venue in wolt.VENUES})
+
+    with capture_logs() as logs:
+        call = _send(s)
+
+    assert "Аптеки на Wolt" not in call.kwargs["html_body"]
+    skipped = [e["reason"] for e in logs if e["event"] == "digest_wolt_report_skipped"]
+    assert skipped == ["wolt_catalog_too_old"]
+
+
+def test_suspicious_rows_are_named_in_the_letter(letter_db):
+    s = letter_db
+    _wolt_catalog(s)
+    s.add_all(
+        [_wolt(ALOE, "20", "Viaqra 100 mq N4", 9.43), _wolt(KANON, "21", "Viaqra 100 mq N4", 68.03)]
+    )
+    s.commit()
+
+    part = _wolt_part(_send(s))
+
+    assert "в сравнении нет — скорее всего, это разные товары (1)" in part
+
+
+def test_owner_price_three_times_off_counts_as_owner_not_compared(letter_db):
+    s = letter_db
+    run = _trusted_run(s)
+    _pair(s, run, "Betadin 10% 30 ml", {"pharmonline": 50.0})
+    s.add_all(
+        [_wolt(BUTA, "1", "Betadin 10% 30 ml", 6.6), _wolt(ALOE, "2", "Betadin 10% 30 ml", 9.3)]
+    )
+    for venue in wolt.VENUES:
+        s.add(storage.WoltScrape(venue=venue, status="ok", items=1, finished_at=utcnow()))
+    s.commit()
+
+    report = notifications._wolt_report(s, 1, locale="ru")
+
+    assert report.counts["differing"] == report.counts["no_owner_price"] == 1
+
+
+def _row(prices: dict[str, tuple[float, bool]]) -> dict:
+    in_stock = [price for price, stock in prices.values() if stock]
+    low = min(in_stock) if len(in_stock) >= 2 else min(p for p, _ in prices.values())
+    high = max(in_stock) if len(in_stock) >= 2 else low
+    return {
+        "prices": {v: {"price": p, "in_stock": stock} for v, (p, stock) in prices.items()},
+        "min_price": low,
+        "max_price": high,
+    }
+
+
+def test_owner_tied_at_the_lowest_price_is_cheapest():
+    row = _row({wolt.OWNER: (5.0, True), BUTA: (5.0, True), ALOE: (7.0, True)})
+
+    assert wolt_export.owner_position(row) == "cheapest"
+    assert wolt_export.difference_counts([row])["owner_cheapest"] == 1
+
+
+def test_letter_waits_for_fresh_rows_instead_of_the_previous_build(letter_db):
+    """Процесс API: страница пересобирает строки, а письмо не берёт прошлую сборку."""
+    import threading
+
+    s = letter_db
+    _wolt_catalog(s)
+    before = wolt.comparison(s)["totals"]
+    s.add_all([_wolt(BUTA, "30", "Linex N16", 9.0)])
+    s.add(storage.WoltScrape(venue=BUTA, status="ok", items=4, finished_at=utcnow()))
+    s.commit()
+
+    got: dict = {}
+    wolt._build_lock.acquire()  # «другой запрос» пересобирает
+    worker = threading.Thread(target=lambda: got.update(wolt.comparison(s, wait=True)))
+    worker.start()
+    worker.join(timeout=0.5)
+    assert worker.is_alive(), "письмо не ждёт пересборки, а берёт прошлые строки"
+    wolt._build_lock.release()
+    worker.join(timeout=10)
+
+    assert got["totals"]["rows"] == before["rows"]
+    linex = next(row for row in got["rows"] if row["name"] == "Linex N16")
+    assert BUTA in linex["prices"]

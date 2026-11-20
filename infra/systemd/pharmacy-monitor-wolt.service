@@ -11,7 +11,8 @@ WorkingDirectory=/opt/pharmacy-monitor
 EnvironmentFile=/etc/pharmacy-monitor/env
 # Аптеки на Wolt (src/wolt.py): свои таблицы wolt_items / wolt_scrapes, сбор
 # через открытый API wolt.com, без прокси. Основной путь (сайты профиля,
-# доверенные цены, письма, алерты) эти данные не читает. Около 300 запросов
+# доверенные цены, алерты) эти данные не читает; утреннее письмо берёт готовые
+# строки сравнения (с 2026-11-20). Около 300 запросов
 # с паузой 0,7 с — несколько минут.
 ExecStart=/opt/pharmacy-monitor/.venv/bin/pharmacy-monitor wolt sync
 TimeoutStartSec=1800

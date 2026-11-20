@@ -580,7 +580,8 @@ class DigestOutcome:
             error_type = type(self.report_failure).__name__
             if self.recipients:
                 found.append(
-                    f"отчёт о разнице цен не собрался ({error_type}) — письмо без чисел и без файла"
+                    f"отчёт о разнице цен не собрался ({error_type}) — письмо без чисел и "
+                    "файла сравнения сайтов"
                 )
             else:
                 found.append(str(DailyLetterNotSent(error_type)))
@@ -744,21 +745,6 @@ def _send_digest(
                 error_type=type(exc).__name__,
             )
 
-    wolt_report: _WoltReport | None = None
-    if kind == "daily":
-        try:
-            with session.begin_nested():
-                wolt_report = _wolt_report(session, tenant_id, locale=locale)
-        except Exception as exc:
-            # Сломанный раздел Wolt письмо не останавливает: оно уходит без него.
-            # Сторож (`daily_letter_state`) этого не видит — только журнал.
-            log.exception(
-                "digest_wolt_report_failed",
-                kind=kind,
-                tenant=tenant_id,
-                error_type=type(exc).__name__,
-            )
-
     events = session.scalars(
         select(storage.AlertEvent)
         .where(
@@ -774,19 +760,41 @@ def _send_digest(
         log.info("digest_no_events", kind=kind, tenant=tenant_id)
         return DigestOutcome(report=report_state, dry_run=dry_run, report_failure=report_failure)
 
+    # Раздел «Аптеки на Wolt» — только письму, которое уходит: сам он письма не
+    # вызывает. Сборка и отрисовка — под одной защитой: сломанный раздел письмо
+    # не останавливает, оно уходит без него. Сторож (`daily_letter_state`) этого
+    # не видит — только журнал (`digest_wolt_report_failed`).
+    wolt_report: _WoltReport | None = None
+    wolt_html = ""
+    if kind == "daily":
+        try:
+            with session.begin_nested():
+                wolt_report = _wolt_report(session, tenant_id, locale=locale)
+            if wolt_report is not None:
+                wolt_html = _render_wolt_report(wolt_report)
+        except Exception as exc:
+            wolt_report, wolt_html = None, ""
+            log.exception(
+                "digest_wolt_report_failed",
+                kind=kind,
+                tenant=tenant_id,
+                error_type=type(exc).__name__,
+            )
+
     # Письмо одно на всех получателей. «Порог email-уведомлений» получателя
     # (`email_severity_min`) на дайджест не действует — решение владельца
     # 2026-10-07: размер держат потолки, а с порогом `warning` из почты совсем
     # пропали бы названия товаров из «Можно поднять цену».
     if report is None:
-        html = _render_digest_email(events, kind=kind, since=since, wolt_report=wolt_report)
+        html = _render_digest_email(events, kind=kind, since=since, wolt_html=wolt_html)
         subject = _digest_subject(events, kind)
-        # Без отчёта письмо шлётся и пишется в журнал теми же аргументами, что раньше.
+        # Без отчёта сайтов письмо шлётся теми же аргументами, что раньше; файл
+        # Wolt, если раздел есть, добавляется ниже.
         with_file: dict = {}
         file_size: dict = {}
     else:
         html = _render_digest_email(
-            events, kind=kind, since=since, price_report=report, wolt_report=wolt_report
+            events, kind=kind, since=since, price_report=report, wolt_html=wolt_html
         )
         subject = _price_letter_subject(report)
         with_file = {"attachments": [report.attachment]}
@@ -1066,6 +1074,13 @@ def _price_report(
 # письмо уходит в 05:00 UTC — обычно данным около 23 часов. Старше 30 — сбор
 # пропущен, и письмо об этом говорит.
 _WOLT_MAX_AGE_HOURS = 30
+# Все каталоги Wolt старше трёх суток — сбор остановлен (таймер выключен или
+# сломан надолго): раздел не показывается совсем, а не шлёт клиенту каждое
+# утро всё более старые цены с предупреждением.
+_WOLT_DROP_AFTER_HOURS = 72
+# Рубильник раздела без выкладки кода: DAILY_LETTER_WOLT=0 в env убирает его
+# из письма со следующего утра.
+_WOLT_SWITCH_ENV = "DAILY_LETTER_WOLT"
 
 
 @dataclass(frozen=True)
@@ -1105,18 +1120,24 @@ def _wolt_report(session: Session, tenant_id: int, *, locale: str) -> _WoltRepor
     Строки — те же, что показывает раздел `/wolt` без фильтров
     (`wolt.comparison`). Раздела нет у неаптечного экземпляра, у арендатора,
     кроме первого (колонка владельца — цены его сайта, `wolt._owner_items`),
-    пока ни одна аптека Wolt не собрана и когда сравнивать нечего; причина — в
-    журнале (`digest_wolt_report_skipped`). Исключение значит, что раздел
-    сломан; ловит его вызывающий.
+    при `DAILY_LETTER_WOLT=0`, пока ни одна аптека Wolt не собрана, когда все
+    каталоги старше `_WOLT_DROP_AFTER_HOURS` и когда сравнивать нечего;
+    причина — в журнале (`digest_wolt_report_skipped`). Исключение значит, что
+    раздел сломан; ловит его вызывающий.
     """
     from src import site_profile, wolt, wolt_export
 
+    now = utcnow()
     if not site_profile.is_pharmacy():
         reason = "not_a_pharmacy_instance"
     elif tenant_id != 1:
         reason = "not_the_wolt_tenant"
+    elif os.environ.get(_WOLT_SWITCH_ENV, "1").strip() == "0":
+        reason = "switched_off"
     else:
-        result = wolt.comparison(session)
+        # wait=True: письму — строки по текущим данным, а не прошлую сборку,
+        # которую кэш процесса API отдаёт, пока другой запрос пересобирает.
+        result = wolt.comparison(session, wait=True)
         collected = {
             venue["venue"]: datetime.fromisoformat(venue["last_ok_at"])
             if venue["last_ok_at"]
@@ -1126,10 +1147,14 @@ def _wolt_report(session: Session, tenant_id: int, *, locale: str) -> _WoltRepor
         }
         if not any(collected.values()):
             reason = "no_wolt_catalog"
+        elif all(
+            moment is None or now - moment > timedelta(hours=_WOLT_DROP_AFTER_HOURS)
+            for moment in collected.values()
+        ):
+            reason = "wolt_catalog_too_old"
         elif not result["rows"]:
             reason = "no_comparison_rows"
         else:
-            now = utcnow()
             pairs = {(pair["a"], pair["b"]): pair for pair in result["pairs"]}
             report = _WoltReport(
                 generated_at=now,
@@ -1681,16 +1706,15 @@ def _render_digest_email(
     since: datetime,
     *,
     price_report: _PriceReport | None = None,
-    wolt_report: _WoltReport | None = None,
+    wolt_html: str = "",
 ) -> str:
     """Письмо-дайджест: сводка по типам, затем списки с потолком.
 
     С `price_report` письмо начинается отчётом о разнице цен, а события идут под
     ним; если событий нет, вместо их сводки — одна строка об этом. Раздел
-    `wolt_report` (аптеки на Wolt) стоит за отчётом о ценах сайтов, перед
-    событиями.
+    `wolt_html` (аптеки на Wolt, готовый `_render_wolt_report`) стоит за
+    отчётом о ценах сайтов, перед событиями.
     """
-    wolt_html = _render_wolt_report(wolt_report) if wolt_report is not None else ""
     events = list(events)
     total = len(events)
 
@@ -1729,7 +1753,14 @@ def _render_digest_email(
       <div style="font-size:14px;color:#71717a;margin-bottom:4px;">Pharmacy Monitor</div>
       <div style="font-size:22px;font-weight:600;color:#18181b;">Дайджест за {period_name}</div>
       <div style="font-size:13px;color:#71717a;margin-top:4px;">{period} · {totals}</div>
-    </td></tr>{wolt_html}"""
+    </td></tr>"""
+        if wolt_html:
+            # Иначе сводка событий читалась бы как продолжение раздела Wolt.
+            header += f"""{wolt_html}
+    <tr><td style="padding:20px 24px 12px;border-top:1px solid #e4e4e7;">
+      <div style="font-size:18px;font-weight:600;color:#18181b;">События за {period_name}</div>
+      <div style="font-size:13px;color:#71717a;margin-top:4px;">{period} · {totals}</div>
+    </td></tr>"""
     elif events:
         title = _price_letter_title(price_report)
         header = f"""{_render_price_report(price_report)}{wolt_html}

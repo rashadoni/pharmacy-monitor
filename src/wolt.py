@@ -496,7 +496,8 @@ def group_items(
 # только проверенные цены. Товары — те, что сайт показывал последние
 # OWNER_FRESH_DAYS дней, без мёртвых ссылок, изолированных и архивных
 # карточек; наличие — как пишет сайт. Основной путь таблицы Wolt по-прежнему
-# не читает; зависимость односторонняя.
+# не читает (кроме утреннего письма — готовыми строками `comparison`, с
+# 2026-11-20); зависимость односторонняя.
 OWNER = site_profile.CLIENT_SITE
 OWNER_TITLE = site_profile.SITE_TITLES[OWNER]
 OWNER_URL = "https://pharmonline.az"
@@ -704,8 +705,15 @@ def _build_rows(session: Session) -> tuple[list[dict], dict[str, int], list[dict
     return rows, totals, _pair_summary(shown_groups)
 
 
-def comparison(session: Session, *, search: str | None = None, only_diff: bool = False) -> dict:
-    """Строки сравнения аптек Wolt, самые большие разницы — первыми."""
+def comparison(
+    session: Session, *, search: str | None = None, only_diff: bool = False, wait: bool = False
+) -> dict:
+    """Строки сравнения аптек Wolt, самые большие разницы — первыми.
+
+    `wait` — не отдавать прошлую сборку, пока другой запрос пересобирает, а
+    дождаться своей: так берёт строки утреннее письмо (кнопка тестового письма
+    идёт через процесс API, где кэш общий со страницей).
+    """
     global _last_rows
     key = _cache_key(session)
     with _cache_lock:
@@ -714,7 +722,7 @@ def comparison(session: Session, *, search: str | None = None, only_diff: bool =
     if cached is None:
         # Строит один запрос; остальные получают прошлый результат, а ждут
         # только тогда, когда прошлого ещё нет (первый запрос процесса).
-        if _build_lock.acquire(blocking=stale is None):
+        if _build_lock.acquire(blocking=stale is None or wait):
             try:
                 with _cache_lock:
                     cached = _rows_cache.get(key)

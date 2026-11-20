@@ -820,7 +820,10 @@ def test_command_fails_after_sending_the_events_letter_without_the_report(
     assert result.exit_code == 1, result.output
     assert "daily digest: принято у 1 из 1 получателей" in result.output
     assert "OK:" not in result.output
-    assert "Error: отчёт о разнице цен не собрался (KeyError) — письмо без чисел и без файла" in (
+    assert (
+        "Error: отчёт о разнице цен не собрался (KeyError) — письмо без чисел и файла "
+        "сравнения сайтов"
+    ) in (
         result.output
     )
     # Исход записан до ошибки: сторож в health видит то же, что код возврата.
