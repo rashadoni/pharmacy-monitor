@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 import io
+import os
 from datetime import timedelta
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from openpyxl import load_workbook
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from structlog.testing import capture_logs
 
@@ -354,8 +357,6 @@ def test_failure_in_the_wolt_part_leaves_the_rest_of_the_letter(letter_db, monke
     if where == "query":
         # Настоящая ошибка базы внутри раздела: точка сохранения её откатывает,
         # и события ниже читаются как обычно.
-        from sqlalchemy import text
-
         monkeypatch.setattr(
             wolt, "_cache_key", lambda session: session.execute(text("SELECT * FROM no_such"))
         )
@@ -472,3 +473,92 @@ def test_letter_waits_for_fresh_rows_instead_of_the_previous_build(letter_db):
     assert got["totals"]["rows"] == before["rows"]
     linex = next(row for row in got["rows"] if row["name"] == "Linex N16")
     assert BUTA in linex["prices"]
+
+
+def test_letter_asks_for_fresh_rows(letter_db, monkeypatch):
+    s = letter_db
+    _wolt_catalog(s)
+    real = wolt.comparison
+    calls: list[dict] = []
+
+    def spy(session, **kwargs):
+        calls.append(kwargs)
+        return real(session, **kwargs)
+
+    monkeypatch.setattr(wolt, "comparison", spy)
+
+    assert notifications._wolt_report(s, 1, locale="ru") is not None
+    assert calls == [{"wait": True}]
+
+
+@pytest.mark.parametrize("value", ["0", " off ", "false", "No"])
+def test_switch_accepts_the_usual_off_words(monkeypatch, value):
+    monkeypatch.setenv("DAILY_LETTER_WOLT", value)
+
+    assert notifications._wolt_switched_off()
+
+
+def test_switch_left_on_by_anything_else(monkeypatch):
+    monkeypatch.setenv("DAILY_LETTER_WOLT", "1")
+    assert not notifications._wolt_switched_off()
+    monkeypatch.delenv("DAILY_LETTER_WOLT")
+    assert not notifications._wolt_switched_off()
+
+
+# ─── PostgreSQL: после ошибки базы в разделе сессия остаётся рабочей ─────────
+
+
+def _postgres_url() -> str:
+    url = os.environ.get("DATABASE_URL", "")
+    if url.startswith("postgresql"):
+        return url
+    if os.environ.get("CI"):
+        pytest.fail(
+            "в CI ошибка базы внутри раздела Wolt обязана проверяться на PostgreSQL: "
+            "прерванную транзакцию SQLite не воспроизводит"
+        )
+    pytest.skip("PostgreSQL DATABASE_URL is required")
+
+
+@pytest.fixture
+def pg_letter_db(monkeypatch):
+    url = _postgres_url()
+    schema = f"wolt_letter_{uuid4().hex[:12]}"
+    admin = create_engine(url, isolation_level="AUTOCOMMIT")
+    with admin.connect() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = storage.create_engine_hiding_statement_data(
+        url, connect_args={"options": f"-csearch_path={schema} -clock_timeout=5000"}
+    )
+    try:
+        storage.Base.metadata.create_all(engine)
+        Session = sessionmaker(engine, expire_on_commit=False, autoflush=False)
+        monkeypatch.setattr(storage, "make_session", lambda *a, **kw: Session)
+        monkeypatch.setattr(storage, "init_db", lambda *a, **kw: None)
+        monkeypatch.setenv("PHARMACY_PUBLIC_URL", "https://example.test")
+        monkeypatch.delenv("COUNTRY_IDENTITY_POLICY", raising=False)
+        monkeypatch.delenv("OFFER_AVAILABILITY_POLICY", raising=False)
+        with Session() as session:
+            _reader(session)
+            yield session
+    finally:
+        engine.dispose()
+        with admin.connect() as connection:
+            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin.dispose()
+
+
+def test_database_error_in_the_wolt_part_leaves_the_session_usable(pg_letter_db, monkeypatch):
+    s = pg_letter_db
+    _event(s, _wolt_catalog(s))
+    monkeypatch.setattr(
+        wolt, "comparison", lambda session, **kw: session.execute(text("SELECT * FROM no_such"))
+    )
+
+    call = _send(s)
+
+    assert "Kreon 25000" in call.kwargs["html_body"]
+    assert "Аптеки на Wolt" not in call.kwargs["html_body"]
+    # Без точки сохранения PostgreSQL держал бы транзакцию прерванной, и любой
+    # следующий запрос в этой сессии падал бы.
+    assert s.execute(text("SELECT 1")).scalar() == 1

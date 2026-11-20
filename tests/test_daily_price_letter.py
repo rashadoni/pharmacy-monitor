@@ -823,9 +823,7 @@ def test_command_fails_after_sending_the_events_letter_without_the_report(
     assert (
         "Error: отчёт о разнице цен не собрался (KeyError) — письмо без чисел и файла "
         "сравнения сайтов"
-    ) in (
-        result.output
-    )
+    ) in (result.output)
     # Исход записан до ошибки: сторож в health видит то же, что код возврата.
     assert daily_letter_state.last_mailing(1).report == "failed:KeyError"
 

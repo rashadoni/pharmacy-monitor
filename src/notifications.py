@@ -1114,88 +1114,100 @@ class _WoltReport:
     attachment: tuple[str, bytes, str]
 
 
+def _wolt_switched_off() -> bool:
+    return os.environ.get(_WOLT_SWITCH_ENV, "1").strip().lower() in {"0", "false", "off", "no"}
+
+
+def _wolt_skip_reason(collected: dict[str, datetime | None], now: datetime) -> str | None:
+    if not any(collected.values()):
+        return "no_wolt_catalog"
+    if all(
+        moment is None or now - moment > timedelta(hours=_WOLT_DROP_AFTER_HOURS)
+        for moment in collected.values()
+    ):
+        return "wolt_catalog_too_old"
+    return None
+
+
 def _wolt_report(session: Session, tenant_id: int, *, locale: str) -> _WoltReport | None:
     """Раздел «Аптеки на Wolt» утреннего письма; None — раздела нет.
 
     Строки — те же, что показывает раздел `/wolt` без фильтров
     (`wolt.comparison`). Раздела нет у неаптечного экземпляра, у арендатора,
     кроме первого (колонка владельца — цены его сайта, `wolt._owner_items`),
-    при `DAILY_LETTER_WOLT=0`, пока ни одна аптека Wolt не собрана, когда все
-    каталоги старше `_WOLT_DROP_AFTER_HOURS` и когда сравнивать нечего;
-    причина — в журнале (`digest_wolt_report_skipped`). Исключение значит, что
-    раздел сломан; ловит его вызывающий.
+    при `DAILY_LETTER_WOLT=0` (или false/off/no), пока ни одна аптека Wolt не
+    собрана, когда все каталоги старше `_WOLT_DROP_AFTER_HOURS` и когда
+    сравнивать нечего; причина — в журнале (`digest_wolt_report_skipped`).
+    Исключение значит, что раздел сломан; ловит его вызывающий.
     """
     from src import site_profile, wolt, wolt_export
 
-    now = utcnow()
     if not site_profile.is_pharmacy():
-        reason = "not_a_pharmacy_instance"
-    elif tenant_id != 1:
-        reason = "not_the_wolt_tenant"
-    elif os.environ.get(_WOLT_SWITCH_ENV, "1").strip() == "0":
-        reason = "switched_off"
-    else:
-        # wait=True: письму — строки по текущим данным, а не прошлую сборку,
-        # которую кэш процесса API отдаёт, пока другой запрос пересобирает.
-        result = wolt.comparison(session, wait=True)
-        collected = {
-            venue["venue"]: datetime.fromisoformat(venue["last_ok_at"])
-            if venue["last_ok_at"]
-            else None
-            for venue in result["venues"]
-            if not venue["is_owner"]
-        }
-        if not any(collected.values()):
-            reason = "no_wolt_catalog"
-        elif all(
-            moment is None or now - moment > timedelta(hours=_WOLT_DROP_AFTER_HOURS)
-            for moment in collected.values()
-        ):
-            reason = "wolt_catalog_too_old"
-        elif not result["rows"]:
-            reason = "no_comparison_rows"
-        else:
-            pairs = {(pair["a"], pair["b"]): pair for pair in result["pairs"]}
-            report = _WoltReport(
-                generated_at=now,
-                counts=wolt_export.difference_counts(result["rows"]),
-                pairs=tuple(
-                    _WoltPair(
-                        title=wolt.VENUES[venue],
-                        common=pairs[(wolt.OWNER, venue)]["common"],
-                        owner_cheaper=pairs[(wolt.OWNER, venue)]["a_cheaper"],
-                        venue_cheaper=pairs[(wolt.OWNER, venue)]["b_cheaper"],
-                        same_price=pairs[(wolt.OWNER, venue)]["same_price"],
-                    )
-                    for venue in wolt.VENUES
-                ),
-                venues=tuple(
-                    _WoltVenueAge(
-                        title=wolt.VENUES[venue],
-                        collected_at=collected.get(venue),
-                        overdue=collected.get(venue) is None
-                        or now - collected[venue] > timedelta(hours=_WOLT_MAX_AGE_HOURS),
-                    )
-                    for venue in wolt.VENUES
-                ),
-                suspicious=result["totals"]["suspicious"],
-                attachment=(
-                    wolt_export.filename(locale, now),
-                    wolt_export.build_workbook(
-                        result["rows"], locale=locale, generated_at=now, collected_at=collected
-                    ),
-                    comparison_export.XLSX_MEDIA_TYPE,
-                ),
+        return _wolt_skipped(tenant_id, "not_a_pharmacy_instance")
+    if tenant_id != 1:
+        return _wolt_skipped(tenant_id, "not_the_wolt_tenant")
+    if _wolt_switched_off():
+        return _wolt_skipped(tenant_id, "switched_off")
+    now = utcnow()
+    # Возраст каталогов — до сборки строк: она стоит секунд, а при старых
+    # каталогах раздела всё равно не будет.
+    collected = {
+        venue["venue"]: datetime.fromisoformat(venue["last_ok_at"]) if venue["last_ok_at"] else None
+        for venue in wolt.venue_status(session)
+        if not venue["is_owner"]
+    }
+    reason = _wolt_skip_reason(collected, now)
+    if reason is not None:
+        return _wolt_skipped(tenant_id, reason)
+    # wait=True: письму — строки по текущим данным, а не прошлую сборку,
+    # которую кэш процесса API отдаёт, пока другой запрос пересобирает.
+    result = wolt.comparison(session, wait=True)
+    if not result["rows"]:
+        return _wolt_skipped(tenant_id, "no_comparison_rows")
+    pairs = {(pair["a"], pair["b"]): pair for pair in result["pairs"]}
+    report = _WoltReport(
+        generated_at=now,
+        counts=wolt_export.difference_counts(result["rows"]),
+        pairs=tuple(
+            _WoltPair(
+                title=wolt.VENUES[venue],
+                common=pairs[(wolt.OWNER, venue)]["common"],
+                owner_cheaper=pairs[(wolt.OWNER, venue)]["a_cheaper"],
+                venue_cheaper=pairs[(wolt.OWNER, venue)]["b_cheaper"],
+                same_price=pairs[(wolt.OWNER, venue)]["same_price"],
             )
-            log.info(
-                "digest_wolt_report",
-                tenant=tenant_id,
-                locale=locale,
-                attachment_kb=round(len(report.attachment[1]) / 1024, 1),
-                overdue_venues=[age.title for age in report.venues if age.overdue],
-                **report.counts,
+            for venue in wolt.VENUES
+        ),
+        venues=tuple(
+            _WoltVenueAge(
+                title=wolt.VENUES[venue],
+                collected_at=collected.get(venue),
+                overdue=collected.get(venue) is None
+                or now - collected[venue] > timedelta(hours=_WOLT_MAX_AGE_HOURS),
             )
-            return report
+            for venue in wolt.VENUES
+        ),
+        suspicious=result["totals"]["suspicious"],
+        attachment=(
+            wolt_export.filename(locale, now),
+            wolt_export.build_workbook(
+                result["rows"], locale=locale, generated_at=now, collected_at=collected
+            ),
+            comparison_export.XLSX_MEDIA_TYPE,
+        ),
+    )
+    log.info(
+        "digest_wolt_report",
+        tenant=tenant_id,
+        locale=locale,
+        attachment_kb=round(len(report.attachment[1]) / 1024, 1),
+        overdue_venues=[age.title for age in report.venues if age.overdue],
+        **report.counts,
+    )
+    return report
+
+
+def _wolt_skipped(tenant_id: int, reason: str) -> None:
     log.info("digest_wolt_report_skipped", tenant=tenant_id, reason=reason)
     return None
 
@@ -1759,7 +1771,6 @@ def _render_digest_email(
             header += f"""{wolt_html}
     <tr><td style="padding:20px 24px 12px;border-top:1px solid #e4e4e7;">
       <div style="font-size:18px;font-weight:600;color:#18181b;">События за {period_name}</div>
-      <div style="font-size:13px;color:#71717a;margin-top:4px;">{period} · {totals}</div>
     </td></tr>"""
     elif events:
         title = _price_letter_title(price_report)
