@@ -22,6 +22,7 @@ import {
   type PasswordProblem,
 } from "@/lib/password-rule";
 import { formatTime } from "@/lib/utils";
+import { PROFILE } from "@/lib/site-profile";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
 // Тексты причин — общие со сменой своего пароля (пространство `settings`).
@@ -149,6 +150,7 @@ function DigestScheduleNote({ status }: { status?: import("@/lib/api").SystemSta
           <li>{t("digest_schedule_daily_state", { state: status?.daily.enabled ? t("digest_schedule_enabled", { schedule: status.daily.schedule_baku }) : t("digest_schedule_disabled") })}</li>
           <li>{t("digest_schedule_weekly_state", { state: status?.weekly.enabled === false ? t("digest_schedule_disabled") : t("digest_schedule_enabled", { schedule: status?.weekly.schedule_baku ?? "Monday 10:00" }) })}</li>
         </ul>
+        {PROFILE.pharmacyPages && <p className="mt-1">{t("digest_daily_contents")}</p>}
       </div>
     </div>
   );

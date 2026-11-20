@@ -10,6 +10,7 @@ import { LocaleSwitcher } from "@/components/locale-switcher";
 import { ViewerSitePicker } from "@/components/viewer-site-picker";
 import { VIEWER_SITE_SELECTABLE } from "@/lib/viewer-site";
 import { passwordProblem, type PasswordProblem } from "@/lib/password-rule";
+import { PROFILE } from "@/lib/site-profile";
 
 const SEVERITIES = ["off", "info", "warning", "critical"] as const;
 
@@ -398,6 +399,9 @@ function NotificationsSection({ email }: { email?: string }) {
             />
             {statusQ.data?.digests.daily.enabled === false && (
               <p className="text-xs text-warning">{t("daily_digest_disabled")}</p>
+            )}
+            {PROFILE.pharmacyPages && (
+              <p className="text-xs text-muted-foreground">{t("daily_digest_contents")}</p>
             )}
             <Toggle
               label={t("weekly_digest_schedule", {
