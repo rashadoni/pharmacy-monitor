@@ -37,6 +37,13 @@ echo "выгрузок: ${#files[@]}"
 # Код — из ветки, записанной установкой (обычно main). Не вышло обновить —
 # работаем тем, что есть.
 BRANCH=$(cat "$BASE/branch" 2>/dev/null || echo main)
+# Ветки PR после мержа нет — дальше main.
+if [[ $BRANCH != main ]] && ! git -C "$REPO" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1 \
+    && git -C "$REPO" ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+    echo "ветки $BRANCH больше нет — перехожу на main"
+    BRANCH=main
+    echo main > "$BASE/branch"
+fi
 if git -C "$REPO" fetch -q origin "$BRANCH"; then
     git -C "$REPO" reset -q --hard FETCH_HEAD
     # Сам этот сценарий — копия: следующий запуск пойдёт уже новой.
