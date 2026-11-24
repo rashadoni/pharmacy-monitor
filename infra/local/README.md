@@ -1,5 +1,12 @@
 # Retired Mac Scrape Runtime
 
+> **Exception since 2026-11-24 — Kontakt Home.** The owner exports the
+> kontakt.az catalog by hand in his own Chrome; `infra/local/kontakt/`
+> installs a desktop shortcut that merges the exports and sends them to the
+> electronics server (see `CLAUDE.md` and `docs/ELECTRONICS.md`). Nothing here
+> scrapes automatically. Everything below is about the pharmacy sites and
+> stays retired.
+
 Production scraping is fully server-side as of 2026-07-03. The paid services own
 the scrape path:
 
