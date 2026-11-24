@@ -460,7 +460,7 @@ async def test_the_owner_is_called_and_the_collector_waits_for_his_click(tmp_pat
 
 async def test_nobody_clicked_in_time_means_a_stop(tmp_path):
     scraper = KontaktBrowserScraper(
-        tmp_path / "profile", rate_limit_sec=0, human_wait_sec=60, on_human_needed=lambda: None
+        tmp_path / "profile", rate_limit_sec=0, human_wait_sec=0.2, on_human_needed=lambda: None
     )
     scraper._page = _CheckThenPassedPage(passes_after=10**6)
 
@@ -479,3 +479,55 @@ def test_the_collector_never_clicks_and_keeps_the_sandbox():
     for usage in (".click(", ".check(", "frame_locator", "mouse.", "keyboard."):
         assert usage not in source, usage
     assert "chromium_sandbox=True" in source
+
+
+def test_the_cli_knows_the_human_wait_and_defaults_to_half_an_hour():
+    args = kontakt_collect.build_parser().parse_args(["--out", "x.csv", "--profile", "p"])
+    assert args.human_wait_minutes == 30
+    args = kontakt_collect.build_parser().parse_args(
+        ["--out", "x.csv", "--profile", "p", "--human-wait-minutes", "0", "--max-minutes", "300"]
+    )
+    assert (args.human_wait_minutes, args.max_minutes) == (0, 300)
+
+
+async def test_no_check_on_the_page_means_no_call_to_the_owner_and_a_stop(tmp_path):
+    called = []
+    scraper = KontaktBrowserScraper(
+        tmp_path / "profile",
+        rate_limit_sec=0,
+        human_wait_sec=600,
+        on_human_needed=lambda: called.append(1),
+    )
+    scraper._page = _FakePage()  # обычная страница, без галочки
+    probes = []
+
+    async def page_fetch(url):
+        probes.append(url)
+        return {"status": 403, "text": "forbidden"}
+
+    scraper._page_fetch = page_fetch
+    with pytest.raises(CaptchaDetected) as error:
+        await scraper._open_site()
+    assert called == [] and "no Cloudflare check to click" in str(error.value)
+    assert len(probes) == len(kontakt_browser._READY_PROBE_DELAYS)
+
+
+async def test_a_midwalk_check_waits_for_the_owner_less_than_the_first(tmp_path, monkeypatch):
+    waits = []
+    monkeypatch.setattr(
+        kontakt_browser.log, "warning", lambda event, **kw: waits.append(kw.get("minutes"))
+    )
+    scraper = KontaktBrowserScraper(
+        tmp_path / "profile", rate_limit_sec=0, human_wait_sec=0.3, on_human_needed=lambda: None
+    )
+    scraper._page = _CheckThenPassedPage(passes_after=10**6)
+
+    async def never(_url):
+        raise AssertionError("no requests while the check is shown")
+
+    scraper._page_fetch = never
+    monkeypatch.setattr(kontakt_browser, "_MIDWALK_HUMAN_WAIT_SEC", 0.1)
+    for _ in range(2):
+        with pytest.raises(CaptchaDetected):
+            await scraper._open_site()
+    assert waits == [0.3 / 60, 0.1 / 60]

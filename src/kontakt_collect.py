@@ -203,6 +203,10 @@ async def _main(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    return asyncio.run(_main(build_parser().parse_args(argv)))
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--out", required=True, help="куда записать CSV")
     parser.add_argument("--profile", required=True, help="каталог профиля Chrome для сборщика")
@@ -213,11 +217,17 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MAX_INCOMPLETE_SHARE,
         help="доля категорий, которые можно не дочитать",
     )
+    parser.add_argument(
+        "--human-wait-minutes",
+        type=int,
+        default=30,
+        help="сколько ждать, пока владелец нажмёт галочку Cloudflare (0 — не ждать)",
+    )
     parser.add_argument("--max-minutes", type=int, default=None, help="предел на весь обход, минут")
     parser.add_argument(
         "--category-limit", type=int, default=None, help="только первые N категорий (проба)"
     )
-    return asyncio.run(_main(parser.parse_args(argv)))
+    return parser
 
 
 if __name__ == "__main__":

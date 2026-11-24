@@ -50,6 +50,9 @@ log = structlog.get_logger()
 _READY_PROBE_DELAYS = (3, 6, 12, 24, 45)
 # Когда ждём человека — как часто смотреть, прошёл ли он проверку.
 _HUMAN_POLL_SEC = 15
+# Посреди обхода (истёк допуск) ждём человека меньше: обход идёт под общим
+# пределом времени, и три таких ожидания по полчаса съели бы его.
+_MIDWALK_HUMAN_WAIT_SEC = 10 * 60
 # Предел одного запроса: зависший ответ не должен держать сбор вечно.
 _REQUEST_TIMEOUT_MS = 60_000
 # Сколько раз за весь обход можно заново открыть главную после проверки
@@ -113,6 +116,7 @@ class KontaktBrowserScraper(KontaktScraper):
         self._browser_context = None
         self._pw = None
         self.reopens = 0
+        self._first_open = True
 
     # -- жизненный цикл ----------------------------------------------------------
 
@@ -167,13 +171,13 @@ class KontaktBrowserScraper(KontaktScraper):
         главная открылась, а первый запрос данных, ушедший сразу, получил 403).
         Поэтому готовность — это ответ 200 на ``/_root.data`` изнутри вкладки.
 
-        Сначала сборщик ждёт сам, с растущими паузами. Не дождался, а
-        ``human_wait_sec`` задан — зовёт владельца (``on_human_needed``),
-        выводит окно вперёд и ждёт, пока проверку пройдёт человек: галочку
-        «Verify you are human» нажимает владелец, сборщик не нажимает ничего
-        (решение владельца 2026-11-24). Пока на странице проверка, запросов к
-        сайту нет.
+        Сначала сборщик ждёт сам, с растущими паузами. Не дождался, на странице
+        галочка «Verify you are human», а ``human_wait_sec`` задан — зовёт
+        владельца (``on_human_needed``), выводит окно вперёд и ждёт его клика:
+        нажимает владелец, сборщик не нажимает ничего (решение владельца
+        2026-11-24). Пока на странице галочка, запросов к сайту нет.
         """
+        first_open, self._first_open = self._first_open, False
         await self._goto_home()
         ready, last = await self._wait_ready(_READY_PROBE_DELAYS)
         if ready:
@@ -183,9 +187,20 @@ class KontaktBrowserScraper(KontaktScraper):
                 f"kontakt: the site does not give data to the real Chrome ({last}); "
                 "the collector does not solve Cloudflare checks"
             )
-        log.warning(
-            "kontakt_browser_waiting_for_human", reason=last, minutes=self.human_wait_sec / 60
+        # Галочку человек видит на странице, а не в ответе данных: открыть
+        # главную заново, если на ней сейчас не проверка. Нет проверки и после
+        # этого — нажимать человеку нечего, звать его незачем: остановка.
+        if not await self._showing_check():
+            await self._goto_home()
+            await asyncio.sleep(_HUMAN_POLL_SEC)
+            if not await self._showing_check():
+                raise CaptchaDetected(
+                    f"kontakt: no Cloudflare check to click, but the site refuses data ({last})"
+                )
+        wait_sec = (
+            self.human_wait_sec if first_open else min(self.human_wait_sec, _MIDWALK_HUMAN_WAIT_SEC)
         )
+        log.warning("kontakt_browser_waiting_for_human", reason=last, minutes=wait_sec / 60)
         if self.on_human_needed is not None:
             self.on_human_needed()
         try:
@@ -193,18 +208,20 @@ class KontaktBrowserScraper(KontaktScraper):
         except Exception as exc:
             if _browser_gone(exc):
                 raise
-        # Проверку человек видит на странице, а не в ответе данных: открыть
-        # главную заново, если на ней сейчас не проверка.
-        if not await self._showing_check():
-            await self._goto_home()
-        rounds = max(1, int(self.human_wait_sec // _HUMAN_POLL_SEC))
-        ready, last = await self._wait_ready((_HUMAN_POLL_SEC,) * rounds, quiet_on_check=True)
-        if ready:
-            log.info("kontakt_browser_passed_by_human")
-            return
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + wait_sec
+        while loop.time() < deadline:
+            ready, last = await self._wait_ready((_HUMAN_POLL_SEC,))
+            if ready:
+                log.info("kontakt_browser_passed_by_human")
+                return
+            if last.startswith("data HTTP"):
+                # Галочка пройдена, а данные всё равно закрыты — ждать
+                # человека дальше бессмысленно.
+                break
         raise CaptchaDetected(
             f"kontakt: the Cloudflare check was not passed within "
-            f"{self.human_wait_sec // 60:.0f} minutes ({last})"
+            f"{wait_sec / 60:.0f} minutes ({last})"
         )
 
     async def _goto_home(self) -> None:
@@ -227,9 +244,7 @@ class KontaktBrowserScraper(KontaktScraper):
                 raise
             return False
 
-    async def _wait_ready(
-        self, delays: tuple[float, ...], *, quiet_on_check: bool = False
-    ) -> tuple[bool, str]:
+    async def _wait_ready(self, delays: tuple[float, ...]) -> tuple[bool, str]:
         """Пробовать данные после каждой паузы; ``(готов, последняя причина)``.
 
         Пока на странице проверка, данные не запрашиваются вовсе.
