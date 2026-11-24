@@ -61,7 +61,12 @@ install -m 755 "$REPO/infra/local/kontakt/run.sh" "$BASE/run.sh"
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 sed "s|HOME_DIR|$HOME|g" "$REPO/infra/local/kontakt/$LABEL.plist" > "$PLIST"
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$UID" "$PLIST"
+# Сразу после bootout macOS иногда отвечает «Bootstrap failed: 5»: повтор.
+for attempt in 1 2 3 4 5; do
+    launchctl bootstrap "gui/$UID" "$PLIST" 2>/dev/null && break
+    (( attempt < 5 )) || { echo "launchctl bootstrap не прошёл" >&2; exit 1; }
+    sleep 2
+done
 
 if [[ ! -f $KEY ]]; then
     echo "==> ключ $KEY"

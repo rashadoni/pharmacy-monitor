@@ -45,17 +45,24 @@ log = structlog.get_logger()
 # Cloudflare. Настоящий Chrome обычно проходит её сам за секунды; дольше —
 # значит, она ждёт человека, а этого сборщик не делает.
 _CHALLENGE_WAIT_SEC = 45
+# Предел одного запроса: зависший ответ не должен держать сбор вечно.
+_REQUEST_TIMEOUT_MS = 60_000
 # Запрос изнутри страницы. Только kontakt.az: адрес проверяется до вызова.
 _FETCH_JS = """
-async (url) => {
+async ([url, timeoutMs]) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {
       credentials: "include",
       headers: { Accept: "*/*" },
+      signal: controller.signal,
     });
     return { status: response.status, text: await response.text() };
   } catch (error) {
     return { status: null, error: String((error && error.name) || error) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 """
@@ -145,7 +152,11 @@ class KontaktBrowserScraper(KontaktScraper):
 
     async def _page_fetch(self, url: str) -> dict:
         """Один запрос изнутри вкладки; ``{"status", "text"}`` или ``{"error"}``."""
-        return await self._page.evaluate(_FETCH_JS, url)
+        # Второй предел — на случай, если зависла сама вкладка, а не запрос.
+        return await asyncio.wait_for(
+            self._page.evaluate(_FETCH_JS, [url, _REQUEST_TIMEOUT_MS]),
+            timeout=_REQUEST_TIMEOUT_MS / 1000 + 15,
+        )
 
     async def fetch(
         self,
@@ -158,8 +169,13 @@ class KontaktBrowserScraper(KontaktScraper):
         """Страница данных сайта или причина, почему её нет.
 
         Исходы те же, что у HTTP-сборщика: ответ; ``CaptchaDetected`` — сайт
-        показал проверку или отказал (403), повторов нет; ``PageFetchError`` —
-        сеть, временный или постоянный статус.
+        показал проверку или отказал (403); ``PageFetchError`` — сеть,
+        временный или постоянный статус.
+
+        Проверка посреди обхода бывает, когда истёк допуск Cloudflare,
+        выданный при открытии главной. Тогда главная открывается заново —
+        обычный переход, как у человека, — и запрос повторяется один раз.
+        Вторая проверка подряд или проверка на главной — остановка.
         """
         del headers  # заголовки ставит сам Chrome; Accept — в _FETCH_JS
         parts = urlsplit(url)
@@ -170,10 +186,13 @@ class KontaktBrowserScraper(KontaktScraper):
 
         attempts = max(1, self.max_retries)
         last_reason, last_status = "no attempt was made", None
-        for attempt in range(attempts):
-            if attempt:
+        reopened = False
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
+            if attempt > 1:
                 self.fetch_retries += 1
-                await asyncio.sleep(min(8.0, 0.5 * 2**attempt))
+                await asyncio.sleep(min(8.0, 0.5 * 2 ** (attempt - 1)))
             await self._throttle()
             try:
                 answer = await self._page_fetch(url)
@@ -187,7 +206,15 @@ class KontaktBrowserScraper(KontaktScraper):
             status = int(answer["status"])
             text = str(answer.get("text") or "")
             if looks_like_protection_page(text) or status == 403:
-                raise CaptchaDetected(f"kontakt: access refused instead of content (HTTP {status})")
+                if reopened:
+                    raise CaptchaDetected(
+                        f"kontakt: access refused instead of content (HTTP {status})"
+                    )
+                reopened = True
+                attempt -= 1  # переоткрытие — не попытка из запаса на сбои сети
+                log.warning("kontakt_browser_reopening_site", status=status)
+                await self._open_site()
+                continue
             if status in accept_statuses:
                 return BrowserResponse(status_code=status, text=text)
             last_reason, last_status = f"HTTP {status}", status

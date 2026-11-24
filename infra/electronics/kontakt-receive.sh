@@ -38,7 +38,17 @@ as_instance() {  # команда экземпляра электроники о
 
 running_unit() {  # идущая загрузка, если есть
     systemctl list-units --state=active,activating --plain --no-legend \
-        "$UNIT_PREFIX-*.service" 2>/dev/null | awk '{print $1}' | head -n 1
+        "$UNIT_PREFIX-*.service" 2>/dev/null | awk '{print $1}' | head -n 1 || true
+}
+
+wait_for_sync() {  # sync.sh меняет код экземпляра: под ним ничего не запускать
+    local state
+    for _ in $(seq 40); do
+        state=$(systemctl show -p ActiveState --value electro-monitor-sync.service 2>/dev/null || true)
+        [[ $state == activating || $state == active ]] || return 0
+        sleep 30
+    done
+    die "идёт обновление кода экземпляра (electro-monitor-sync) дольше 20 минут" 75
 }
 
 action=${SSH_ORIGINAL_COMMAND:-import}
@@ -80,6 +90,7 @@ trap - EXIT
 ls -1t "$INBOX"/kontakt-*.csv 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f --
 
 say "файл $(basename "$file"), $size байт"
+wait_for_sync
 # Сначала проверка без записи: файл с ошибками отвергается здесь, и Мак видит
 # причины сразу, а не в журнале сервера.
 as_instance catalog import --site kontakt "$file" --dry-run

@@ -45,7 +45,12 @@ def browser(answers, tmp_path):
         seen.append(url)
         return answers(url)
 
+    async def open_site():  # переоткрытие главной — в тестах без браузера
+        scraper.reopened += 1
+
     scraper._page_fetch = page_fetch
+    scraper._open_site = open_site
+    scraper.reopened = 0
     return scraper, seen
 
 
@@ -69,11 +74,11 @@ async def test_page_is_returned_as_the_http_scraper_would(tmp_path):
         {"status": 403, "text": "forbidden"},
     ],
 )
-async def test_a_check_or_refusal_stops_at_once_and_is_not_retried(tmp_path, answer):
+async def test_a_check_or_refusal_stops_after_one_reopening(tmp_path, answer):
     scraper, seen = browser(lambda _url: answer, tmp_path)
     with pytest.raises(CaptchaDetected):
         await scraper.fetch("https://kontakt.az/tv.data")
-    assert len(seen) == 1
+    assert len(seen) == 2 and scraper.reopened == 1
 
 
 async def test_transient_answer_is_retried_and_counted(tmp_path):
@@ -226,3 +231,63 @@ def test_file_is_written_atomically(tmp_path):
     assert out.exists() and not (tmp_path / "sub" / "k.csv.part").exists()
     with out.open(encoding="utf-8") as fh:
         assert next(csv.reader(fh)) == list(kontakt_collect.COLUMNS)
+
+
+async def test_an_expired_clearance_reopens_the_site_once_and_continues(tmp_path):
+    scraper, seen = browser(
+        sequence({"status": 403, "text": CLOUDFLARE_CHALLENGE}, {"status": 200, "text": "ok"}),
+        tmp_path,
+    )
+    reopened = []
+
+    async def open_site():
+        reopened.append(1)
+
+    scraper._open_site = open_site
+    assert (await scraper.fetch("https://kontakt.az/tv.data")).text == "ok"
+    assert len(reopened) == 1 and len(seen) == 2
+    assert scraper.fetch_retries == 0  # переоткрытие — не повтор из-за сбоя
+
+
+async def test_a_check_right_after_reopening_stops_the_collection(tmp_path):
+    scraper, seen = browser(lambda _url: {"status": 403, "text": CLOUDFLARE_CHALLENGE}, tmp_path)
+    reopened = []
+
+    async def open_site():
+        reopened.append(1)
+
+    scraper._open_site = open_site
+    with pytest.raises(CaptchaDetected):
+        await scraper.fetch("https://kontakt.az/tv.data")
+    assert len(reopened) == 1 and len(seen) == 2
+
+
+async def test_a_hung_request_is_a_retried_failure_not_a_hang(tmp_path):
+    scraper, seen = browser(lambda _url: {"status": 200, "text": "never"}, tmp_path)
+
+    async def hung(url):
+        seen.append(url)
+        raise TimeoutError
+
+    scraper._page_fetch = hung
+    with pytest.raises(PageFetchError) as error:
+        await scraper.fetch("https://kontakt.az/tv.data")
+    assert "TimeoutError" in error.value.reason
+    assert len(seen) == scraper.max_retries
+
+
+def test_the_request_inside_the_tab_has_its_own_time_limit():
+    assert "AbortController" in kontakt_browser._FETCH_JS
+    assert kontakt_browser._REQUEST_TIMEOUT_MS > 0
+
+
+def test_mac_upload_reads_the_server_key_from_a_path_without_spaces():
+    """ssh делит значение UserKnownHostsFile по пробелам, а каталог сборщика —
+    в «Application Support»: ключ сервера кладётся в ~/.ssh."""
+    from pathlib import Path
+
+    run = (Path(__file__).parents[1] / "infra" / "local" / "kontakt" / "run.sh").read_text()
+    assert 'KNOWN="$HOME/.ssh/kontakt_known_hosts"' in run
+    assert '-o UserKnownHostsFile="$KNOWN"' in run
+    assert 'UserKnownHostsFile="$REPO' not in run and 'UserKnownHostsFile="$BASE' not in run
+    assert "--max-minutes" in run

@@ -57,12 +57,15 @@ fi
 out="$OUT_DIR/kontakt-$(date +%Y%m%d-%H%M).csv"
 cd "$REPO" || finish "Kontakt: нет каталога кода" 1
 # caffeinate: Мак не засыпает посреди обхода.
+# Предел на весь обход: зависший сбор не должен держать Мак без сна и
+# закрывать дорогу завтрашнему запуску.
 /usr/bin/caffeinate -i "$VENV/bin/python" -m src.kontakt_collect \
-    --out "$out" --profile "$BASE/chrome-profile"
+    --out "$out" --profile "$BASE/chrome-profile" --max-minutes 300
 code=$?
 case $code in
     0) ;;
     2) finish "Kontakt: Cloudflare не пустил Chrome — сбор остановлен" 2 ;;
+    4) finish "Kontakt: обход не уложился в 5 часов — файл не отправлен" 4 ;;
     3) finish "Kontakt: каталог собран не полностью — файл не отправлен" 3 ;;
     *) finish "Kontakt: сбор упал (код $code), см. kontakt-collect.log" "$code" ;;
 esac
@@ -70,8 +73,12 @@ ls -1t "$OUT_DIR"/kontakt-*.csv 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -I{
 
 # Ключ годится только для приёма файла (принудительная команда на сервере);
 # сервер узнаётся по прошитому ключу из репозитория.
+# Путь к ключу сервера — без пробелов: ssh делит значение UserKnownHostsFile
+# по пробелам, а каталог сборщика лежит в «Application Support».
+KNOWN="$HOME/.ssh/kontakt_known_hosts"
+cp "$REPO/infra/prod_known_hosts" "$KNOWN"
 answer=$(/usr/bin/ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ControlPath=none \
-    -o UserKnownHostsFile="$REPO/infra/prod_known_hosts" -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile="$KNOWN" -o StrictHostKeyChecking=yes \
     -o ConnectTimeout=30 "$SERVER" import < "$out" 2>&1)
 code=$?
 echo "$answer"

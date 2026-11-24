@@ -16,7 +16,8 @@
 
 Коды выхода: 0 — файл записан; 2 — сайт показал проверку Cloudflare, которую
 Chrome не прошёл сам; 3 — обход неполный (больше допустимого числа категорий
-не дочитано) или товаров нет; 1 — прочая ошибка. Файл пишется только при 0.
+не дочитано) или товаров нет; 4 — обход не уложился в ``--max-minutes``;
+1 — прочая ошибка. Файл пишется только при 0.
 """
 
 from __future__ import annotations
@@ -135,11 +136,17 @@ async def _main(args: argparse.Namespace) -> int:
     scraper = KontaktBrowserScraper(args.profile, headless=args.headless)
     try:
         async with scraper:
-            rows = await collect(
-                scraper,
-                max_incomplete_share=args.max_incomplete_share,
-                category_limit=args.category_limit,
+            rows = await asyncio.wait_for(
+                collect(
+                    scraper,
+                    max_incomplete_share=args.max_incomplete_share,
+                    category_limit=args.category_limit,
+                ),
+                timeout=args.max_minutes * 60 if args.max_minutes else None,
             )
+    except TimeoutError:
+        print(f"kontakt: обход не уложился в {args.max_minutes} минут", file=sys.stderr)
+        return 4
     except CaptchaDetected as exc:
         print(f"kontakt: {exc}", file=sys.stderr)
         return 2
@@ -165,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MAX_INCOMPLETE_SHARE,
         help="доля категорий, которые можно не дочитать",
     )
+    parser.add_argument("--max-minutes", type=int, default=None, help="предел на весь обход, минут")
     parser.add_argument(
         "--category-limit", type=int, default=None, help="только первые N категорий (проба)"
     )
