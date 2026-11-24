@@ -40,6 +40,8 @@ COLUMNS = ("name", "url", "price", "sale_price", "category", "availability")
 # Длина колонки ``products.category``; длиннее — сервер отверг бы файл целиком.
 _CATEGORY_MAX = 100
 _SITE = "https://kontakt.az/"
+# Длины колонок `products`: идентификатор — путь адреса (200), адрес — 500.
+_URL_MAX = len(_SITE) + 200
 
 
 @dataclass
@@ -55,7 +57,10 @@ def money(value: object) -> str | None:
     if value is None:
         return None
     text = str(value).replace("\xa0", " ").replace("₼", "").replace("AZN", "")
-    text = text.replace(" ", "").replace(",", ".").strip()
+    text = text.replace(" ", "").strip()
+    if "," in text and "." in text:
+        text = text.replace(",", "")  # «2,199.00» — запятая разделяет тысячи
+    text = text.replace(",", ".")
     if not re.fullmatch(r"\d+(\.\d+)?", text):
         return None
     amount = float(text)
@@ -74,7 +79,8 @@ def product_url(value: object) -> str | None:
 def _sections(folder: Path) -> dict[str, str]:
     """Файл выгрузки → раздел сайта, из ``catalog-status.csv``."""
     sections: dict[str, str] = {}
-    for status in sorted(folder.rglob("catalog-status.csv")):
+    # Только сама папка: в её подпапке «отправлено» лежат прошлые выгрузки.
+    for status in sorted(folder.glob("catalog-status.csv")):
         with status.open(encoding="utf-8-sig", newline="") as fh:
             for row in csv.DictReader(fh, delimiter=";"):
                 name = (row.get("Файл") or "").strip()
@@ -114,12 +120,16 @@ def merge(folder: str | Path) -> MergeResult:
     sections = _sections(folder)
     result = MergeResult(rows=[])
     by_url: dict[str, dict[str, str]] = {}
-    for path in sorted(folder.rglob("*.xlsx")):
+    # Только верхний уровень папки: прошлые выгрузки уезжают в «отправлено/…»
+    # внутри неё и не должны склеиваться заново.
+    for path in sorted(folder.glob("*.xlsx")):
         if path.name.startswith(("~$", ".")):
             continue  # служебный файл открытого Excel
         result.files += 1
-        sheet = load_workbook(path, read_only=True, data_only=True).worksheets[0]
-        rows = sheet.iter_rows(values_only=True)
+        book = load_workbook(path, read_only=True, data_only=True)
+        rows = list(book.worksheets[0].iter_rows(values_only=True))
+        book.close()
+        rows = iter(rows)
         head = [str(cell or "").strip() for cell in next(rows, ())]
         col = _columns(head)
         if col is None:
@@ -139,7 +149,7 @@ def merge(folder: str | Path) -> MergeResult:
             name = " ".join(str(cell("name") or "").split())
             current = money(cell("price"))
             old = money(cell("old"))
-            if not url:
+            if not url or len(url) > _URL_MAX:
                 result.stats["no_url"] += 1
                 continue
             if not name:

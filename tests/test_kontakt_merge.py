@@ -89,6 +89,22 @@ def test_both_export_kinds_merge_into_a_file_the_server_reads(tmp_path):
     assert by_id["disk-ps4"].category == "Gamer zona"
 
 
+def test_archived_exports_are_not_merged_again(tmp_path):
+    folder = tmp_path / "Kontakt"
+    sent = folder / "отправлено" / "2026-11-24_1000"
+    sent.mkdir(parents=True)
+    _xlsx(
+        sent / "телефоны.xlsx",
+        [["Название", "Цена", "Ссылка"], ["Old", "1 ₼", "https://kontakt.az/old-phone"]],
+    )
+    _xlsx(
+        folder / "new.xlsx",
+        [["Название", "Цена", "Ссылка"], ["New", "2 ₼", "https://kontakt.az/new-phone"]],
+    )
+    rows = kontakt_merge.merge(folder).rows
+    assert [row["url"] for row in rows] == ["https://kontakt.az/new-phone"]
+
+
 def test_a_folder_without_products_writes_nothing(tmp_path):
     folder = tmp_path / "Kontakt"
     folder.mkdir()
@@ -102,6 +118,7 @@ def test_money_reads_the_forms_the_exports_use():
     assert kontakt_merge.money("1 899.99 ₼") == "1899.99"
     assert kontakt_merge.money("14,99 ₼") == "14.99"
     assert kontakt_merge.money(5049.9) == "5049.90"
+    assert kontakt_merge.money("2,199.00") == "2199.00"
     assert kontakt_merge.money("0 ₼") is None and kontakt_merge.money("—") is None
 
 

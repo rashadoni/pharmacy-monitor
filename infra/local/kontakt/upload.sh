@@ -39,8 +39,10 @@ echo "выгрузок: ${#files[@]}"
 BRANCH=$(cat "$BASE/branch" 2>/dev/null || echo main)
 if git -C "$REPO" fetch -q origin "$BRANCH"; then
     git -C "$REPO" reset -q --hard FETCH_HEAD
+    # Сам этот сценарий — копия: следующий запуск пойдёт уже новой.
+    install -m 755 "$REPO/infra/local/kontakt/upload.sh" "$BASE/upload.sh"
 else
-    echo "git fetch не прошёл — работаю прежним кодом"
+    echo "git fetch ($BRANCH) не прошёл — работаю прежним кодом; если ветку удалили, переустановите"
 fi
 
 # Ключ сервера — в пути без пробелов: ssh делит значение UserKnownHostsFile
@@ -72,6 +74,7 @@ sent="$INBOX/отправлено/$(date +%Y-%m-%d_%H%M)"
 mkdir -p "$sent"
 mv "${files[@]}" "$sent/"
 [[ -f $INBOX/catalog-status.csv ]] && mv "$INBOX/catalog-status.csv" "$sent/"
+shopt -u nullglob
 ls -1t "$BASE/out"/kontakt-*.csv 2>/dev/null | tail -n +15 | xargs -I{} rm -f -- {}
 products=$(($(wc -l < "$out") - 1))
 finish "Отправлено $products товаров Kontakt — сервер загружает (минуты; если идёт ночной сбор Irshad — после него)"
