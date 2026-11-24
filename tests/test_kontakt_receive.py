@@ -82,7 +82,7 @@ def _csv(rows=1) -> bytes:
 
 
 def test_ping_and_unknown_command(server):
-    from src.kontakt_collect import COLUMNS
+    from src.kontakt_merge import COLUMNS
 
     pong = server("ping")
     # Мак сверяет этот заголовок со своими колонками до обхода.

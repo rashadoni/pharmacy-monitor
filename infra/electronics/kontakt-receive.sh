@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Приём каталога Kontakt Home, собранного на Маке владельца
-# (infra/local/kontakt/run.sh). Ставится kontakt-upload-setup.sh в
+# Приём каталога Kontakt Home, отправленного с Мака владельца
+# (infra/local/kontakt/upload.sh). Ставится kontakt-upload-setup.sh в
 # /usr/local/lib/electro-monitor/kontakt-receive и исполняется как
 # принудительная команда ключа Мака в /root/.ssh/authorized_keys:
 # этот ключ ничего другого на сервере сделать не может.
