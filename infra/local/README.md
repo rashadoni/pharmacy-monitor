@@ -1,5 +1,11 @@
 # Retired Mac Scrape Runtime
 
+> **Exception since 2026-11-24 — Kontakt Home.** The electronics instance
+> collects Kontakt Home (kontakt.az) on the owner's Mac in real Google Chrome,
+> once a day, and sends the file to the server: `infra/local/kontakt/`
+> (owner's decision; boundaries in `CLAUDE.md` and `docs/ELECTRONICS.md`).
+> Everything below is about the pharmacy sites and stays retired.
+
 Production scraping is fully server-side as of 2026-07-03. The paid services own
 the scrape path:
 

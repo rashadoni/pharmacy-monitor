@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Сбор Kontakt Home на Маке раз в сутки. Ставит install-mac.sh, подставляя
+  HOME_DIR. Время местное: 04:30. Если Мак в это время спит, launchd
+  запускает пропущенный сбор после пробуждения.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>az.leaddrive.kontakt-collect</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>HOME_DIR/Library/Application Support/kontakt-collector/run.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>HOME_DIR/Library/Logs/kontakt-collect.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>HOME_DIR/Library/Logs/kontakt-collect.launchd.log</string>
+</dict>
+</plist>
