@@ -323,3 +323,46 @@ async def test_reopening_the_site_is_capped_for_the_whole_walk(tmp_path):
     with pytest.raises(CaptchaDetected):
         await scraper.fetch("https://kontakt.az/tv.data")
     assert scraper.reopened == kontakt_browser._MAX_REOPENS
+
+
+class _FakePage:
+    def __init__(self, html="<html><title>Kontakt</title></html>"):
+        self.html = html
+        self.visits = []
+
+    async def goto(self, url, **_kwargs):
+        self.visits.append(url)
+
+    async def content(self):
+        return self.html
+
+
+async def test_site_is_ready_only_when_data_comes_back_not_when_the_page_shows(tmp_path):
+    """Проба 2026-11-24: главная нарисована, а первый запрос данных — 403.
+    Сборщик ждёт ответа 200 на данные, а не только видимую страницу."""
+    scraper = KontaktBrowserScraper(tmp_path / "profile", rate_limit_sec=0)
+    scraper._page = _FakePage()
+    answers = iter([{"status": 403, "text": CLOUDFLARE_CHALLENGE}, {"status": 200, "text": "[]"}])
+    probes = []
+
+    async def page_fetch(url):
+        probes.append(url)
+        return next(answers)
+
+    scraper._page_fetch = page_fetch
+    await scraper._open_site()
+    assert probes == ["https://kontakt.az/_root.data"] * 2
+
+
+async def test_site_that_never_gives_data_stops_with_a_check(tmp_path, monkeypatch):
+    monkeypatch.setattr(kontakt_browser, "_CHALLENGE_WAIT_SEC", 0)
+    scraper = KontaktBrowserScraper(tmp_path / "profile", rate_limit_sec=0)
+    scraper._page = _FakePage()
+
+    async def page_fetch(_url):
+        return {"status": 403, "text": CLOUDFLARE_CHALLENGE}
+
+    scraper._page_fetch = page_fetch
+    with pytest.raises(CaptchaDetected) as error:
+        await scraper._open_site()
+    assert "data HTTP 403" in str(error.value)

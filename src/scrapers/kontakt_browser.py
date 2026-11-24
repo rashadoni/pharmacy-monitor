@@ -44,7 +44,7 @@ log = structlog.get_logger()
 # Сколько ждать, пока открытая главная страница перестанет быть проверкой
 # Cloudflare. Настоящий Chrome обычно проходит её сам за секунды; дольше —
 # значит, она ждёт человека, а этого сборщик не делает.
-_CHALLENGE_WAIT_SEC = 45
+_CHALLENGE_WAIT_SEC = 90
 # Предел одного запроса: зависший ответ не должен держать сбор вечно.
 _REQUEST_TIMEOUT_MS = 60_000
 # Сколько раз за весь обход можно заново открыть главную после проверки
@@ -137,20 +137,41 @@ class KontaktBrowserScraper(KontaktScraper):
                 pass
 
     async def _open_site(self) -> None:
-        """Открыть главную kontakt.az и дождаться её самой, а не проверки."""
-        await self._page.goto(f"{self.base_url}/", wait_until="domcontentloaded", timeout=60_000)
+        """Открыть главную kontakt.az и дождаться, пока сайт начнёт отдавать данные.
+
+        Видимая главная — ещё не допуск: Cloudflare выдаёт его скриптом страницы,
+        уже после того, как она нарисована (первая проба 2026-11-24 на Маке:
+        главная открылась, а первый запрос данных, ушедший сразу, получил 403).
+        Поэтому готовность — это ответ 200 на ``/_root.data`` изнутри вкладки;
+        до него сборщик ждёт, ничего не нажимая.
+        """
+        await self._page.goto(f"{self.base_url}/", wait_until="load", timeout=90_000)
         loop = asyncio.get_event_loop()
         deadline = loop.time() + _CHALLENGE_WAIT_SEC
+        last = "no answer"
         while True:
+            await asyncio.sleep(3)
             html = await self._page.content()
             if not looks_like_protection_page(html):
-                return
+                try:
+                    probe = await self._page_fetch(f"{self.base_url}/_root.data")
+                except Exception as exc:
+                    if "closed" in str(exc).lower():
+                        raise
+                    probe = {"status": None, "error": type(exc).__name__}
+                status = probe.get("status") if isinstance(probe, dict) else None
+                text = str(probe.get("text") or "") if isinstance(probe, dict) else ""
+                if status == 200 and not looks_like_protection_page(text):
+                    log.info("kontakt_browser_site_ready")
+                    return
+                last = f"data HTTP {status}"
+            else:
+                last = "check page"
             if loop.time() >= deadline:
                 raise CaptchaDetected(
-                    "kontakt: Cloudflare keeps showing a check to the real Chrome; "
-                    "the collector does not solve it"
+                    f"kontakt: the site does not give data to the real Chrome ({last}); "
+                    "the collector does not solve Cloudflare checks"
                 )
-            await asyncio.sleep(2)
 
     # -- запрос страницы ---------------------------------------------------------
 

@@ -167,6 +167,11 @@ async def _main(args: argparse.Namespace) -> int:
     except PageFetchError as exc:
         print(f"kontakt: страница не получена: {exc.reason}", file=sys.stderr)
         return 1
+    except Exception as exc:
+        if type(exc).__name__ != "TargetClosedError":
+            raise
+        print("kontakt: окно Chrome сборщика закрыто — сбор прерван", file=sys.stderr)
+        return 1
     write_catalog(rows, Path(args.out))
     print(f"kontakt: товаров {len(rows)} → {args.out}")
     return 0
