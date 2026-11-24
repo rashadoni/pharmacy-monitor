@@ -101,8 +101,12 @@ def test_archived_exports_are_not_merged_again(tmp_path):
         folder / "new.xlsx",
         [["Название", "Цена", "Ссылка"], ["New", "2 ₼", "https://kontakt.az/new-phone"]],
     )
+    (sent / "catalog-status.csv").write_text(
+        "Раздел;Файл\nСтарый раздел;new.xlsx\n", encoding="utf-8-sig"
+    )
     rows = kontakt_merge.merge(folder).rows
     assert [row["url"] for row in rows] == ["https://kontakt.az/new-phone"]
+    assert rows[0]["category"] == ""  # раздел из архива не подхвачен
 
 
 def test_a_folder_without_products_writes_nothing(tmp_path):
@@ -119,6 +123,7 @@ def test_money_reads_the_forms_the_exports_use():
     assert kontakt_merge.money("14,99 ₼") == "14.99"
     assert kontakt_merge.money(5049.9) == "5049.90"
     assert kontakt_merge.money("2,199.00") == "2199.00"
+    assert kontakt_merge.money("1.899,99") == "1899.99"
     assert kontakt_merge.money("0 ₼") is None and kontakt_merge.money("—") is None
 
 

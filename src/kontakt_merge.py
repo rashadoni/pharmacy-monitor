@@ -13,7 +13,8 @@ Kontakt Home сборщиком не читается: Cloudflare не пуск�
   - колонки карточки сайта: ``product-card__title``, ``product-card__price``,
     ``product-card__image-link href``, ``product-card__old-price``.
 Раздел товара берётся из ``catalog-status.csv`` в той же папке (колонки
-«Раздел» и «Файл»), если он есть.
+«Раздел» и «Файл»), если он есть. Читается только сама папка, без подпапок:
+в подпапке «отправлено» лежат прошлые выгрузки.
 
 Колонки итога — те же, что ждёт приём на сервере
 (``infra/electronics/kontakt-receive.sh``): name, url, price, sale_price,
@@ -59,7 +60,9 @@ def money(value: object) -> str | None:
     text = str(value).replace("\xa0", " ").replace("₼", "").replace("AZN", "")
     text = text.replace(" ", "").strip()
     if "," in text and "." in text:
-        text = text.replace(",", "")  # «2,199.00» — запятая разделяет тысячи
+        # Оба знака: дробный — тот, что правее («2,199.00» и «1.899,99»).
+        thousands = "," if text.rfind(".") > text.rfind(",") else "."
+        text = text.replace(thousands, "")
     text = text.replace(",", ".")
     if not re.fullmatch(r"\d+(\.\d+)?", text):
         return None
@@ -149,8 +152,11 @@ def merge(folder: str | Path) -> MergeResult:
             name = " ".join(str(cell("name") or "").split())
             current = money(cell("price"))
             old = money(cell("old"))
-            if not url or len(url) > _URL_MAX:
+            if not url:
                 result.stats["no_url"] += 1
+                continue
+            if len(url) > _URL_MAX:
+                result.stats["url_too_long"] += 1
                 continue
             if not name:
                 result.stats["no_name"] += 1
