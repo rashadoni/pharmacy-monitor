@@ -291,3 +291,35 @@ def test_mac_upload_reads_the_server_key_from_a_path_without_spaces():
     assert '-o UserKnownHostsFile="$KNOWN"' in run
     assert 'UserKnownHostsFile="$REPO' not in run and 'UserKnownHostsFile="$BASE' not in run
     assert "--max-minutes" in run
+
+
+async def test_a_product_in_several_listings_gets_the_deepest_category(tmp_path):
+    menu = {
+        "root": {
+            "data": {
+                "categories": [
+                    {"url_path": "tv", "is_category": True, "children": []},
+                    {"url_path": "tv/oled", "is_category": True, "children": []},
+                ]
+            }
+        }
+    }
+    item = kontakt_item(sku="A-1")
+    pages = {
+        "/_root.data": menu,
+        "/tv.data": kontakt_listing([item], 1),
+        "/tv/oled.data": kontakt_listing([kontakt_item(sku="A-1")], 1),
+    }
+    scraper, _ = browser(site(pages), tmp_path)
+    rows = await kontakt_collect.collect(scraper)
+    assert [row["category"] for row in rows] == ["tv/oled"]
+
+
+async def test_reopening_the_site_is_capped_for_the_whole_walk(tmp_path):
+    scraper, _ = browser(lambda _url: {"status": 403, "text": CLOUDFLARE_CHALLENGE}, tmp_path)
+    for _ in range(kontakt_browser._MAX_REOPENS):
+        with pytest.raises(CaptchaDetected):
+            await scraper.fetch("https://kontakt.az/tv.data")
+    with pytest.raises(CaptchaDetected):
+        await scraper.fetch("https://kontakt.az/tv.data")
+    assert scraper.reopened == kontakt_browser._MAX_REOPENS

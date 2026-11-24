@@ -47,6 +47,9 @@ log = structlog.get_logger()
 _CHALLENGE_WAIT_SEC = 45
 # Предел одного запроса: зависший ответ не должен держать сбор вечно.
 _REQUEST_TIMEOUT_MS = 60_000
+# Сколько раз за весь обход можно заново открыть главную после проверки
+# посреди обхода. Больше — Cloudflare не отпускает, обход останавливается.
+_MAX_REOPENS = 3
 # Запрос изнутри страницы. Только kontakt.az: адрес проверяется до вызова.
 _FETCH_JS = """
 async ([url, timeoutMs]) => {
@@ -89,6 +92,7 @@ class KontaktBrowserScraper(KontaktScraper):
         self._page = None
         self._browser_context = None
         self._pw = None
+        self.reopens = 0
 
     # -- жизненный цикл ----------------------------------------------------------
 
@@ -206,11 +210,12 @@ class KontaktBrowserScraper(KontaktScraper):
             status = int(answer["status"])
             text = str(answer.get("text") or "")
             if looks_like_protection_page(text) or status == 403:
-                if reopened:
+                if reopened or self.reopens >= _MAX_REOPENS:
                     raise CaptchaDetected(
                         f"kontakt: access refused instead of content (HTTP {status})"
                     )
                 reopened = True
+                self.reopens += 1
                 attempt -= 1  # переоткрытие — не попытка из запаса на сбои сети
                 log.warning("kontakt_browser_reopening_site", status=status)
                 await self._open_site()

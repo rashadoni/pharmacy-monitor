@@ -54,6 +54,24 @@ if [[ $(cat "$BASE/deps.sha" 2>/dev/null) != "$want" ]]; then
     echo "$want" > "$BASE/deps.sha"
 fi
 
+# Ключ сервера — в пути без пробелов: ssh делит значение UserKnownHostsFile
+# по пробелам, а каталог сборщика лежит в «Application Support».
+KNOWN="$HOME/.ssh/kontakt_known_hosts"
+cp "$REPO/infra/prod_known_hosts" "$KNOWN"
+server() {
+    /usr/bin/ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ControlPath=none \
+        -o UserKnownHostsFile="$KNOWN" -o StrictHostKeyChecking=yes \
+        -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$SERVER" "$@"
+}
+
+# До обхода: сервер доступен и ждёт те же колонки, что пишет этот код. Код
+# Мака обновляется из ветки сам, приём на сервере — установкой; расхождение
+# видно здесь, а не после двух часов обхода.
+expected=$(server ping 2>&1) || finish "Kontakt: сервер не отвечает на ключ (см. kontakt-collect.log)" 1
+ours=$(cd "$REPO" && "$VENV/bin/python" -c 'from src.kontakt_collect import COLUMNS; print(",".join(COLUMNS))')
+[[ $expected == "$ours" ]] || finish "Kontakt: колонки файла и приёма на сервере разошлись — сбор не начат" 1
+echo "сервер: последняя загрузка"; server status 2>&1 | tail -n 5
+
 out="$OUT_DIR/kontakt-$(date +%Y%m%d-%H%M).csv"
 cd "$REPO" || finish "Kontakt: нет каталога кода" 1
 # caffeinate: Мак не засыпает посреди обхода.
@@ -73,13 +91,7 @@ ls -1t "$OUT_DIR"/kontakt-*.csv 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -I{
 
 # Ключ годится только для приёма файла (принудительная команда на сервере);
 # сервер узнаётся по прошитому ключу из репозитория.
-# Путь к ключу сервера — без пробелов: ssh делит значение UserKnownHostsFile
-# по пробелам, а каталог сборщика лежит в «Application Support».
-KNOWN="$HOME/.ssh/kontakt_known_hosts"
-cp "$REPO/infra/prod_known_hosts" "$KNOWN"
-answer=$(/usr/bin/ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ControlPath=none \
-    -o UserKnownHostsFile="$KNOWN" -o StrictHostKeyChecking=yes \
-    -o ConnectTimeout=30 "$SERVER" import < "$out" 2>&1)
+answer=$(server import < "$out" 2>&1)
 code=$?
 echo "$answer"
 (( code == 0 )) || finish "Kontakt: сервер не принял файл (код $code), см. kontakt-collect.log" "$code"

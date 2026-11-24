@@ -62,6 +62,11 @@ def category_label(path: str) -> str:
     return "/".join(parts)[-_CATEGORY_MAX:]
 
 
+def _category_rank(row: dict[str, str]) -> tuple[int, str]:
+    category = row["category"]
+    return (-category.count("/"), category)
+
+
 def _money(value: float | None) -> str:
     return "" if value is None else f"{value:.2f}"
 
@@ -108,8 +113,14 @@ async def collect(
     for number, category in enumerate(categories, start=1):
         try:
             async for product in scraper.scrape_category(category):
-                # Товар стоит и в разделе, и во вложенном списке: берём первый.
-                by_url.setdefault(product.url, product_row(product))
+                row = product_row(product)
+                # Товар стоит и в разделе, и во вложенном списке. Категория —
+                # самая глубокая (точнее), при равной глубине — меньшая по
+                # алфавиту: от порядка обхода она зависеть не должна, иначе
+                # группы на дашборде перетасовывались бы каждую ночь.
+                earlier = by_url.get(product.url)
+                if earlier is None or _category_rank(row) < _category_rank(earlier):
+                    by_url[product.url] = row
         except CaptchaDetected as exc:
             raise CollectError(f"Cloudflare остановил сбор на {category}: {exc}", 2) from exc
         if number % 50 == 0:

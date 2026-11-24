@@ -82,7 +82,11 @@ def _csv(rows=1) -> bytes:
 
 
 def test_ping_and_unknown_command(server):
-    assert server("ping").returncode == 0
+    from src.kontakt_collect import COLUMNS
+
+    pong = server("ping")
+    # Мак сверяет этот заголовок со своими колонками до обхода.
+    assert pong.returncode == 0 and pong.stdout.decode().strip() == ",".join(COLUMNS)
     refused = server("bash -i")
     assert refused.returncode == 64
     assert server.calls() == []
