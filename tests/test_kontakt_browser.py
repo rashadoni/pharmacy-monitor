@@ -414,3 +414,68 @@ async def test_probes_are_few_and_spaced(tmp_path, monkeypatch):
         await scraper._open_site()
     assert sleeps == list(kontakt_browser._READY_PROBE_DELAYS)
     assert len(sleeps) <= 5 and sum(sleeps) <= 120
+
+
+class _CheckThenPassedPage(_FakePage):
+    """Страница с галочкой, пока «человек» не нажал её (после n просмотров)."""
+
+    def __init__(self, passes_after):
+        super().__init__(CLOUDFLARE_CHALLENGE)
+        self.views = 0
+        self.passes_after = passes_after
+        self.fronted = 0
+
+    async def content(self):
+        self.views += 1
+        if self.views > self.passes_after:
+            return "<html><title>Kontakt</title></html>"
+        return self.html
+
+    async def bring_to_front(self):
+        self.fronted += 1
+
+
+async def test_the_owner_is_called_and_the_collector_waits_for_his_click(tmp_path):
+    called = []
+    scraper = KontaktBrowserScraper(
+        tmp_path / "profile",
+        rate_limit_sec=0,
+        human_wait_sec=600,
+        on_human_needed=lambda: called.append(1),
+    )
+    page = _CheckThenPassedPage(passes_after=8)
+    scraper._page = page
+    probes = []
+
+    async def page_fetch(url):
+        probes.append(url)
+        return {"status": 200, "text": "[]"}
+
+    scraper._page_fetch = page_fetch
+    await scraper._open_site()
+    assert called == [1] and page.fronted == 1
+    # Пока на странице галочка, к сайту не ушло ни одного запроса.
+    assert probes == ["/_root.data"]
+
+
+async def test_nobody_clicked_in_time_means_a_stop(tmp_path):
+    scraper = KontaktBrowserScraper(
+        tmp_path / "profile", rate_limit_sec=0, human_wait_sec=60, on_human_needed=lambda: None
+    )
+    scraper._page = _CheckThenPassedPage(passes_after=10**6)
+
+    async def page_fetch(_url):
+        raise AssertionError("no requests while the check is shown")
+
+    scraper._page_fetch = page_fetch
+    with pytest.raises(CaptchaDetected) as error:
+        await scraper._open_site()
+    assert "was not passed" in str(error.value)
+
+
+def test_the_collector_never_clicks_and_keeps_the_sandbox():
+    with open(kontakt_browser.__file__, encoding="utf-8") as fh:
+        source = fh.read()
+    for usage in (".click(", ".check(", "frame_locator", "mouse.", "keyboard."):
+        assert usage not in source, usage
+    assert "chromium_sandbox=True" in source

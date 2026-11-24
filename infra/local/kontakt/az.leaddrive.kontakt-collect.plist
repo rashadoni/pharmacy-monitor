@@ -2,7 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Сбор Kontakt Home на Маке раз в сутки. Ставит install-mac.sh, подставляя
-  HOME_DIR. Время местное: 04:30. Если Мак в это время спит, launchd
+  HOME_DIR. Время местное: 10:00 — когда владелец за Маком: Cloudflare может
+  показать галочку, и нажимает её он. Если Мак в это время спит, launchd
   запускает пропущенный сбор после пробуждения.
 -->
 <plist version="1.0">
@@ -17,9 +18,9 @@
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
-        <integer>4</integer>
+        <integer>10</integer>
         <key>Minute</key>
-        <integer>30</integer>
+        <integer>0</integer>
     </dict>
     <key>StandardOutPath</key>
     <string>HOME_DIR/Library/Logs/kontakt-collect.launchd.log</string>

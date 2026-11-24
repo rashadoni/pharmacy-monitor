@@ -11,7 +11,7 @@
 #      ~/Library/Application Support/kontakt-collector (рабочие копии
 #      владельца не трогаются);
 #   2. ключ ~/.ssh/kontakt_upload — только для отправки файла каталога;
-#   3. расписание launchd az.leaddrive.kontakt-collect: каждый день в 04:30.
+#   3. расписание launchd az.leaddrive.kontakt-collect: каждый день в 10:00.
 # В конце печатает открытый ключ: его один раз ставит на сервер root
 # (infra/electronics/kontakt-upload-setup.sh).
 set -euo pipefail
@@ -78,7 +78,8 @@ fi
 
 cat <<DONE
 
-Готово. Сбор — каждый день в 04:30 (если Мак спал — после пробуждения).
+Готово. Сбор — каждый день в 10:00 (если Мак спал — после пробуждения).
+Если Cloudflare покажет галочку — придёт уведомление, нажмите её в окне Chrome.
 Запустить сейчас:   bash "$BASE/run.sh"
 Журнал:             ~/Library/Logs/kontakt-collect.log
 

@@ -14,8 +14,12 @@
 и товар там узнан по адресу страницы. Колонка с артикулом дала бы каждому
 товару новый идентификатор — весь каталог вторыми строками, без истории цен.
 
-Коды выхода: 0 — файл записан; 2 — сайт показал проверку Cloudflare, которую
-Chrome не прошёл сам; 3 — обход неполный (больше допустимого числа категорий
+Если Cloudflare показывает галочку «Verify you are human», сборщик зовёт
+владельца уведомлением и ждёт его клика (``--human-wait-minutes``); сам он
+ничего не нажимает (решение владельца 2026-11-24).
+
+Коды выхода: 0 — файл записан; 2 — проверку Cloudflare не прошли (никто не
+нажал галочку за отведённое время); 3 — обход неполный (больше допустимого числа категорий
 не дочитано) или товаров нет; 4 — обход не уложился в ``--max-minutes``;
 1 — прочая ошибка. Файл пишется только при 0.
 """
@@ -26,6 +30,7 @@ import argparse
 import asyncio
 import csv
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -143,8 +148,28 @@ async def collect(
     return list(by_url.values())
 
 
+def notify_human_needed() -> None:
+    """Позвать владельца: Cloudflare показал галочку, нажать её должен человек."""
+    print("kontakt: нужна галочка Cloudflare — нажмите её в окне Chrome сборщика", file=sys.stderr)
+    if sys.platform != "darwin":
+        return
+    script = (
+        'display notification "Нажмите галочку «Verify you are human» в окне Chrome '
+        'сборщика — дальше сбор пойдёт сам" with title "Kontakt" sound name "Glass"'
+    )
+    try:
+        subprocess.run(["/usr/bin/osascript", "-e", script], timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 async def _main(args: argparse.Namespace) -> int:
-    scraper = KontaktBrowserScraper(args.profile, headless=args.headless)
+    scraper = KontaktBrowserScraper(
+        args.profile,
+        headless=args.headless,
+        human_wait_sec=args.human_wait_minutes * 60,
+        on_human_needed=notify_human_needed,
+    )
     try:
         async with scraper:
             rows = await asyncio.wait_for(

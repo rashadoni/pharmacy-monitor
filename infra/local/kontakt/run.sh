@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ночной сбор Kontakt Home на Маке владельца: обойти каталог в настоящем
+# Ежедневный сбор Kontakt Home на Маке владельца: обойти каталог в настоящем
 # Chrome и отправить файл на сервер. Запускает launchd
 # (az.leaddrive.kontakt-collect); руками — так же:
 #   bash "$HOME/Library/Application Support/kontakt-collector/run.sh"
@@ -82,7 +82,7 @@ cd "$REPO" || finish "Kontakt: нет каталога кода" 1
 code=$?
 case $code in
     0) ;;
-    2) finish "Kontakt: Cloudflare не пустил Chrome — сбор остановлен" 2 ;;
+    2) finish "Kontakt: галочку Cloudflare не нажали за 30 минут — сбор остановлен, запустите заново" 2 ;;
     4) finish "Kontakt: обход не уложился в 5 часов — файл не отправлен" 4 ;;
     3) finish "Kontakt: каталог собран не полностью — файл не отправлен" 3 ;;
     *) finish "Kontakt: сбор упал (код $code), см. kontakt-collect.log" "$code" ;;

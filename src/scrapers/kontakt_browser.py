@@ -12,8 +12,9 @@ Cloudflare. Этот сборщик — тот же самый, с той же �
   - маскировки: отпечаток браузера, заголовок User-Agent и признак
     автоматизации не подменяются, плагинов «stealth» нет;
   - решения задач Cloudflare: если сайт показывает проверку и настоящий
-    Chrome сам её не проходит, сбор останавливается (``CaptchaDetected``) —
-    ничего не нажимается; ожидание допуска — не больше пяти проб за 90 с,
+    Chrome сам её не проходит, галочку нажимает владелец — сборщик зовёт его
+    и ждёт, сам ничего не нажимает; не дождался — останавливается
+    (``CaptchaDetected``); ожидание допуска — не больше пяти проб за 90 с,
     заново главная открывается не больше трёх раз за обход;
   - чужих адресов: только kontakt.az, только то, что не запрещает его
     ``robots.txt`` (данные страниц каталога), с паузой между запросами.
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
@@ -46,6 +48,8 @@ log = structlog.get_logger()
 # Chrome обычно получает допуск сам за секунды; дольше — значит, проверка ждёт
 # человека, а этого сборщик не делает.
 _READY_PROBE_DELAYS = (3, 6, 12, 24, 45)
+# Когда ждём человека — как часто смотреть, прошёл ли он проверку.
+_HUMAN_POLL_SEC = 15
 # Предел одного запроса: зависший ответ не должен держать сбор вечно.
 _REQUEST_TIMEOUT_MS = 60_000
 # Сколько раз за весь обход можно заново открыть главную после проверки
@@ -91,10 +95,20 @@ class KontaktBrowserScraper(KontaktScraper):
     # Паузы между запросами — как у человека, листающего каталог.
     default_rate_limit_sec = 2.5
 
-    def __init__(self, profile_dir: str | Path, *, headless: bool = False, **kwargs):
+    def __init__(
+        self,
+        profile_dir: str | Path,
+        *,
+        headless: bool = False,
+        human_wait_sec: float = 0,
+        on_human_needed: Callable[[], None] | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.profile_dir = Path(profile_dir)
         self.browser_headless = headless
+        self.human_wait_sec = human_wait_sec
+        self.on_human_needed = on_human_needed
         self._page = None
         self._browser_context = None
         self._pw = None
@@ -115,6 +129,9 @@ class KontaktBrowserScraper(KontaktScraper):
                 channel="chrome",
                 headless=self.browser_headless,
                 locale="az-AZ",
+                # Без этого Playwright запускает Chrome с --no-sandbox: жёлтая
+                # полоса «unsupported flag» и Chrome без песочницы на Маке.
+                chromium_sandbox=True,
             )
             pages = self._browser_context.pages
             self._page = pages[0] if pages else await self._browser_context.new_page()
@@ -149,9 +166,48 @@ class KontaktBrowserScraper(KontaktScraper):
         уже после того, как она нарисована (первая проба 2026-11-24 на Маке:
         главная открылась, а первый запрос данных, ушедший сразу, получил 403).
         Поэтому готовность — это ответ 200 на ``/_root.data`` изнутри вкладки.
-        До него сборщик ждёт, ничего не нажимая, с растущими паузами и не
-        больше ``len(_READY_PROBE_DELAYS)`` проб; не дождался — остановка.
+
+        Сначала сборщик ждёт сам, с растущими паузами. Не дождался, а
+        ``human_wait_sec`` задан — зовёт владельца (``on_human_needed``),
+        выводит окно вперёд и ждёт, пока проверку пройдёт человек: галочку
+        «Verify you are human» нажимает владелец, сборщик не нажимает ничего
+        (решение владельца 2026-11-24). Пока на странице проверка, запросов к
+        сайту нет.
         """
+        await self._goto_home()
+        ready, last = await self._wait_ready(_READY_PROBE_DELAYS)
+        if ready:
+            return
+        if self.human_wait_sec <= 0:
+            raise CaptchaDetected(
+                f"kontakt: the site does not give data to the real Chrome ({last}); "
+                "the collector does not solve Cloudflare checks"
+            )
+        log.warning(
+            "kontakt_browser_waiting_for_human", reason=last, minutes=self.human_wait_sec / 60
+        )
+        if self.on_human_needed is not None:
+            self.on_human_needed()
+        try:
+            await self._page.bring_to_front()
+        except Exception as exc:
+            if _browser_gone(exc):
+                raise
+        # Проверку человек видит на странице, а не в ответе данных: открыть
+        # главную заново, если на ней сейчас не проверка.
+        if not await self._showing_check():
+            await self._goto_home()
+        rounds = max(1, int(self.human_wait_sec // _HUMAN_POLL_SEC))
+        ready, last = await self._wait_ready((_HUMAN_POLL_SEC,) * rounds, quiet_on_check=True)
+        if ready:
+            log.info("kontakt_browser_passed_by_human")
+            return
+        raise CaptchaDetected(
+            f"kontakt: the Cloudflare check was not passed within "
+            f"{self.human_wait_sec // 60:.0f} minutes ({last})"
+        )
+
+    async def _goto_home(self) -> None:
         try:
             await self._page.goto(
                 f"{self.base_url}/", wait_until="domcontentloaded", timeout=60_000
@@ -160,10 +216,26 @@ class KontaktBrowserScraper(KontaktScraper):
             if _browser_gone(exc):
                 raise
             # Главная грузится дольше предела (счётчики, долгие запросы) —
-            # это ещё не отказ: готовность решает проба данных ниже.
+            # это ещё не отказ: готовность решает проба данных.
             log.warning("kontakt_browser_home_slow", error=type(exc).__name__)
+
+    async def _showing_check(self) -> bool:
+        try:
+            return looks_like_protection_page(await self._page.content())
+        except Exception as exc:
+            if _browser_gone(exc):
+                raise
+            return False
+
+    async def _wait_ready(
+        self, delays: tuple[float, ...], *, quiet_on_check: bool = False
+    ) -> tuple[bool, str]:
+        """Пробовать данные после каждой паузы; ``(готов, последняя причина)``.
+
+        Пока на странице проверка, данные не запрашиваются вовсе.
+        """
         last = "no answer"
-        for delay in _READY_PROBE_DELAYS:
+        for delay in delays:
             await asyncio.sleep(delay)
             try:
                 html = await self._page.content()
@@ -184,12 +256,9 @@ class KontaktBrowserScraper(KontaktScraper):
             text = str(probe.get("text") or "") if isinstance(probe, dict) else ""
             if status == 200 and not looks_like_protection_page(text):
                 log.info("kontakt_browser_site_ready")
-                return
+                return True, "ready"
             last = f"data HTTP {status}"
-        raise CaptchaDetected(
-            f"kontakt: the site does not give data to the real Chrome ({last}); "
-            "the collector does not solve Cloudflare checks"
-        )
+        return False, last
 
     # -- запрос страницы ---------------------------------------------------------
 
