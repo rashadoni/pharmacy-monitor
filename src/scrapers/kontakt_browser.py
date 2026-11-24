@@ -13,7 +13,8 @@ Cloudflare. Этот сборщик — тот же самый, с той же �
     автоматизации не подменяются, плагинов «stealth» нет;
   - решения задач Cloudflare: если сайт показывает проверку и настоящий
     Chrome сам её не проходит, сбор останавливается (``CaptchaDetected``) —
-    ничего не нажимается и не повторяется;
+    ничего не нажимается; ожидание допуска — не больше пяти проб за 90 с,
+    заново главная открывается не больше трёх раз за обход;
   - чужих адресов: только kontakt.az, только то, что не запрещает его
     ``robots.txt`` (данные страниц каталога), с паузой между запросами.
 
@@ -41,10 +42,10 @@ from src.scrapers.kontakt import KontaktScraper
 
 log = structlog.get_logger()
 
-# Сколько ждать, пока открытая главная страница перестанет быть проверкой
-# Cloudflare. Настоящий Chrome обычно проходит её сам за секунды; дольше —
-# значит, она ждёт человека, а этого сборщик не делает.
-_CHALLENGE_WAIT_SEC = 90
+# Паузы перед пробами готовности сайта (всего 90 с, пять проб). Настоящий
+# Chrome обычно получает допуск сам за секунды; дольше — значит, проверка ждёт
+# человека, а этого сборщик не делает.
+_READY_PROBE_DELAYS = (3, 6, 12, 24, 45)
 # Предел одного запроса: зависший ответ не должен держать сбор вечно.
 _REQUEST_TIMEOUT_MS = 60_000
 # Сколько раз за весь обход можно заново открыть главную после проверки
@@ -77,6 +78,11 @@ class BrowserResponse:
 
     status_code: int
     text: str
+
+
+def _browser_gone(exc: BaseException) -> bool:
+    """Окно или сам Chrome закрыты — дальше ждать нечего."""
+    return type(exc).__name__ == "TargetClosedError"
 
 
 class KontaktBrowserScraper(KontaktScraper):
@@ -142,36 +148,48 @@ class KontaktBrowserScraper(KontaktScraper):
         Видимая главная — ещё не допуск: Cloudflare выдаёт его скриптом страницы,
         уже после того, как она нарисована (первая проба 2026-11-24 на Маке:
         главная открылась, а первый запрос данных, ушедший сразу, получил 403).
-        Поэтому готовность — это ответ 200 на ``/_root.data`` изнутри вкладки;
-        до него сборщик ждёт, ничего не нажимая.
+        Поэтому готовность — это ответ 200 на ``/_root.data`` изнутри вкладки.
+        До него сборщик ждёт, ничего не нажимая, с растущими паузами и не
+        больше ``len(_READY_PROBE_DELAYS)`` проб; не дождался — остановка.
         """
-        await self._page.goto(f"{self.base_url}/", wait_until="load", timeout=90_000)
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + _CHALLENGE_WAIT_SEC
+        try:
+            await self._page.goto(
+                f"{self.base_url}/", wait_until="domcontentloaded", timeout=60_000
+            )
+        except Exception as exc:
+            if _browser_gone(exc):
+                raise
+            # Главная грузится дольше предела (счётчики, долгие запросы) —
+            # это ещё не отказ: готовность решает проба данных ниже.
+            log.warning("kontakt_browser_home_slow", error=type(exc).__name__)
         last = "no answer"
-        while True:
-            await asyncio.sleep(3)
-            html = await self._page.content()
-            if not looks_like_protection_page(html):
-                try:
-                    probe = await self._page_fetch(f"{self.base_url}/_root.data")
-                except Exception as exc:
-                    if "closed" in str(exc).lower():
-                        raise
-                    probe = {"status": None, "error": type(exc).__name__}
-                status = probe.get("status") if isinstance(probe, dict) else None
-                text = str(probe.get("text") or "") if isinstance(probe, dict) else ""
-                if status == 200 and not looks_like_protection_page(text):
-                    log.info("kontakt_browser_site_ready")
-                    return
-                last = f"data HTTP {status}"
-            else:
-                last = "check page"
-            if loop.time() >= deadline:
-                raise CaptchaDetected(
-                    f"kontakt: the site does not give data to the real Chrome ({last}); "
-                    "the collector does not solve Cloudflare checks"
-                )
+        for delay in _READY_PROBE_DELAYS:
+            await asyncio.sleep(delay)
+            try:
+                html = await self._page.content()
+                if looks_like_protection_page(html):
+                    last = "check page"
+                    continue
+                # Относительный адрес: тот же источник, что у открытой
+                # страницы, даже если сайт перевёл на www.
+                probe = await self._page_fetch("/_root.data")
+            except Exception as exc:
+                if _browser_gone(exc):
+                    raise
+                # Страница переходит (проверка пройдена и перезагружает её,
+                # перенаправление) — ещё не готово.
+                last = f"page busy: {type(exc).__name__}"
+                continue
+            status = probe.get("status") if isinstance(probe, dict) else None
+            text = str(probe.get("text") or "") if isinstance(probe, dict) else ""
+            if status == 200 and not looks_like_protection_page(text):
+                log.info("kontakt_browser_site_ready")
+                return
+            last = f"data HTTP {status}"
+        raise CaptchaDetected(
+            f"kontakt: the site does not give data to the real Chrome ({last}); "
+            "the collector does not solve Cloudflare checks"
+        )
 
     # -- запрос страницы ---------------------------------------------------------
 
@@ -221,7 +239,9 @@ class KontaktBrowserScraper(KontaktScraper):
             await self._throttle()
             try:
                 answer = await self._page_fetch(url)
-            except Exception as exc:  # вкладка закрылась, навигация, сбой Chrome
+            except Exception as exc:  # навигация, зависшая вкладка, сбой Chrome
+                if _browser_gone(exc):
+                    raise
                 last_reason, last_status = f"browser error: {type(exc).__name__}", None
                 continue
             if not isinstance(answer, dict) or answer.get("status") is None:

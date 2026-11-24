@@ -351,11 +351,11 @@ async def test_site_is_ready_only_when_data_comes_back_not_when_the_page_shows(t
 
     scraper._page_fetch = page_fetch
     await scraper._open_site()
-    assert probes == ["https://kontakt.az/_root.data"] * 2
+    assert probes == ["/_root.data"] * 2
 
 
 async def test_site_that_never_gives_data_stops_with_a_check(tmp_path, monkeypatch):
-    monkeypatch.setattr(kontakt_browser, "_CHALLENGE_WAIT_SEC", 0)
+    monkeypatch.setattr(kontakt_browser, "_READY_PROBE_DELAYS", (0, 0, 0))
     scraper = KontaktBrowserScraper(tmp_path / "profile", rate_limit_sec=0)
     scraper._page = _FakePage()
 
@@ -366,3 +366,51 @@ async def test_site_that_never_gives_data_stops_with_a_check(tmp_path, monkeypat
     with pytest.raises(CaptchaDetected) as error:
         await scraper._open_site()
     assert "data HTTP 403" in str(error.value)
+
+
+class TargetClosedError(Exception):
+    """Имя как у Playwright: сборщик узнаёт закрытое окно по имени класса."""
+
+
+async def test_a_busy_page_is_not_ready_yet_and_a_closed_window_stops_at_once(tmp_path):
+    scraper = KontaktBrowserScraper(tmp_path / "profile", rate_limit_sec=0)
+    scraper._page = _FakePage()
+    answers = iter([RuntimeError("navigating"), {"status": 200, "text": "[]"}])
+
+    async def page_fetch(_url):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    scraper._page_fetch = page_fetch
+    await scraper._open_site()  # «страница переходит» — подождать, не упасть
+
+    async def closed(_url):
+        raise TargetClosedError("Target page, context or browser has been closed")
+
+    scraper._page_fetch = closed
+    with pytest.raises(TargetClosedError):
+        await scraper._open_site()
+    with pytest.raises(TargetClosedError):
+        await scraper.fetch("https://kontakt.az/tv.data")
+
+
+async def test_probes_are_few_and_spaced(tmp_path, monkeypatch):
+    sleeps = []
+
+    async def record(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(kontakt_browser.asyncio, "sleep", record)
+    scraper = KontaktBrowserScraper(tmp_path / "profile", rate_limit_sec=0)
+    scraper._page = _FakePage()
+
+    async def refused(_url):
+        return {"status": 403, "text": CLOUDFLARE_CHALLENGE}
+
+    scraper._page_fetch = refused
+    with pytest.raises(CaptchaDetected):
+        await scraper._open_site()
+    assert sleeps == list(kontakt_browser._READY_PROBE_DELAYS)
+    assert len(sleeps) <= 5 and sum(sleeps) <= 120
