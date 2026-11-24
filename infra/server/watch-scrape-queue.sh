@@ -6,6 +6,10 @@
 # scrape» в дашборде кладёт ScrapeRequest(pending); этот вотчер опрашивает
 # локальный API и исполняет прогон ПРЯМО НА СЕРВЕРЕ — с серверными прокси:
 #   aptekonline → Decodo (AZ residential), pharmonline → IPRoyal DDP, aloe → direct.
+# ⚠️ 2026-10-14: на хосте с маркером автономного режима pharmonline этим путём не
+# собирается — `run --mode category` убирает его из прогона или отказывает
+# (src/main.py `_sites_without_pharmonline_catalog_scan`); его собирает только
+# ночной `run --site pharmonline` через публичный API.
 # Hetzner-IP-бан, из-за которого скрейп раньше гнали только с Mac, обойдён этими
 # прокси, поэтому ноут больше не нужен.
 #
